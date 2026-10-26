@@ -306,7 +306,8 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 					Type string `json:"type"`
 					Text string `json:"text"`
 				} `json:"content"`
-				IsError bool `json:"isError"`
+				StructuredContent json.RawMessage `json:"structuredContent"`
+				IsError           bool            `json:"isError"`
 			}
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return actool.Errorf("Error: bad MCP response: " + err.Error()), nil
@@ -315,6 +316,7 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 			for _, blk := range res.Content {
 				text += blk.Text
 			}
+			text = mcpResultText(text, res.StructuredContent)
 			// 与内置/自定义工具一致：超长输出走 Capture——按会话 MaxOutputChars（默认
 			// 30000）截断，配了 ToolOutputDir 时全量溢写到磁盘只留 head + 指针，避免大
 			// MCP 结果整段灌爆上下文。
@@ -337,7 +339,8 @@ func (c *Client) Call(ctx context.Context, tool string, args any) (string, error
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
-		IsError bool `json:"isError"`
+		StructuredContent json.RawMessage `json:"structuredContent"`
+		IsError           bool            `json:"isError"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return "", fmt.Errorf("bad MCP response: %w", err)
@@ -346,10 +349,24 @@ func (c *Client) Call(ctx context.Context, tool string, args any) (string, error
 	for _, blk := range res.Content {
 		text.WriteString(blk.Text)
 	}
+	out := mcpResultText(text.String(), res.StructuredContent)
 	if res.IsError {
-		return text.String(), fmt.Errorf("mcp tool %q error: %s", tool, text.String())
+		return out, fmt.Errorf("mcp tool %q error: %s", tool, out)
 	}
-	return text.String(), nil
+	return out, nil
+}
+
+// mcpResultText falls back to structuredContent when the server sends no text
+// blocks, so machine-readable-only results don't surface as blank success.
+func mcpResultText(text string, structured json.RawMessage) string {
+	if strings.TrimSpace(text) != "" {
+		return text
+	}
+	trimmed := strings.TrimSpace(string(structured))
+	if trimmed == "" || trimmed == "null" {
+		return text
+	}
+	return trimmed
 }
 
 // Close terminates the MCP session best-effort (DELETE with the session id, per the

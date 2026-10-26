@@ -16,6 +16,12 @@ func TestNewWebSearchConfig(t *testing.T) {
 	if _, err := NewWebSearch(WebSearchConfig{}); err != nil {
 		t.Fatalf("empty backend should default to ddgs: %v", err)
 	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "bing"}); err != nil {
+		t.Fatalf("bing backend should build (no key needed): %v", err)
+	}
+	if _, err := NewWebSearch(WebSearchConfig{Backend: "baidu"}); err != nil {
+		t.Fatalf("baidu backend should build (no key needed): %v", err)
+	}
 	if _, err := NewWebSearch(WebSearchConfig{Backend: "brave-free"}); err == nil {
 		t.Fatal("brave-free without key should error")
 	}
@@ -74,6 +80,133 @@ func TestDDGSSearchParse(t *testing.T) {
 	}
 }
 
+func TestBingSearchParse(t *testing.T) {
+	// Mirrors cn.bing.com: organic hits are li.b_algo with h2 > a and
+	// div.b_caption > p. The second link uses Bing's /ck/a base64 wrapper.
+	page := `<html><body><ol id="b_results">
+	<li class="b_algo"><h2><a href="https://example.com/a">First <strong>Result</strong></a></h2>
+	  <div class="b_caption"><p class="b_lineclamp2">First snippet.</p></div></li>
+	<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?!&&amp;p=x&amp;u=a1aHR0cHM6Ly9leGFtcGxlLm9yZy9i&amp;ntb=1">Second Result</a></h2>
+	  <div class="b_caption"><p>Second snippet.</p></div></li>
+	</ol></body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("q"); got != "test query" {
+			t.Errorf("expected q param, got %q", got)
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(page))
+	}))
+	defer srv.Close()
+
+	p := &bingProvider{client: srv.Client(), endpoint: srv.URL}
+	res, err := p.Search(context.Background(), "test query", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("want 2 results, got %d: %+v", len(res), res)
+	}
+	if res[0].Title != "First Result" || res[0].URL != "https://example.com/a" || res[0].Description != "First snippet." {
+		t.Errorf("bad result[0]: %+v", res[0])
+	}
+	if res[1].URL != "https://example.org/b" {
+		t.Errorf("ck/a wrapper not unwrapped: %q", res[1].URL)
+	}
+	if res[0].Position != 1 || res[1].Position != 2 {
+		t.Errorf("positions not 1-indexed: %d %d", res[0].Position, res[1].Position)
+	}
+
+	res, _ = p.Search(context.Background(), "test query", 1)
+	if len(res) != 1 {
+		t.Errorf("limit=1 should yield 1 result, got %d", len(res))
+	}
+}
+
+func TestUnwrapBingHref(t *testing.T) {
+	cases := map[string]string{
+		"https://plain.example/path": "https://plain.example/path",
+		"https://www.bing.com/ck/a?!&&p=x&u=a1aHR0cHM6Ly9leGFtcGxlLm9yZy9i&ntb=1": "https://example.org/b",
+		"/search?q=relative": "https://www.bing.com/search?q=relative",
+		"":                   "",
+	}
+	for in, want := range cases {
+		if got := unwrapBingHref(in); got != want {
+			t.Errorf("unwrapBingHref(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestBaiduSearchParse(t *testing.T) {
+	// Mirrors www.baidu.com: organic hits are div.result.c-container[mu]; the real
+	// URL is the mu attribute while the h3 anchor is a /link redirect. Snippets
+	// live in div[data-module=abstract] (new) or .c-abstract (old).
+	page := `<html><body>
+	<div class="result c-container xpath-log new-pmd" mu="https://example.com/real">
+	  <h3 class="t"><a href="http://www.baidu.com/link?url=abc" target="_blank"><span>Baidu First</span></a></h3>
+	  <div data-module="abstract" class="content-gap"><span class="summary-text_x">First Baidu snippet.</span></div>
+	</div>
+	<div class="result-op c-container" mu="https://example.org/b">
+	  <h3><a href="/link?url=def">Second</a></h3>
+	  <div class="c-abstract">Second snippet.</div>
+	</div>
+	<div class="EC_result c-container"><h3><a href="https://ad.example">Ad</a></h3></div>
+	</body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("wd"); got != "test query" {
+			t.Errorf("expected wd param, got %q", got)
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(page))
+	}))
+	defer srv.Close()
+
+	p := &baiduProvider{client: srv.Client(), endpoint: srv.URL}
+	res, err := p.Search(context.Background(), "test query", 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("want 2 organic results (ad skipped), got %d: %+v", len(res), res)
+	}
+	if res[0].Title != "Baidu First" || res[0].URL != "https://example.com/real" || res[0].Description != "First Baidu snippet." {
+		t.Errorf("bad result[0]: %+v", res[0])
+	}
+	if res[1].URL != "https://example.org/b" || res[1].Description != "Second snippet." {
+		t.Errorf("bad result[1]: %+v", res[1])
+	}
+	if res[0].Position != 1 || res[1].Position != 2 {
+		t.Errorf("positions not 1-indexed: %d %d", res[0].Position, res[1].Position)
+	}
+
+	res, _ = p.Search(context.Background(), "test query", 1)
+	if len(res) != 1 {
+		t.Errorf("limit=1 should yield 1 result, got %d", len(res))
+	}
+}
+
+func TestBaiduChallengeSurfacesError(t *testing.T) {
+	page := `<html><head><title>百度安全验证</title></head><body></body></html>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(page))
+	}))
+	defer srv.Close()
+	p := &baiduProvider{client: srv.Client(), endpoint: srv.URL}
+	if _, err := p.Search(context.Background(), "q", 5); err == nil {
+		t.Fatal("security-verification page should error, not return empty results")
+	}
+}
+
+func TestBaiduEmptyPageSurfacesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`<html><body><p>no hits</p></body></html>`))
+	}))
+	defer srv.Close()
+	p := &baiduProvider{client: srv.Client(), endpoint: srv.URL}
+	if _, err := p.Search(context.Background(), "q", 5); err == nil {
+		t.Fatal("a zero-result Baidu page should surface an error, not look like no hits")
+	}
+}
+
 func TestBraveSearchParse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Subscription-Token"); got != "secret-key" {
@@ -114,8 +247,8 @@ func TestBraveHTTPError(t *testing.T) {
 func TestUnwrapDDGHref(t *testing.T) {
 	cases := map[string]string{
 		"//duckduckgo.com/l/?uddg=https%3A%2F%2Fx.com%2Fy&rut=z": "https://x.com/y",
-		"https://plain.example/path":                            "https://plain.example/path",
-		"":                                                      "",
+		"https://plain.example/path":                             "https://plain.example/path",
+		"":                                                       "",
 	}
 	for in, want := range cases {
 		if got := unwrapDDGHref(in); got != want {

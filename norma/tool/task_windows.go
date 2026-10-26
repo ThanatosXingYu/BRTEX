@@ -23,4 +23,5 @@ func setDetached(cmd *exec.Cmd) {
 // treeKill terminates the process and its descendants via taskkill.
 func treeKill(p *os.Process) {
 	_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(p.Pid)).Run()
+	_ = p.Kill()
 }

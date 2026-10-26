@@ -29,6 +29,11 @@ const (
 type archiveFileMove struct {
 	Source   string `json:"source"`
 	Relative string `json:"relative"`
+	// Copied marks a move staged by copy instead of rename (the rename failed,
+	// typically because a live process holds the source on a bind mount). On
+	// rollback the payload copy is authoritative: the best-effort source removal
+	// after the copy may have left the original tree incomplete.
+	Copied bool `json:"copied,omitempty"`
 }
 
 type archiveStageJournal struct {
@@ -152,12 +157,24 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 	return stage, nil
 }
 
-// applyMoves performs the renames recorded in the journal. Entries already sitting
+// stageRename is swappable in tests to force the copy fallback.
+var stageRename = os.Rename
+
+// applyMoves performs the moves recorded in the journal. Entries already sitting
 // in the payload are skipped, so an interrupted staging round can be resumed in
-// place without moving anything twice.
+// place without moving anything twice. A rename that fails (on Windows bind
+// mounts a live process holding the source makes directory renames fail with
+// permission denied) falls back to a journaled copy instead of failing the
+// archive.
 func (s *taskArchiveFileStage) applyMoves() error {
-	for _, move := range s.journal.Moves {
+	for i := range s.journal.Moves {
+		move := &s.journal.Moves[i]
 		destination := filepath.Join(s.payload, move.Relative)
+		// A leftover .copying directory is always a partial copy: discard it
+		// before deciding whether this move still needs staging.
+		if err := os.RemoveAll(destination + ".copying"); err != nil {
+			return err
+		}
 		if _, err := os.Lstat(destination); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
@@ -174,11 +191,73 @@ func (s *taskArchiveFileStage) applyMoves() error {
 		if err := os.MkdirAll(filepath.Dir(destination), archiveDirMode); err != nil {
 			return err
 		}
-		if err := os.Rename(move.Source, destination); err != nil {
-			return fmt.Errorf("stage task archive path %s: %w", move.Source, err)
+		if err := stageRename(move.Source, destination); err == nil {
+			continue
+		} else if fallbackErr := s.copyFallback(move, destination); fallbackErr != nil {
+			return fmt.Errorf("stage task archive path %s: rename: %v; copy: %w", move.Source, err, fallbackErr)
 		}
 	}
 	return nil
+}
+
+// copyFallback stages a move whose rename failed by copying the tree into the
+// payload and best-effort removing the source. The journal records the copy
+// before it starts, so an interrupted round can be resumed (a copy in place is
+// treated as done) or rolled back.
+func (s *taskArchiveFileStage) copyFallback(move *archiveFileMove, destination string) error {
+	move.Copied = true
+	if err := writeArchiveJournal(filepath.Join(s.root, "journal.json"), s.journal); err != nil {
+		return err
+	}
+	if err := copyArchiveTree(move.Source, destination+".copying"); err != nil {
+		return err
+	}
+	if err := os.Rename(destination+".copying", destination); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(move.Source)
+	return nil
+}
+
+// copyArchiveTree recursively copies source into destination, preserving file
+// modes and skipping symlinks (the package walk skips them too). Directory
+// modes are not preserved: a copied directory must stay writable until the copy
+// finishes.
+func copyArchiveTree(source, destination string) error {
+	return filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, current)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, archiveDirMode)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), archiveDirMode); err != nil {
+			return err
+		}
+		input, err := os.Open(current)
+		if err != nil {
+			return err
+		}
+		output, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		return errors.Join(copyErr, output.Close(), input.Close())
+	})
 }
 
 func (s *taskArchiveFileStage) rollback() error {
@@ -186,6 +265,12 @@ func (s *taskArchiveFileStage) rollback() error {
 		return nil
 	}
 	var errs []error
+	// Discard partial copies left by an interrupted fallback.
+	for _, move := range s.journal.Moves {
+		if err := os.RemoveAll(filepath.Join(s.payload, move.Relative) + ".copying"); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for i := len(s.journal.Moves) - 1; i >= 0; i-- {
 		move := s.journal.Moves[i]
 		staged := filepath.Join(s.payload, move.Relative)
@@ -193,6 +278,28 @@ func (s *taskArchiveFileStage) rollback() error {
 			continue
 		} else if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		if move.Copied {
+			// The payload copy is authoritative: the best-effort source removal
+			// after the copy may have left the original tree incomplete, so the
+			// source is cleared before the copy is renamed back.
+			if _, err := os.Lstat(move.Source); err == nil {
+				if err := os.RemoveAll(move.Source); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			} else if !os.IsNotExist(err) {
+				errs = append(errs, err)
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(move.Source), 0o755); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if err := os.Rename(staged, move.Source); err != nil {
+				errs = append(errs, err)
+			}
 			continue
 		}
 		if _, err := os.Lstat(move.Source); err == nil {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/Autumn-27/norma/llm"
@@ -234,7 +235,8 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 					Type string `json:"type"`
 					Text string `json:"text"`
 				} `json:"content"`
-				IsError bool `json:"isError"`
+				StructuredContent json.RawMessage `json:"structuredContent"`
+				IsError           bool            `json:"isError"`
 			}
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return tool.Errorf("Error: bad MCP response: " + err.Error()), nil
@@ -243,9 +245,24 @@ func (c *Client) wrap(rt remoteTool) tool.CoreTool {
 			for _, blk := range res.Content {
 				text += blk.Text
 			}
+			text = mcpResultText(text, res.StructuredContent)
 			return tool.Result{Content: []llm.ContentBlock{llm.TextBlock(tool.Capture(tc, text))}, IsError: res.IsError}, nil
 		},
 	})
+}
+
+// mcpResultText falls back to structuredContent when the server sends no text
+// blocks. FastMCP does this for machine-readable results such as an empty list,
+// which would otherwise surface as a blank successful output.
+func mcpResultText(text string, structured json.RawMessage) string {
+	if strings.TrimSpace(text) != "" {
+		return text
+	}
+	trimmed := strings.TrimSpace(string(structured))
+	if trimmed == "" || trimmed == "null" {
+		return text
+	}
+	return trimmed
 }
 
 // Close shuts down the client's transport.

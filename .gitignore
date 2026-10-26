@@ -58,3 +58,9 @@ Thumbs.db
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+
+# 闭源前原始源码包（随 GitHub Release 发布，不进仓库）
+/ARTEX-main.zip
+
+# 本地临时抓包/调试产物
+/.tmp/

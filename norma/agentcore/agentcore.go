@@ -106,8 +106,10 @@ type Options struct {
 	// EnableWebSearch adds the network-facing web_search tool (permission-gated).
 	EnableWebSearch bool
 	// WebSearchBackend selects the search backend: "ddgs" (DuckDuckGo, no key),
-	// "brave-free" (Brave Search API), "tavily" (Tavily Search API), or
-	// "deepseek" (DeepSeek's server-side search). Empty defaults to "ddgs".
+	// "bing" (Bing scrape via cn.bing.com, no key, China-direct), "baidu" (Baidu
+	// scrape, no key, China-direct), "brave-free" (Brave Search API), "tavily"
+	// (Tavily Search API), or "deepseek" (DeepSeek's server-side search).
+	// Empty defaults to "ddgs".
 	WebSearchBackend string
 	// BraveSearchAPIKey authenticates the "brave-free" backend. Required only when
 	// WebSearchBackend == "brave-free".

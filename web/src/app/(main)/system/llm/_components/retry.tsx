@@ -97,7 +97,7 @@ export const RETRY_LAYERS = {
     desc: "熔断后进入冷却，冷却期内轮询直接跳过这个配置。状态落库，重启不丢。",
     attemptsLabel: "连续失败几次熔断",
     defAttempts: 3,
-    defInterval: "1min→5min→30min 梯度",
+    defInterval: "30s→1min→1min→2min→5min→10min 梯度",
     offHint: "-1 = 瞬时失败永不熔断（确定性失败仍然熔断）",
   },
   intent: {

@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/agentcore"
@@ -191,19 +192,34 @@ func FromEnv() (Config, bool) {
 	return c, true
 }
 
+// StripInvisible removes invisible Unicode format characters (zero-width
+// spaces, BOM, word joiners, ...) that sneak into pasted URLs and keys.
+// strings.TrimSpace does not treat them as whitespace, and a single stray
+// U+200B breaks url.Parse downstream with "first path segment in URL cannot
+// contain colon".
+func StripInvisible(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // ConfigFrom builds a Config from UI-provided strings (provider defaults to
 // anthropic; model defaults per provider). Inputs are trimmed and the base URL
 // is normalized to the API base the provider expects (the provider appends the
 // endpoint path itself), so a full endpoint URL is tolerated.
 func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
+	provider = strings.TrimSpace(StripInvisible(provider))
 	c := Config{
-		Model:   strings.TrimSpace(model),
-		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:  strings.TrimSpace(apiKey),
-		Proxy:   strings.TrimSpace(proxy),
+		Model:   strings.TrimSpace(StripInvisible(model)),
+		BaseURL: strings.TrimRight(strings.TrimSpace(StripInvisible(baseURL)), "/"),
+		APIKey:  strings.TrimSpace(StripInvisible(apiKey)),
+		Proxy:   strings.TrimSpace(StripInvisible(proxy)),
 		Stream:  true, // 默认流式;调用方按 profile 覆盖
 	}
-	switch strings.TrimSpace(provider) {
+	switch provider {
 	case "openai":
 		c.Format = llm.FormatOpenAI
 		// provider appends "/chat/completions"; tolerate a full endpoint URL.

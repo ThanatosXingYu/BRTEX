@@ -3,8 +3,10 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +163,33 @@ func TestBashSleepTimesOutNotBackgrounded(t *testing.T) {
 	}
 	if tasks := m.List(); len(tasks) != 0 {
 		t.Fatalf("timed-out sleep should be forgotten, got %d", len(tasks))
+	}
+}
+
+// A timed-out synchronous Bash run must kill the whole process group: a
+// backgrounded child writing a marker after the timeout must never run.
+// Orphans that survive the turn keep holding task files open, which later
+// breaks archive renames on bind mounts.
+func TestBashSyncKillsProcessGroupOnTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group kill is Unix-specific; the Windows tree kill is covered by the managed task tests")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "orphan-ran")
+	res, err := runBashSync(context.Background(), nil,
+		fmt.Sprintf("sleep 2 && echo ran > %q & wait", marker), 150*time.Millisecond)
+	if err != nil {
+		t.Fatalf("runBashSync: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Flatten(), "timed out") {
+		t.Fatalf("expected timeout error: %q (err=%v)", res.Flatten(), res.IsError)
+	}
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("orphaned child survived the timeout and wrote %s", marker)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

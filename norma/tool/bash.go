@@ -157,7 +157,12 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	defer cancel()
 
 	shell, flags := shellCmd()
-	cmd := exec.CommandContext(cctx, shell, append(flags, command)...)
+	cmd := exec.Command(shell, append(flags, command)...)
+	// Detach into its own process group so the whole tree can be killed on
+	// timeout/cancel: killing only the shell leaves grandchildren (e.g.
+	// backgrounded scripts) running, holding task files open — which later
+	// breaks archive renames on bind mounts.
+	setDetached(cmd)
 	if tc != nil {
 		cmd.Dir = tc.WorkingDir
 		if env := withEnv(tc.Env); env != nil {
@@ -167,7 +172,19 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return Errorf(fmt.Sprintf("[failed to run: %v]", err)), nil
+	}
+	finished := make(chan struct{})
+	go func() {
+		select {
+		case <-cctx.Done():
+			treeKill(cmd.Process)
+		case <-finished:
+		}
+	}()
+	err := cmd.Wait()
+	close(finished)
 
 	out := Capture(tc, buf.String())
 	if cctx.Err() == context.DeadlineExceeded {

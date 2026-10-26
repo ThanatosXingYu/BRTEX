@@ -536,8 +536,9 @@ func (m *Manager) SetLLMPoolBindFallback(on bool) error {
 }
 
 // WebSearch returns the current web-search config: whether it is enabled, the
-// backend ("ddgs" | "brave-free" | "tavily"), the Brave API key, the Tavily API
-// key (each empty unless set), and the dedicated egress proxy (empty = direct).
+// backend ("ddgs" | "bing" | "baidu" | "brave-free" | "tavily"), the Brave API
+// key, the Tavily API key (each empty unless set), and the dedicated egress
+// proxy (empty = direct). bing/baidu are keyless and China-direct.
 func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

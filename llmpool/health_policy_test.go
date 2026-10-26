@@ -6,7 +6,7 @@ import (
 )
 
 // A configured soft-trip threshold replaces the default: two transient failures
-// are enough, and the fixed cooldown replaces the 1/5/30min ladder.
+// are enough, and the fixed cooldown replaces the 30s…10min ladder.
 func TestSetPolicyOverridesThresholdAndCooldown(t *testing.T) {
 	reg := NewRegistry(nil, nil)
 	reg.SetPolicy(2, 90*time.Second)
@@ -44,8 +44,8 @@ func TestSetPolicyDisablesSoftTrip(t *testing.T) {
 	if !reg.Trip(1, "no credit", true) {
 		t.Fatal("a hard failure must still trip immediately")
 	}
-	if d := time.Until(reg.Get(1).OpenUntil); d < 50*time.Second || d > 60*time.Second {
-		t.Fatalf("cooldown=%v, want the default first rung (~1min)", d)
+	if d := time.Until(reg.Get(1).OpenUntil); d < 20*time.Second || d > 30*time.Second {
+		t.Fatalf("cooldown=%v, want the default first rung (~30s)", d)
 	}
 }
 
@@ -61,7 +61,7 @@ func TestZeroPolicyKeepsDefaults(t *testing.T) {
 	if !reg.Trip(1, "429", false) {
 		t.Fatalf("should trip on failure #%d", softTripAfter)
 	}
-	if d := time.Until(reg.Get(1).OpenUntil); d < 50*time.Second || d > 60*time.Second {
-		t.Fatalf("cooldown=%v, want the first ladder rung (~1min)", d)
+	if d := time.Until(reg.Get(1).OpenUntil); d < 20*time.Second || d > 30*time.Second {
+		t.Fatalf("cooldown=%v, want the first ladder rung (~30s)", d)
 	}
 }

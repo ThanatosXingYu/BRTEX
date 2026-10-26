@@ -1989,7 +1989,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Resolve API key: form input > profile stored key.
-	apiKey := strings.TrimSpace(req.APIKey)
+	apiKey := strings.TrimSpace(agent.StripInvisible(req.APIKey))
 	if apiKey == "" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			apiKey = p.APIKey
@@ -2000,8 +2000,8 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
-	provider := strings.TrimSpace(req.Provider)
+	baseURL := strings.TrimRight(strings.TrimSpace(agent.StripInvisible(req.BaseURL)), "/")
+	provider := strings.TrimSpace(agent.StripInvisible(req.Provider))
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
@@ -2051,7 +2051,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 
 	// Build HTTP client with optional proxy.
 	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
+	if p := strings.TrimSpace(agent.StripInvisible(req.Proxy)); p != "" {
 		if pu, err := url.Parse(p); err == nil {
 			transport.Proxy = http.ProxyURL(pu)
 		}

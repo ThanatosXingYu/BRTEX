@@ -2,12 +2,15 @@ package tool
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,10 +36,12 @@ type searchProvider interface {
 
 // WebSearchConfig selects and configures the active search backend.
 type WebSearchConfig struct {
-	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key),
-	// "brave-free" (Brave Search API, needs BraveAPIKey), "tavily" (Tavily
-	// Search API, needs TavilyAPIKey), or "deepseek" (DeepSeek's server-side
-	// web search, needs DeepSeek*). Empty defaults to "ddgs".
+	// Backend chooses the provider: "ddgs" (DuckDuckGo scrape, no key), "bing"
+	// (Bing scrape via cn.bing.com, no key, reachable from mainland China without
+	// a proxy), "baidu" (Baidu scrape, no key, China-direct), "brave-free" (Brave
+	// Search API, needs BraveAPIKey), "tavily" (Tavily Search API, needs
+	// TavilyAPIKey), or "deepseek" (DeepSeek's server-side web search, needs
+	// DeepSeek*). Empty defaults to "ddgs".
 	Backend string
 	// BraveAPIKey authenticates the "brave-free" backend. Required (and only
 	// used) when Backend == "brave-free".
@@ -110,6 +115,10 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 	switch backend {
 	case "ddgs":
 		return &ddgsProvider{client: client, endpoint: ddgsEndpoint}, nil
+	case "bing":
+		return &bingProvider{client: client, endpoint: bingEndpoint}, nil
+	case "baidu":
+		return &baiduProvider{client: client, endpoint: baiduEndpoint}, nil
 	case "brave-free":
 		key := strings.TrimSpace(cfg.BraveAPIKey)
 		if key == "" {
@@ -137,7 +146,7 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 		}
 		return &deepseekProvider{apiKey: key, model: model, client: client, endpoint: deepseekMessagesURL(base)}, nil
 	default:
-		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"brave-free\", \"tavily\", or \"deepseek\")", backend)
+		return nil, fmt.Errorf("web_search: unknown backend %q (want \"ddgs\", \"bing\", \"baidu\", \"brave-free\", \"tavily\", or \"deepseek\")", backend)
 	}
 }
 
@@ -308,6 +317,320 @@ func unwrapDDGHref(href string) string {
 		return href
 	}
 	return ""
+}
+
+// ─── Bing (cn.bing.com, China-direct) ───────────────────────────────────────
+// No API key. Scrapes the cn.bing.com result page, which is served server-side
+// (no JS/cookies needed) and reachable from mainland China without a proxy.
+// Each organic hit is an `li.b_algo` block: title anchor inside `h2`, snippet
+// inside `div.b_caption > p`. Bing occasionally wraps links in /ck/a?u=a1<base64>,
+// which unwrapBingHref decodes.
+
+const bingEndpoint = "https://cn.bing.com/search"
+
+// browserUA is used by the China-direct scrapers; both endpoints reject
+// obviously-automated clients.
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+type bingProvider struct {
+	client   *http.Client
+	endpoint string
+}
+
+func (p *bingProvider) Name() string { return "bing" }
+
+func (p *bingProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	q := url.Values{"q": {query}, "setlang": {"zh-Hans"}, "mkt": {"zh-CN"}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Bing returned HTTP %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("could not parse Bing response: %w", err)
+	}
+	return parseBing(doc, limit), nil
+}
+
+// parseBing walks li.b_algo blocks. Each block yields the first h2 anchor as the
+// title and the first paragraph of div.b_caption (or .b_snippet) as the snippet.
+func parseBing(doc *html.Node, limit int) []SearchResult {
+	var out []SearchResult
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		if len(out) >= limit {
+			return
+		}
+		if n.Type == html.ElementNode && hasClass(n, "b_algo") {
+			if r, ok := bingHit(n); ok {
+				r.Position = len(out) + 1
+				out = append(out, r)
+			}
+			return // results never nest; don't double-count
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return out
+}
+
+func bingHit(block *html.Node) (SearchResult, bool) {
+	h2 := findDescendant(block, func(n *html.Node) bool {
+		return n.Type == html.ElementNode && n.Data == "h2"
+	})
+	if h2 == nil {
+		return SearchResult{}, false
+	}
+	a := findDescendant(h2, func(n *html.Node) bool {
+		return n.Type == html.ElementNode && n.Data == "a" && attr(n, "href") != ""
+	})
+	if a == nil {
+		return SearchResult{}, false
+	}
+	link := unwrapBingHref(attr(a, "href"))
+	title := nodeText(a)
+	if link == "" || title == "" {
+		return SearchResult{}, false
+	}
+	desc := ""
+	if cap := findDescendant(block, func(n *html.Node) bool {
+		return n.Type == html.ElementNode && hasClass(n, "b_caption")
+	}); cap != nil {
+		if p := findDescendant(cap, func(n *html.Node) bool {
+			return n.Type == html.ElementNode && n.Data == "p"
+		}); p != nil {
+			desc = nodeText(p)
+		} else {
+			desc = nodeText(cap)
+		}
+	}
+	if desc == "" {
+		if sn := findDescendant(block, func(n *html.Node) bool {
+			return n.Type == html.ElementNode && hasClass(n, "b_snippet")
+		}); sn != nil {
+			desc = nodeText(sn)
+		}
+	}
+	return SearchResult{Title: title, URL: link, Description: desc}, true
+}
+
+// unwrapBingHref resolves Bing's /ck/a redirect wrapper, whose `u` param is
+// "a1" followed by the base64url-encoded target. Direct links pass through.
+func unwrapBingHref(href string) string {
+	href = strings.TrimSpace(href)
+	if href == "" {
+		return ""
+	}
+	if strings.HasPrefix(href, "/") {
+		href = "https://www.bing.com" + href
+	}
+	if !strings.HasPrefix(href, "http://") && !strings.HasPrefix(href, "https://") {
+		return ""
+	}
+	u, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	host := strings.ToLower(u.Hostname())
+	if (host != "bing.com" && !strings.HasSuffix(host, ".bing.com")) || !strings.HasPrefix(u.Path, "/ck/a") {
+		return href
+	}
+	enc := strings.TrimPrefix(u.Query().Get("u"), "a1")
+	if b, err := base64.RawURLEncoding.DecodeString(enc); err == nil {
+		if target := string(b); strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+			return target
+		}
+	}
+	return href
+}
+
+// ─── Baidu (China-direct) ────────────────────────────────────────────────────
+// No API key. Scrapes Baidu's server-rendered result page (www.baidu.com/s).
+// Organic hits are `div.result.c-container[mu]` blocks: the real URL is the
+// container's `mu` attribute (the h3 anchor itself is a /link?url= redirect),
+// the title is the h3 anchor, and the snippet lives in div[data-module=abstract]
+// (new markup, summary-text_*) or .c-abstract (old markup).
+//
+// Baidu rate-limits by IP and redirects to a security-verification page when it
+// suspects automation. That is surfaced as an explicit error so the agent can
+// switch backends instead of seeing an empty result list.
+
+const baiduEndpoint = "https://www.baidu.com/s"
+
+type baiduProvider struct {
+	client   *http.Client
+	endpoint string
+}
+
+func (p *baiduProvider) Name() string { return "baidu" }
+
+func (p *baiduProvider) Search(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	q := url.Values{"wd": {query}, "ie": {"utf-8"}, "rn": {strconv.Itoa(min(limit, 20))}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Baidu returned HTTP %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFetchBytes))
+	if isBaiduChallenge(resp, body) {
+		return nil, fmt.Errorf("Baidu served its security-verification page (IP rate-limited); switch backend or retry later")
+	}
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("could not parse Baidu response: %w", err)
+	}
+	results := parseBaidu(doc, limit)
+	if len(results) == 0 {
+		// A zero-result SERP from Baidu almost always means an anti-bot interstitial
+		// with unrecognized markup or a changed layout; report it so the agent can
+		// switch backends rather than concluding the query has no hits.
+		return nil, fmt.Errorf("Baidu returned no parsable results (likely rate-limited or its markup changed); switch backend or retry later")
+	}
+	return results, nil
+}
+
+// isBaiduChallenge detects the anti-bot interstitial. A real SERP is hundreds of
+// KB; the challenge page is tiny, so the title check is size-gated to avoid a
+// footer mention on a legitimate page.
+func isBaiduChallenge(resp *http.Response, body []byte) bool {
+	if resp.Request != nil && resp.Request.URL != nil &&
+		strings.EqualFold(resp.Request.URL.Hostname(), "wappass.baidu.com") {
+		return true
+	}
+	return len(body) < 64*1024 && bytes.Contains(body, []byte("百度安全验证"))
+}
+
+func parseBaidu(doc *html.Node, limit int) []SearchResult {
+	var out []SearchResult
+	seen := map[string]bool{}
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		if len(out) >= limit {
+			return
+		}
+		if n.Type == html.ElementNode && isBaiduResultBlock(n) {
+			if r, ok := baiduHit(n); ok && !seen[r.URL] {
+				seen[r.URL] = true
+				r.Position = len(out) + 1
+				out = append(out, r)
+			}
+			return // don't descend into a result block (avoids nested duplicates)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return out
+}
+
+func isBaiduResultBlock(n *html.Node) bool {
+	classes := strings.Fields(attr(n, "class"))
+	if len(classes) == 0 {
+		return false
+	}
+	container := false
+	for _, c := range classes {
+		if strings.HasPrefix(c, "EC_") { // sponsored slot, not an organic hit
+			return false
+		}
+		switch c {
+		case "c-container", "result", "result-op":
+			container = true
+		}
+	}
+	if !container {
+		return false
+	}
+	return findDescendant(n, func(x *html.Node) bool {
+		return x.Type == html.ElementNode && x.Data == "h3"
+	}) != nil
+}
+
+func baiduHit(block *html.Node) (SearchResult, bool) {
+	h3 := findDescendant(block, func(n *html.Node) bool {
+		return n.Type == html.ElementNode && n.Data == "h3"
+	})
+	if h3 == nil {
+		return SearchResult{}, false
+	}
+	a := findDescendant(h3, func(n *html.Node) bool {
+		return n.Type == html.ElementNode && n.Data == "a" && attr(n, "href") != ""
+	})
+	if a == nil {
+		return SearchResult{}, false
+	}
+	link := strings.TrimSpace(attr(block, "mu"))
+	if !strings.HasPrefix(link, "http://") && !strings.HasPrefix(link, "https://") {
+		link = strings.TrimSpace(attr(a, "href"))
+		if strings.HasPrefix(link, "/") {
+			link = "https://www.baidu.com" + link
+		}
+		if !strings.HasPrefix(link, "http://") && !strings.HasPrefix(link, "https://") {
+			return SearchResult{}, false
+		}
+	}
+	title := nodeText(a)
+	if title == "" {
+		return SearchResult{}, false
+	}
+	desc := ""
+	if sn := findDescendant(block, isBaiduSnippet); sn != nil {
+		desc = nodeText(sn)
+	}
+	return SearchResult{Title: title, URL: link, Description: desc}, true
+}
+
+func isBaiduSnippet(n *html.Node) bool {
+	if n.Type != html.ElementNode {
+		return false
+	}
+	if attr(n, "data-module") == "abstract" {
+		return true
+	}
+	for _, c := range strings.Fields(attr(n, "class")) {
+		if c == "c-abstract" || strings.HasPrefix(c, "summary-text_") {
+			return true
+		}
+	}
+	return false
+}
+
+// findDescendant returns the first node under n (document order) matching pred.
+func findDescendant(n *html.Node, pred func(*html.Node) bool) *html.Node {
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if pred(c) {
+			return c
+		}
+		if found := findDescendant(c, pred); found != nil {
+			return found
+		}
+	}
+	return nil
 }
 
 // ─── Brave Search (free tier) ────────────────────────────────────────────────

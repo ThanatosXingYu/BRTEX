@@ -14,11 +14,19 @@ import (
 	"time"
 )
 
-// backoff is the cooling-off ladder, indexed by trip count: the 1st trip cools
-// for a minute, the 2nd for five, everything after that for half an hour. A
-// profile that is merely rate-limited recovers quickly; one that keeps failing
-// stops being probed every round.
-var backoff = []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute}
+// backoff is the cooling-off ladder, indexed by trip count. The first rung is
+// deliberately short (30s) so a one-off blip costs less than a minute of
+// avoided traffic, and the last is capped at 10 minutes rather than half an
+// hour so a persistently broken profile keeps getting retried within a working
+// session. A fixed cooldown set via SetPolicy replaces the ladder entirely.
+var backoff = []time.Duration{
+	30 * time.Second,
+	time.Minute,
+	time.Minute,
+	2 * time.Minute,
+	5 * time.Minute,
+	10 * time.Minute,
+}
 
 // State is one profile's circuit-breaker state.
 type State struct {
@@ -60,7 +68,7 @@ type Registry struct {
 // SetPolicy overrides the breaker's two knobs. softTrip: how many consecutive
 // transient failures trip it (0 = default softTripAfter; negative = transient
 // failures never trip it, leaving only the deterministic ones). cooldown: a fixed
-// cooling-off window (0 = the 1min/5min/30min ladder). Safe to call at any time.
+// cooling-off window (0 = the 30s…10min ladder). Safe to call at any time.
 func (r *Registry) SetPolicy(softTrip int, cooldown time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

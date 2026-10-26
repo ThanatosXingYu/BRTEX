@@ -443,7 +443,8 @@ export default function SystemSettingsPage() {
               <b>web_search</b>（仅返回标题/链接/摘要，不抓取正文；抓取由 WebFetch 负责）。网络搜索<b>不走</b>
               记录代理，独立于流量捕获。
               <br />
-              来源可选 <b>DuckDuckGo（ddgs）</b>（无需 Key）、<b>Brave（免费版）</b>（需填写 Brave API Key）、{" "}
+              来源可选 <b>DuckDuckGo（ddgs）</b>（无需 Key）、<b>Bing</b> 或 <b>百度</b>（均抓取公开搜索结果页，
+              国内网络可直连，<b>无需 API Key 与代理</b>）、<b>Brave（免费版）</b>（需填写 Brave API Key）、{" "}
               <b>Tavily</b>（需填写 Tavily API Key）或 <b>DeepSeek</b>（复用当前 LLM 配置）。总开关关闭时，各
               Agent 的网络搜索开关不可用。
             </CardDescription>
@@ -475,7 +476,7 @@ export default function SystemSettingsPage() {
                     saveWebSearch({ web_search_backend: v });
                   }}
                 >
-                  <SelectTrigger className="w-48 shrink-0">
+                  <SelectTrigger className="w-64 shrink-0">
                     <SelectValue placeholder="选择来源" />
                   </SelectTrigger>
                   <SelectContent>
@@ -483,9 +484,19 @@ export default function SystemSettingsPage() {
                     <SelectItem value="brave-free">Brave（免费版 · 需 Key）</SelectItem>
                     <SelectItem value="tavily">Tavily（需 Key）</SelectItem>
                     <SelectItem value="deepseek">DeepSeek（官方）</SelectItem>
+                    <SelectItem value="bing">Bing（国内直连 · 免费无 Key）</SelectItem>
+                    <SelectItem value="baidu">百度（国内直连 · 免费无 Key）</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
+            )}
+
+            {webSearch && (backend === "bing" || backend === "baidu") && (
+              <p className="text-muted-foreground text-xs leading-relaxed">
+                该来源直接抓取公开搜索结果页（
+                {backend === "bing" ? "cn.bing.com" : "www.baidu.com"}），无需 API Key，国内网络可直连。若被目标
+                站点限流或出现验证码，可切换其它搜索来源，或在下方配置出口代理。
+              </p>
             )}
 
             {webSearch && backend === "deepseek" && (
