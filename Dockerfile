@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # 多阶段构建：前端静态导出 → Go 单二进制（内嵌前端）→ 运行镜像。
-# 原 Docker Hub 镜像源（autumn27/artex）已失效，本仓库自此支持从纯源码自助构建：
-#   docker compose build        # 或 docker build -t artex:local .
+# 本仓库从纯源码自助构建，不依赖外部镜像源：
+#   docker compose build        # 或 docker build -t brtex:local .
 # TARGETARCH 由 buildx 自动注入（amd64/arm64），Go 交叉编译无需 QEMU；
 # 运行层只装工具，编译全部在构建阶段完成。
 # 国内网络可覆盖模块源（默认已对国内友好）：

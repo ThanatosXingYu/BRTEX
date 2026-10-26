@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/notify"
+	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/ThanatosXingYu/BRTEX/notify"
 )
 
 // 全局设置键（存在 settings 键值表里，无需建表）。

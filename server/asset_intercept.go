@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/ThanatosXingYu/BRTEX/db"
 )
 
 // --- asset intercept rule CRUD ---

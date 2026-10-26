@@ -14,12 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/enrich"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/traffic"
+	"github.com/ThanatosXingYu/BRTEX/agent"
+	pgdb "github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/ThanatosXingYu/BRTEX/enrich"
+	"github.com/ThanatosXingYu/BRTEX/guard"
+	"github.com/ThanatosXingYu/BRTEX/intercept"
+	"github.com/ThanatosXingYu/BRTEX/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
 

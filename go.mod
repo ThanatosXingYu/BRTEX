@@ -1,4 +1,4 @@
-module github.com/Autumn-27/artex
+module github.com/ThanatosXingYu/BRTEX
 
 // Upstream github.com/Autumn-27/norma went closed-source and is no
 // longer publicly accessible; v0.4.3 was restored from the Go module
