@@ -1,57 +1,31 @@
 <div align="center">
 
-# ARTEX
+# BRTEX
 
-AI 自主渗透测试系统（Go 后端 + Next.js 前端）
-
-
-🌐 **在线 Demo（模拟数据）**： [https://artex-demo.mhtsec.com](https://artex-demo.mhtsec.com)
-
-📦 **该仓库为ARTEX最后一个版本纯源码备份。原 Docker 镜像源 `autumn27/artex` 已失效，现由本仓库自维护镜像 `mianhuatang11/artex`（Docker Hub）；拉取失败时可 `docker compose build` 从纯源码本地构建，无任何外部预编译依赖。**
+ARTEX 自用魔改版 · AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 </div>
 
 ---
 
-## 截图预览
+## 关于 BRTEX
 
-> 完整交互见[在线 Demo](https://artex-demo.mhtsec.com)（纯前端 + Mock 数据，无需后端）。
+BRTEX 是 ARTEX 的自用魔改分支，基线为 ARTEX 闭源前可得的最后一个源码版本（v0.3.15）。除上游功能外，本分支包含以下改动：
 
-| 仪表盘（总览 / Token 消耗 / 活动流） | 任务列表 |
-| :---: | :---: |
-| ![仪表盘](screenshots/dashboard.png) | ![任务](screenshots/tasks.png) |
-
-| 任务 · 执行过程（会话 / 工具调用） | 探索链路 |
-| :---: | :---: |
-| ![执行过程](screenshots/sessions.png) | ![探索链路](screenshots/graph.png) |
-
-| 发现 | 资产 |
-| :---: | :---: |
-| ![发现](screenshots/findings.png) | ![资产](screenshots/assets.png) |
-
-| 资产覆盖图（力导向布局 · 已测高亮 · 节点折叠展开） |
-| :---: |
-| ![资产覆盖图](screenshots/assets_test.png) |
-
-| 流量录制 | 人在环路对话 |
-| :---: | :---: |
-| ![流量](screenshots/traffic.png) | ![对话](screenshots/chat.png) |
-
-| Agent 管理 | LLM 配置 |
-| :---: | :---: |
-| ![Agent](screenshots/agents.png) | ![LLM](screenshots/llm.png) |
-
-| 拦截审批 | 后端日志 |
-| :---: | :---: |
-| ![拦截](screenshots/intercept.png) | ![日志](screenshots/logs.png) |
-
+- **LLM 配置清洗**：provider / model / Base URL / API Key / 代理中的零宽字符、BOM 等不可见 Unicode 会被自动剥除，避免粘贴内容导致 URL 解析失败；「获取模型列表」走同一套清洗逻辑。
+- **熔断冷却重调**：LLM 配置的冷却梯度改为 30s → 1m → 1m → 2m → 5m → 10m（上游为 1m / 5m / 30m），持续失败的配置在会话内能更快恢复探测，前端提示同步更新。
+- **MCP structuredContent 回退**：MCP 服务只返回 `structuredContent`（例如 FastMCP 的空列表）时，不再显示为空白成功；内置与远程 MCP 客户端行为一致。
+- **Bash 进程树终止**：命令超时或取消时终止整棵进程树，避免后台子进程继续占用文件、导致后续任务归档失败（Windows 使用 `taskkill /T`）。
+- **任务归档复制兜底**：归档时 `rename` 失败（Windows 绑定挂载被占用）会回退为日志化复制，支持中断续跑与回滚。
+- **无密钥搜索后端**：`web_search` 新增 `bing`（cn.bing.com）与 `baidu` 两个爬取后端，国内网络可直连，无需 API Key。
+- **Docker 构建修复**：apt / npm 走国内镜像并预置 `libllvm15`，修复无外网环境下的构建失败。
+- **更新源**：内置「版本与更新」检查本仓库（`ThanatosXingYu/BRTEX`）的发布，不再依赖上游。
 
 ---
 
 ## 审批记录详情
 
-全局「审批记录」、任务内「拦截审批」及对话中的审批卡片均支持展开查看详情。展示结构参考
-[AegisHook 的审批详情组件](https://github.com/RuoJi6/AegisHook/blob/main/web/src/components/CallDetail.vue)，沿用 ARTEX 的组件和主题：
+全局「审批记录」、任务内「拦截审批」及对话中的审批卡片均支持展开查看详情，沿用项目的组件和主题。
 
 
 ## 资产同步（ScopeSentry）
@@ -71,14 +45,14 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/mhtsec/ARTEX.git
-cd ARTEX
+git clone https://github.com/ThanatosXingYu/BRTEX.git
+cd BRTEX
 ./install.sh
 ```
 
 脚本会：检测 / 自动安装 Docker → 让你选 **① 全部 Docker** 或 **② 本地编译运行**：
 
-- **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
+- **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → 本地构建镜像并 `docker compose up -d`。
 - **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动。
 
 装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
@@ -86,15 +60,15 @@ cd ARTEX
 ### 方式二：Docker Compose（手动）
 
 ```bash
-git clone https://github.com/mhtsec/ARTEX.git
-cd ARTEX
+git clone https://github.com/ThanatosXingYu/BRTEX.git
+cd BRTEX
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 mianhuatang11/artex 镜像 + postgres
+docker compose build          # 本地从源码构建镜像（不依赖外部镜像源）
+docker compose up -d          # 启动 + postgres
 # → http://localhost:8787
 ```
 
-> 原镜像源 `autumn27/artex` 已从 Docker Hub 删除，镜像现由本仓库自维护为 **`mianhuatang11/artex`**。
-> 镜像源不可用（或想自行改代码）时，本地从纯源码构建即可：`docker compose build && docker compose up -d`。
+> 镜像名预留为 `ghcr.io/thanatosxingyu/brtex`，打过 tag 后由 GitHub Actions 自动发布；日常使用本地构建即可。
 > Dockerfile 为多阶段构建（前端静态导出 → Go 静态编译 → 运行镜像），默认走国内友好依赖源，可加 `--build-arg GOPROXY=... / --build-arg NPM_REGISTRY=...` 覆盖。
 
 镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
@@ -104,9 +78,9 @@ docker compose up -d          # 拉取 mianhuatang11/artex 镜像 + postgres
 `/message?sessionId=...` 接收 JSON-RPC 请求；配置时将 URL 填为 `/sse`，请求头按
 `Authorization=Bearer <token>` 填写。
 
-### 方式三：下载预编译二进制（Releases）
+### 方式三：预编译二进制（Releases）
 
-到原仓库 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip（**本备份仓库不托管二进制**，若原 Releases 也失效请用方式二或方式四）：解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
+本仓库目前只发布源码包，未托管预编译二进制；需要二进制时请用方式二（Docker）或方式四（源码编译）。若以后发布二进制，会在此处提供说明：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接
@@ -134,7 +108,7 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 ```bash
 ./build.sh --release
-# 产物：dist/artex-0.3.3-*.zip
+# 产物：dist/artex-<版本>-*.zip
 ```
 
 UPX 自解压二进制可能与部分 Linux 内核、虚拟化环境或安全策略不兼容，因此默认不启用。可用 `ARTEX_TARGETS` 自定义目标；确认目标运行环境兼容时，可显式传入 `--upx` 进一步缩小二进制：
@@ -160,40 +134,35 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 - **随时可回退**：上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」。注意数据库结构不会回退。
 - **更新会中断正在运行的任务**——更新即重启，请在空闲时进行。
 - **开发构建不给更新**：版本号是 `dev` 或 `git describe` 带后缀时禁用，避免正式版覆盖掉本地调试的二进制。
-- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级仍请用 `docker compose pull artex && docker compose up -d artex`。
+- **Docker 下只换程序、不换镜像**：镜像里的 playwright / nmap 等工具链不会跟着升级，且 `docker compose up -d` 重建容器后会退回镜像自带的版本。要连镜像一起升级请用 `docker compose build --pull artex && docker compose up -d artex`。
 - 访问 GitHub 需要代理时，在同一页面配置**全局代理**即可，更新链路会走它。更新只从 GitHub 域名下载并强制 HTTPS。
+- **发布未就绪时**：本仓库目前只有源码发布，页面一键更新需要仓库提供带 `SHA256SUMS` 的二进制 Release；在此之前请用 `./update.sh`、Docker 或源码编译更新。
 
 ### 方式二：一键更新脚本
 
 ```bash
-cd ARTEX
+cd BRTEX
 ./update.sh
 ```
 
 脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
 
-- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
+- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose build --pull artex` → `docker compose up -d`（换新镜像重启即自动迁移）。
 - **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
 
 ### 方式三：Docker Compose（手动）
 
 ```bash
-cd ARTEX
+cd BRTEX
 git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
-docker compose pull artex
+docker compose build           # 重新构建镜像（含最新源码）
 docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
 docker image prune -f          # 清理旧镜像（可选）
 ```
 
 ### 方式四：预编译二进制（Releases）
 
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
-
-```bash
-cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
-./start.sh
-```
+本仓库暂未发布预编译二进制；请用方式一（页面更新）配合自建构建，或方式五（源码编译）。
 
 ### 方式五：从源码编译
 
@@ -283,17 +252,12 @@ server {
 - 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
 - 测试：`go test ./...`
 - Mock 预览（无后端）：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
-- 在线 Demo 重新部署（Cloudflare Pages，静态导出 + Mock 数据）：
-  ```bash
-  cd web && NEXT_PUBLIC_MOCK=1 npm run build:static
-  CLOUDFLARE_API_TOKEN=<token> npx wrangler pages deploy out --project-name=artex-demo --branch=main
-  ```
 
 ---
 
 ## 系统技术架构
 
-ARTEX 是一套 **LLM 多 agent 驱动的自主渗透系统**：Go 单体后端（内嵌 Next.js 前端）+ PostgreSQL，agent 能力由 [`norma`](https://github.com/Autumn-27/norma) SDK 提供（`agentcore` / `tool` / `permission` / `harness` / `memory` / `transcript`）。核心是**双图架构**，以及围绕它的两条自主性机制：**worker 间过程级信息交换**与 **planner 多轮共享 todolist 稳定攻击链路**。
+ARTEX 是一套 **LLM 多 agent 驱动的自主渗透系统**：Go 单体后端（内嵌 Next.js 前端）+ PostgreSQL，agent 能力由仓库内 vendored 的 `norma` SDK 提供（`agentcore` / `tool` / `permission` / `harness` / `memory` / `transcript`，位于 `./norma`）。核心是**双图架构**，以及围绕它的两条自主性机制：**worker 间过程级信息交换**与 **planner 多轮共享 todolist 稳定攻击链路**。
 
 ### 总体分层
 
@@ -461,33 +425,19 @@ flowchart TB
 
 ---
 
-## 交流群
-
-扫码关注微信公众号 **SecSentry**，在公众号后台私信即可入群交流。
-
-<div align="center">
-
-<img src="screenshots/wx.png" alt="微信公众号 SecSentry" width="480" />
-
-</div>
-
----
-## 参考
-
-https://github.com/oritera/Cairn
-
-
 ## 许可与免责声明
 
 ### 开源协议
 
 本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 授权，完整条款见仓库根目录的 [LICENSE](LICENSE) 文件。
 
+本项目是 ARTEX 的衍生修改版，原始代码版权归原作者所有；修改部分同样按 AGPL-3.0 发布。
+
 这意味着任何人都可以自由使用、修改和分发本项目，但**衍生作品必须同样以 AGPL-3.0 开源**；特别地，**若你修改本项目并通过网络（如部署为在线服务）向用户提供，也必须向这些用户公开对应的完整源码**。
 
 > ⚠️ **重要提示**：开源协议本身不限制软件的使用用途。以下的「使用限制」与「免责声明」是作者对使用者的额外约定与郑重声明，请务必遵守。
 
-**ARTEX 仅供个人学习、代码研究与本地技术验证使用，不得用于对任何线上系统或网站发起实际测试。**
+**本项目仅供个人学习、代码研究与本地技术验证使用，不得用于对任何线上系统或网站发起实际测试。**
 
 ### 允许使用范围
 
