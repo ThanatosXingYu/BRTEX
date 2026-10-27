@@ -459,6 +459,20 @@ func (l *loop) run() {
 			l.finish(ReasonModelError, streamErr, "")
 			return
 		}
+		// A relay can truncate the upstream mid-reasoning and then mirror the
+		// accumulated reasoning into `content` before closing the stream cleanly.
+		// The turn arrives with no error, no tool call and no real answer, so the
+		// run would stop as if the model had finished. Treat it as a broken turn.
+		if stopReason != "max_tokens" && len(asst.ToolUses()) == 0 && mirroredReasoning(asst) {
+			turnUsage := usageDelta(usageBefore, l.usage)
+			resumed, stopped := l.resumeBrokenTurn(asst, exec, nil, turnUsage)
+			if stopped {
+				return
+			}
+			if resumed {
+				continue
+			}
+		}
 		l.hasAttemptedReactiveCompact = false
 		l.streamResumeCount = 0
 		l.messages = append(l.messages, asst)
@@ -690,6 +704,9 @@ func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr er
 	if l.in.Compactor != nil && l.in.Compactor.IsOverflow(streamErr) {
 		return false, false
 	}
+	// A mirrored turn repeats its reasoning in the text block; that copy is not
+	// an answer, so it must not stay in history or be glued onto the final text.
+	mirrored := len(asst.ToolUses()) == 0 && mirroredReasoning(asst)
 	delivered := exec.count() > 0 || strings.TrimSpace(asst.Text()) != ""
 	if !delivered {
 		// Nothing reached the user; re-asking would just replay the failed request.
@@ -716,6 +733,9 @@ func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr er
 		if b.Type == llm.BlockToolUse && !ran[b.ID] {
 			continue // input was cut off mid-stream; never executed
 		}
+		if mirrored && b.Type == llm.BlockText {
+			continue // verbatim copy of the reasoning, not an answer
+		}
 		kept = append(kept, b)
 	}
 	if len(kept) > 0 {
@@ -736,7 +756,9 @@ func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr er
 			l.record(em, llm.Usage{})
 		}
 	}
-	l.resumeCarry.WriteString(asst.Text())
+	if !mirrored {
+		l.resumeCarry.WriteString(asst.Text())
+	}
 	nudge := llm.UserText(
 		"上一条回复在输出中途中断了（模型连接断开）。请从断开处直接继续：不要道歉、不要重述已经写过的内容、不要重新开始任务，接着把没写完的部分写完，或接着调用工具。")
 	l.messages = append(l.messages, nudge)
@@ -744,6 +766,26 @@ func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr er
 	l.streamResumeCount++
 	l.lastContinue = ContinueStreamResume
 	return true, false
+}
+
+// mirroredReasoning reports whether the turn's text blocks merely repeat its
+// thinking blocks verbatim. Some OpenAI-compatible relays truncate the upstream
+// mid-reasoning and then copy the accumulated reasoning into `content`, yielding
+// a turn that looks complete but carries no actual answer.
+func mirroredReasoning(m llm.Message) bool {
+	var think, text strings.Builder
+	for _, b := range m.Content {
+		switch b.Type {
+		case llm.BlockThinking:
+			think.WriteString(b.Thinking)
+		case llm.BlockText:
+			text.WriteString(b.Text)
+		}
+	}
+	if think.Len() == 0 || text.Len() == 0 {
+		return false
+	}
+	return strings.TrimSpace(think.String()) == strings.TrimSpace(text.String())
 }
 
 // checkBudgetContinue continues with a nudge while under 90% of budget and not

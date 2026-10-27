@@ -128,6 +128,65 @@ func TestStreamBreakPairsExecutedToolsAndDropsTruncatedCall(t *testing.T) {
 	}
 }
 
+// mirroredTurn mimics a relay that truncates the upstream mid-reasoning and
+// mirrors the accumulated reasoning into `content` before closing cleanly.
+func mirroredTurn(reasoning string) []llm.StreamEvent {
+	return []llm.StreamEvent{
+		{Type: llm.SEThinkingDelta, Text: reasoning},
+		{Type: llm.SETextDelta, Text: reasoning},
+		{Type: llm.SEMessageDelta, StopReason: "end_turn"},
+		{Type: llm.SEMessageStop},
+	}
+}
+
+func TestMirroredReasoningResumes(t *testing.T) {
+	const trace = "Now update generator maps and status"
+	m := &failingModel{
+		turns: [][]llm.StreamEvent{mirroredTurn(trace), textTurn("done")},
+		errs:  []error{nil, nil},
+	}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(), PermissionMode: permission.ModeBypass}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if term.Reason != ReasonCompleted || term.Text != "done" {
+		t.Fatalf("terminal=%+v", term)
+	}
+	if m.calls != 2 {
+		t.Fatalf("calls=%d, want a resume after the mirrored turn", m.calls)
+	}
+	nudged := false
+	for _, msg := range term.Messages {
+		if strings.Contains(msg.Text(), "从断开处") {
+			nudged = true
+		}
+		if strings.TrimSpace(msg.Text()) == trace {
+			t.Fatalf("mirrored reasoning kept as an answer: %+v", msg)
+		}
+	}
+	if !nudged {
+		t.Fatalf("resume nudge not injected: %+v", term.Messages)
+	}
+}
+
+func TestDistinctReasoningDoesNotResume(t *testing.T) {
+	m := &failingModel{
+		turns: [][]llm.StreamEvent{{
+			{Type: llm.SEThinkingDelta, Text: "let me check the file"},
+			{Type: llm.SETextDelta, Text: "the file contains X"},
+			{Type: llm.SEMessageDelta, StopReason: "end_turn"},
+			{Type: llm.SEMessageStop},
+		}},
+		errs: []error{nil},
+	}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(), PermissionMode: permission.ModeBypass}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if term.Reason != ReasonCompleted || term.Text != "the file contains X" {
+		t.Fatalf("terminal=%+v", term)
+	}
+	if m.calls != 1 {
+		t.Fatalf("calls=%d, want no resume for a real answer", m.calls)
+	}
+}
+
 func maxTokensTurn(text string) []llm.StreamEvent {
 	return []llm.StreamEvent{
 		{Type: llm.SETextDelta, Text: text},
