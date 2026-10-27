@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/transcript"
 	"github.com/ThanatosXingYu/BRTEX/agent"
 	"github.com/ThanatosXingYu/BRTEX/db"
 	"github.com/ThanatosXingYu/BRTEX/llmrec"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 type taskAgentBundle struct {
@@ -399,13 +399,13 @@ func streamEventCommitsOutput(event llm.StreamEvent) bool {
 // 冒泡成 model_error,零重试。只要一个 token 都还没交给调用方(!committed),重放
 // 完全相同的请求就不会重复模型输出或工具副作用,因此这里补一层同 provider 退避重试,
 // 把这类抖动挡在意图整体重跑之前。可被 LLM 配置的重试覆盖/全局重试策略改写。
-const sameProviderStreamRetries = 2
+const sameProviderStreamRetries = 10
 
-// sameProviderRetryBackoff 是第 attempt 次重试前的【默认】退避(0.5s、1s…,上限 4s),
-// 与 SDK 的指数梯度同风格但封顶更小,避免拖住 worker 的收尾/取消响应。
-// 以变量形式暴露,便于测试将退避置零。
-var sameProviderRetryBackoff = func(attempt int) time.Duration {
-	return min(500*time.Millisecond*(1<<attempt), 4*time.Second)
+// sameProviderRetryBackoff 是第 attempt 次重试前的【默认】退避(固定 10s)。固定间隔
+// 让连续抖动有足够恢复时间,同时行为可预测,类似 Codex 的重试节奏。以变量形式暴露,
+// 便于测试将退避置零。
+var sameProviderRetryBackoff = func(int) time.Duration {
+	return 10 * time.Second
 }
 
 // sameProviderRetryPolicy 解析这次调用用哪套同 provider 重试参数:配置里设了次数就

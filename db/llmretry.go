@@ -84,7 +84,7 @@ type LLMRetryPolicy struct {
 	Connect RetryRule `json:"connect"`
 	// Empty：SDK 空响应重试(完成但无 content block，仅 openai 格式)。默认 2 次、指数退避。
 	Empty RetryRule `json:"empty"`
-	// Stream：同 provider 安全窗口重试(未交付输出前的断流重放)。默认 2 次、0.5s 起指数(封顶 4s)。
+	// Stream：同 provider 安全窗口重试(未交付输出前的断流重放)。默认 10 次、固定 10s。
 	Stream RetryRule `json:"stream"`
 	// Breaker：轮询熔断。Attempts=连续几次瞬时失败触发熔断(默认 3，-1=瞬时失败不熔断，
 	// 硬失败如余额不足/密钥失效仍立即熔断)；IntervalMS=固定冷却时长(0=默认 30s…10min 梯度)。

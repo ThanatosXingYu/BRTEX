@@ -21,12 +21,12 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/ThanatosXingYu/BRTEX/llmrec"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/ThanatosXingYu/BRTEX/llmrec"
 )
 
 // Config describes the LLM backend resolved from the environment.
@@ -95,7 +95,7 @@ type RetryConfig struct {
 	EmptyInterval time.Duration
 	// StreamAttempts/StreamInterval:同 provider 安全窗口重试——本项目在 SDK 之上补的
 	// 一层,只在「还没向调用方交付任何输出」时重放断流/过载/流内 429。SDK 看不到它,
-	// 由 server/task_llm.go 消费。默认 2 次、0.5s 起指数(封顶 4s)。
+	// 由 server/task_llm.go 消费。默认 10 次、固定 10s。
 	StreamAttempts int
 	StreamInterval time.Duration
 }

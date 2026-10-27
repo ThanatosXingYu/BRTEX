@@ -82,10 +82,10 @@ export const RETRY_LAYERS = {
       "流已经建立（拿到 200）之后才出问题：连接中途断开、供应商 overloaded、流内的 429 / 5xx 错误事件——且一个 token 都还没交给调用方。",
     skips:
       "额度耗尽（402 / insufficient_quota，交给轮询换配置）、上下文过长（413 / context length，交给压缩）、400 / 401 / 403 / 404 / 422 确定性拒绝，都不重试。",
-    desc: "在同一个配置上重放同一个请求。因为还没交付任何输出，重放不会重复模型输出或工具执行。",
+    desc: "在同一个配置上重放同一个请求。因为还没交付任何输出，重放不会重复模型输出或工具执行。默认 10 次、每次固定 10s。",
     attemptsLabel: "重试次数",
-    defAttempts: 2,
-    defInterval: "0.5s→1s 指数（封顶 4s）",
+    defAttempts: 10,
+    defInterval: "固定 10s",
     offHint: "-1 = 断流直接交给外层的意图重跑",
   },
   breaker: {
