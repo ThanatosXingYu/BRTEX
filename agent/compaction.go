@@ -55,7 +55,7 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 		n:        20,
 		m:        8,
 		cooldown: 60 * time.Second,
-		maxDur:   5 * time.Minute,
+		maxDur:   10 * time.Minute,
 		running:  map[int64]bool{},
 		lastRun:  map[int64]time.Time{},
 	}
@@ -509,8 +509,23 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 	return sb.String()
 }
 
+const (
+	// compressAttempts bounds how many times one block's body call is tried.
+	compressAttempts = 3
+	// compressAttemptTimeout caps one attempt so a stalled call is abandoned
+	// while budget remains for the retry (three attempts + backoff stay inside
+	// the 10-minute compaction deadline).
+	compressAttemptTimeout = 3 * time.Minute
+	// compressBackoff is the pause between compress attempts. The whole
+	// compaction shares one ctx deadline (maxDur), so retries stop as soon as
+	// it expires.
+	compressBackoff = 10 * time.Second
+)
+
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
-// runs on; thinking disabled (a pure summarization step).
+// runs on; thinking disabled (a pure summarization step). A relay that drops the
+// stream or stalls mid-call leaves the block uncompressed until the next round
+// threshold, so retry a couple of times before giving up.
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
 	req := llm.CompletionRequest{
 		System:    []string{compressionSystemPrompt},
@@ -518,15 +533,32 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 		MaxTokens: 1500,
 		Thinking:  "disabled",
 	}
-	msg, _, _, err := c.prov.Complete(ctx, req)
-	if err != nil {
-		return "", err
+	var lastErr error
+	for attempt := 1; attempt <= compressAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		callCtx, cancel := context.WithTimeout(ctx, compressAttemptTimeout)
+		msg, _, _, err := c.prov.Complete(callCtx, req)
+		cancel()
+		if err == nil {
+			if body := strings.TrimSpace(msg.Text()); body != "" {
+				return body, nil
+			}
+			err = fmt.Errorf("empty body from model")
+		}
+		lastErr = err
+		if attempt == compressAttempts || ctx.Err() != nil {
+			break
+		}
+		log.Printf("[compaction] compress attempt %d/%d failed: %v (retrying in %v)", attempt, compressAttempts, err, compressBackoff)
+		select {
+		case <-ctx.Done():
+			return "", lastErr
+		case <-time.After(compressBackoff):
+		}
 	}
-	body := strings.TrimSpace(msg.Text())
-	if body == "" {
-		return "", fmt.Errorf("empty body from model")
-	}
-	return body, nil
+	return "", lastErr
 }
 
 // compressionSystemPrompt is the §4 body prompt.

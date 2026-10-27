@@ -32,7 +32,11 @@ func (p captureUsageProvider) Complete(ctx context.Context, req llm.CompletionRe
 
 func TestCaptureRunPersistsUsageOnProviderFailure(t *testing.T) {
 	wantErr := errors.New("provider failed after reporting usage")
+	// 断流发生在已交付输出之后时,harness 会从断点续写(有上限);每次尝试都真实消耗
+	// token,所以 result 行报的是所有尝试的累计值。
+	attempts := 0
 	provider := captureUsageProvider{stream: func(_ context.Context, yield func(llm.StreamEvent, error) bool) {
+		attempts++
 		// 遵守迭代器协议:yield 返回 false 后立即停止,不再调用它。
 		if !yield(llm.StreamEvent{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 11, CacheReadTokens: 3}}, nil) {
 			return
@@ -53,7 +57,10 @@ func TestCaptureRunPersistsUsageOnProviderFailure(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("captureRun error=%v, want %v", err, wantErr)
 	}
-	assertCapturedResultUsage(t, activities, 11, 7, 3, 2)
+	if attempts < 2 {
+		t.Fatalf("a break after delivered output should be retried from the break point, attempts=%d", attempts)
+	}
+	assertCapturedResultUsage(t, activities, 11*attempts, 7*attempts, 3*attempts, 2*attempts)
 }
 
 func TestCaptureRunPersistsUsageOnCancellation(t *testing.T) {

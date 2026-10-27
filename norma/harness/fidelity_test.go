@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"strings"
 	"testing"
@@ -10,6 +11,122 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	"github.com/Autumn-27/norma/tool"
 )
+
+// failingModel plays scripted turns; a non-nil entry in errs makes that call fail
+// after its events are delivered, mimicking a provider that drops the connection
+// mid-output.
+type failingModel struct {
+	turns [][]llm.StreamEvent
+	errs  []error
+	calls int
+}
+
+func (m *failingModel) call(_ context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	i := m.calls
+	m.calls++
+	return func(yield func(llm.StreamEvent, error) bool) {
+		for _, ev := range m.turns[i] {
+			if !yield(ev, nil) {
+				return
+			}
+		}
+		if m.errs[i] != nil {
+			yield(llm.StreamEvent{}, m.errs[i])
+		}
+	}
+}
+
+func TestStreamBreakResumesAndKeepsPartialText(t *testing.T) {
+	m := &failingModel{
+		turns: [][]llm.StreamEvent{
+			{{Type: llm.SETextDelta, Text: "first half "}},
+			textTurn("second half"),
+		},
+		errs: []error{errors.New("unexpected EOF"), nil},
+	}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(), PermissionMode: permission.ModeBypass}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if term.Reason != ReasonCompleted {
+		t.Fatalf("reason=%v, want completed (resume after mid-stream break)", term.Reason)
+	}
+	if term.Text != "first half second half" {
+		t.Fatalf("partial text lost: %q", term.Text)
+	}
+	// user, asst(partial), user(resume), asst(finished)
+	if len(term.Messages) != 4 || !strings.Contains(term.Messages[2].Text(), "从断开处") {
+		t.Fatalf("resume nudge not injected: %+v", term.Messages)
+	}
+}
+
+func TestStreamBreakResumeLimit(t *testing.T) {
+	broken := func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		return func(yield func(llm.StreamEvent, error) bool) {
+			if !yield(llm.StreamEvent{Type: llm.SETextDelta, Text: "x"}, nil) {
+				return
+			}
+			yield(llm.StreamEvent{}, errors.New("connection reset"))
+		}
+	}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(), PermissionMode: permission.ModeBypass, MaxTurns: 20}
+	term := drain(t, in, QueryDeps{CallModel: broken})
+	if term.Reason != ReasonModelError {
+		t.Fatalf("reason=%v, want model_error after resume limit", term.Reason)
+	}
+	resumes := 0
+	for _, msg := range term.Messages {
+		if strings.Contains(msg.Text(), "从断开处") {
+			resumes++
+		}
+	}
+	if resumes != maxStreamResumeLimit {
+		t.Fatalf("expected %d resume injections, got %d", maxStreamResumeLimit, resumes)
+	}
+	if term.Text != strings.Repeat("x", maxStreamResumeLimit) {
+		t.Fatalf("partial text from broken turns should survive: %q", term.Text)
+	}
+}
+
+func TestStreamBreakPairsExecutedToolsAndDropsTruncatedCall(t *testing.T) {
+	m := &failingModel{
+		turns: [][]llm.StreamEvent{{
+			{Type: llm.SETextDelta, Text: "checking"},
+			{Type: llm.SEToolUseStart, ToolID: "c1", ToolName: "Bash"},
+			{Type: llm.SEToolInputJSON, Text: `{"command":"echo hi"}`},
+			// c2's input was cut off by the break: it must never be executed.
+			{Type: llm.SEToolUseStart, ToolID: "c2", ToolName: "Bash"},
+			{Type: llm.SEToolInputJSON, Text: `{"command":"echo`},
+		}, textTurn("done")},
+		errs: []error{errors.New("unexpected EOF"), nil},
+	}
+	in := QueryInput{
+		Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(tool.NewBash()),
+		PermissionMode: permission.ModeBypass, WorkingDir: t.TempDir(),
+	}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if term.Reason != ReasonCompleted || term.Text != "checkingdone" {
+		t.Fatalf("terminal=%+v", term)
+	}
+	var toolUses, toolResults int
+	for _, msg := range term.Messages {
+		for _, b := range msg.Content {
+			switch b.Type {
+			case llm.BlockToolUse:
+				toolUses++
+				if b.ID != "c1" {
+					t.Fatalf("truncated tool_use leaked into history: %s", b.ID)
+				}
+			case llm.BlockToolResult:
+				toolResults++
+				if b.ToolUseID != "c1" {
+					t.Fatalf("unexpected tool_result id %q", b.ToolUseID)
+				}
+			}
+		}
+	}
+	if toolUses != 1 || toolResults != 1 {
+		t.Fatalf("tool_use=%d tool_result=%d, want 1/1", toolUses, toolResults)
+	}
+}
 
 func maxTokensTurn(text string) []llm.StreamEvent {
 	return []llm.StreamEvent{

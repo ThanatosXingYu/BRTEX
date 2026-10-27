@@ -250,6 +250,12 @@ type loop struct {
 	stopHookActive               bool
 	budget                       budgetTracker
 	lastContinue                 ContinueReason
+	// streamResumeCount counts consecutive resumes of a turn whose model stream
+	// broke after output was delivered; reset once a turn streams cleanly.
+	streamResumeCount int
+	// resumeCarry holds text from broken turns so the final Terminal.Text is the
+	// whole answer, not just the tail the model wrote after resuming.
+	resumeCarry strings.Builder
 }
 
 const (
@@ -258,6 +264,9 @@ const (
 	budgetDiminishingThreshold   = 500
 	escalatedMaxTokens           = 64000
 	maxOutputTokensRecoveryLimit = 3
+	// maxStreamResumeLimit bounds how many times one turn is re-asked after its
+	// stream broke mid-output (a flaky provider usually recovers within one).
+	maxStreamResumeLimit = 3
 	// maxLoopIterations is a defensive backstop; turnCount counts only tool-turns,
 	// so this only guards against a pathological recovery/continuation loop.
 	maxLoopIterations = 10000
@@ -343,6 +352,12 @@ func countBoundaries(msgs []llm.Message) int {
 }
 
 func (l *loop) finish(reason TerminalReason, err error, text string) {
+	// Text from turns whose stream broke mid-output was never repeated by the
+	// model (the resume nudge tells it to pick up where it stopped), so glue it
+	// in front of the final text to keep the whole answer.
+	if l.resumeCarry.Len() > 0 && (text != "" || reason == ReasonModelError) {
+		text = l.resumeCarry.String() + text
+	}
 	l.yield(Event{Kind: KindResult, Terminal: &Terminal{
 		Reason:   reason,
 		Err:      err,
@@ -429,10 +444,23 @@ func (l *loop) run() {
 				l.finish(ReasonPromptTooLong, streamErr, "")
 				return
 			}
+			// The provider dropped the connection after the model had already
+			// produced output. The gateway's own retry only covers the window
+			// before the first token, so instead of discarding the partial turn
+			// ask the model to continue from where it stopped.
+			turnUsage := usageDelta(usageBefore, l.usage)
+			resumed, stopped := l.resumeBrokenTurn(asst, exec, streamErr, turnUsage)
+			if stopped {
+				return
+			}
+			if resumed {
+				continue
+			}
 			l.finish(ReasonModelError, streamErr, "")
 			return
 		}
 		l.hasAttemptedReactiveCompact = false
+		l.streamResumeCount = 0
 		l.messages = append(l.messages, asst)
 		turnUsage := usageDelta(usageBefore, l.usage)
 		// The size the model just reported for its input, preferred by the
@@ -648,6 +676,76 @@ func (l *loop) handleMaxOutputTokens() bool {
 	return false
 }
 
+// resumeBrokenTurn salvages a turn whose model stream failed mid-output: the
+// partial assistant message is kept (minus any tool_use whose input was cut off),
+// tools that already ran are paired with their results, and a nudge asks the
+// model to continue from the break point. It reports whether the turn should be
+// retried (resumed) and whether the consumer stopped (run should return).
+func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr error, turnUsage llm.Usage) (resumed, stopped bool) {
+	// Wrap-up has a strict small budget, and a context-overflow break needs
+	// compaction (handled above), not another request.
+	if l.settling || l.streamResumeCount >= maxStreamResumeLimit {
+		return false, false
+	}
+	if l.in.Compactor != nil && l.in.Compactor.IsOverflow(streamErr) {
+		return false, false
+	}
+	delivered := exec.count() > 0 || strings.TrimSpace(asst.Text()) != ""
+	if !delivered {
+		// Nothing reached the user; re-asking would just replay the failed request.
+		return false, false
+	}
+	if exec.count() > 0 {
+		var aborted bool
+		if stopped, aborted = exec.finish(); stopped {
+			return false, true
+		}
+		if aborted {
+			// The run's own wall-clock budget interrupted the tools; ending here lets
+			// the caller report the original failure instead of fighting the deadline.
+			return false, false
+		}
+	}
+	results := exec.results()
+	ran := make(map[string]bool, len(results))
+	for _, r := range results {
+		ran[r.ToolUseID] = true
+	}
+	kept := make([]llm.ContentBlock, 0, len(asst.Content))
+	for _, b := range asst.Content {
+		if b.Type == llm.BlockToolUse && !ran[b.ID] {
+			continue // input was cut off mid-stream; never executed
+		}
+		kept = append(kept, b)
+	}
+	if len(kept) > 0 {
+		partial := llm.Message{Role: llm.RoleAssistant, Content: kept}
+		l.messages = append(l.messages, partial)
+		l.record(partial, turnUsage)
+		// A broken stream often reports no usage; keep the previous estimate then.
+		if n := turnUsage.InputTokens + turnUsage.OutputTokens; n > 0 {
+			l.lastInputTokens = n
+		}
+	}
+	if len(results) > 0 {
+		resultMsg := llm.Message{Role: llm.RoleUser, Content: results}
+		l.messages = append(l.messages, resultMsg)
+		l.record(resultMsg, llm.Usage{})
+		for _, em := range exec.extraMessages() {
+			l.messages = append(l.messages, em)
+			l.record(em, llm.Usage{})
+		}
+	}
+	l.resumeCarry.WriteString(asst.Text())
+	nudge := llm.UserText(
+		"上一条回复在输出中途中断了（模型连接断开）。请从断开处直接继续：不要道歉、不要重述已经写过的内容、不要重新开始任务，接着把没写完的部分写完，或接着调用工具。")
+	l.messages = append(l.messages, nudge)
+	l.record(nudge, llm.Usage{})
+	l.streamResumeCount++
+	l.lastContinue = ContinueStreamResume
+	return true, false
+}
+
 // checkBudgetContinue continues with a nudge while under 90% of budget and not
 // in diminishing returns; otherwise stops.
 func (l *loop) checkBudgetContinue() bool {
@@ -845,6 +943,13 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			curID, curName, building = ev.ToolID, ev.ToolName, true
 		}
 		acc.Add(ev)
+	}
+	if err != nil && building {
+		// The stream died mid-tool-input, so this block's JSON is truncated. Drop
+		// it rather than finalizing it (which coerces to "{}" and would execute a
+		// tool with garbage arguments); resumeBrokenTurn strips it from the message.
+		building = false
+		curInput.Reset()
 	}
 	if !finalizeTool() {
 		return asst, exec, "", nil, true, false

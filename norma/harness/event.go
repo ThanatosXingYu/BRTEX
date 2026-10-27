@@ -60,6 +60,7 @@ const (
 	ContinueStopHookBlocking        ContinueReason = "stop_hook_blocking"
 	ContinueTokenBudget             ContinueReason = "token_budget_continuation"
 	ContinueTaskNotification        ContinueReason = "task_notification"
+	ContinueStreamResume            ContinueReason = "stream_resume"
 )
 
 // Terminal is the final state of a Query, delivered as the KindResult event.
