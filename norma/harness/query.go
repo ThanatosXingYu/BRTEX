@@ -459,11 +459,13 @@ func (l *loop) run() {
 			l.finish(ReasonModelError, streamErr, "")
 			return
 		}
-		// A relay can truncate the upstream mid-reasoning and then mirror the
-		// accumulated reasoning into `content` before closing the stream cleanly.
-		// The turn arrives with no error, no tool call and no real answer, so the
-		// run would stop as if the model had finished. Treat it as a broken turn.
-		if stopReason != "max_tokens" && len(asst.ToolUses()) == 0 && mirroredReasoning(asst) {
+		// A relay can truncate the upstream mid-reasoning and then close the stream
+		// cleanly with either the accumulated reasoning mirrored into `content` or no
+		// content at all. The turn arrives with no error, no tool call and no real
+		// answer, so the run would stop as if the model had finished. Treat it as a
+		// broken turn.
+		if stopReason != "max_tokens" && len(asst.ToolUses()) == 0 &&
+			(mirroredReasoning(asst) || isThinkingOnly(asst)) {
 			turnUsage := usageDelta(usageBefore, l.usage)
 			resumed, stopped := l.resumeBrokenTurn(asst, exec, nil, turnUsage)
 			if stopped {
@@ -707,8 +709,12 @@ func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr er
 	// A mirrored turn repeats its reasoning in the text block; that copy is not
 	// an answer, so it must not stay in history or be glued onto the final text.
 	mirrored := len(asst.ToolUses()) == 0 && mirroredReasoning(asst)
+	// A thinking-only turn is the same failure without the mirrored copy: the
+	// stream died right after reasoning, so there is no answer to keep but the
+	// model did leave a plan in its thinking that a nudge can resume.
+	emptyTurn := len(asst.ToolUses()) == 0 && isThinkingOnly(asst)
 	delivered := exec.count() > 0 || strings.TrimSpace(asst.Text()) != ""
-	if !delivered {
+	if !delivered && !emptyTurn {
 		// Nothing reached the user; re-asking would just replay the failed request.
 		return false, false
 	}
@@ -759,13 +765,33 @@ func (l *loop) resumeBrokenTurn(asst llm.Message, exec *streamExec, streamErr er
 	if !mirrored {
 		l.resumeCarry.WriteString(asst.Text())
 	}
-	nudge := llm.UserText(
-		"上一条回复在输出中途中断了（模型连接断开）。请从断开处直接继续：不要道歉、不要重述已经写过的内容、不要重新开始任务，接着把没写完的部分写完，或接着调用工具。")
+	prompt := "上一条回复在输出中途中断了（模型连接断开）。请从断开处直接继续：不要道歉、不要重述已经写过的内容、不要重新开始任务，接着把没写完的部分写完，或接着调用工具。"
+	if emptyTurn {
+		// The stream died before any text or tool call was emitted; the model only
+		// got as far as thinking. Ask it to act on that plan instead of repeating it.
+		prompt = "上一条回复只输出了思考过程，正文和工具调用都没有发出来（模型输出在思考阶段被上游截断）。请直接执行你刚才想好的下一步：要么调用工具，要么给出结论文字。不要重复思考。"
+	}
+	nudge := llm.UserText(prompt)
 	l.messages = append(l.messages, nudge)
 	l.record(nudge, llm.Usage{})
 	l.streamResumeCount++
 	l.lastContinue = ContinueStreamResume
 	return true, false
+}
+
+// isThinkingOnly reports whether the turn carries reasoning but neither visible
+// text nor a tool call — the shape a relay leaves when it cuts the upstream
+// mid-reasoning and still closes the stream cleanly.
+func isThinkingOnly(m llm.Message) bool {
+	if len(m.ToolUses()) > 0 || strings.TrimSpace(m.Text()) != "" {
+		return false
+	}
+	for _, b := range m.Content {
+		if b.Type == llm.BlockThinking && strings.TrimSpace(b.Thinking) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // mirroredReasoning reports whether the turn's text blocks merely repeat its

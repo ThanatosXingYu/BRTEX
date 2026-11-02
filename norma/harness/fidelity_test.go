@@ -167,6 +167,58 @@ func TestMirroredReasoningResumes(t *testing.T) {
 	}
 }
 
+// thinkingOnlyTurn mimics a relay that cuts the upstream mid-reasoning and closes
+// cleanly without emitting any content: no error, no text, no tool call.
+func thinkingOnlyTurn(reasoning string) []llm.StreamEvent {
+	return []llm.StreamEvent{
+		{Type: llm.SEThinkingDelta, Text: reasoning},
+		{Type: llm.SEMessageDelta, StopReason: "end_turn"},
+		{Type: llm.SEMessageStop},
+	}
+}
+
+func TestThinkingOnlyTurnResumes(t *testing.T) {
+	const trace = "Let me check the directory contents"
+	m := &failingModel{
+		turns: [][]llm.StreamEvent{thinkingOnlyTurn(trace), textTurn("done")},
+		errs:  []error{nil, nil},
+	}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(), PermissionMode: permission.ModeBypass}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if term.Reason != ReasonCompleted || term.Text != "done" {
+		t.Fatalf("terminal=%+v", term)
+	}
+	if m.calls != 2 {
+		t.Fatalf("calls=%d, want a resume after a thinking-only turn", m.calls)
+	}
+	nudged := false
+	for _, msg := range term.Messages {
+		if strings.Contains(msg.Text(), "不要重复思考") {
+			nudged = true
+		}
+	}
+	if !nudged {
+		t.Fatalf("resume nudge not injected: %+v", term.Messages)
+	}
+}
+
+func TestThinkingOnlyTurnResumeIsBounded(t *testing.T) {
+	turns := make([][]llm.StreamEvent, maxStreamResumeLimit+1)
+	errs := make([]error, len(turns))
+	for i := range turns {
+		turns[i] = thinkingOnlyTurn("still thinking")
+	}
+	m := &failingModel{turns: turns, errs: errs}
+	in := QueryInput{Messages: []llm.Message{llm.UserText("go")}, Tools: tool.NewRegistry(), PermissionMode: permission.ModeBypass}
+	term := drain(t, in, QueryDeps{CallModel: m.call})
+	if m.calls != maxStreamResumeLimit+1 {
+		t.Fatalf("calls=%d, want %d before giving up", m.calls, maxStreamResumeLimit+1)
+	}
+	if term.Reason != ReasonCompleted || term.Text != "" {
+		t.Fatalf("terminal=%+v", term)
+	}
+}
+
 func TestDistinctReasoningDoesNotResume(t *testing.T) {
 	m := &failingModel{
 		turns: [][]llm.StreamEvent{{
