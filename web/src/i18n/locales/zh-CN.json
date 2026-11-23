@@ -353,7 +353,7 @@
   "Assets listed per finding": "每项发现展示的资产数",
   "Assets to sync:": "同步资产：",
   "Assets:": "资产：",
-  "At least 12 characters": "至少 12 个字符",
+  "At least 8 characters": "至少 8 个字符",
   "At most {count} characters": "最多 {count} 个字符",
   "Attempts": "尝试",
   "Attribution basis (optional)": "归属依据（可选）",
@@ -1023,7 +1023,7 @@
   "Findings": "发现",
   "Fingerprint": "指纹",
   "Fingerprints": "指纹",
-  "First time using ARTEX? Enter the setup token from the server log, then set a login password for the account (at least 12 characters)": "首次使用 ARTEX？请输入服务器日志中的初始化令牌，然后设置账号登录密码（至少 12 个字符）",
+  "First time using ARTEX? Enter the setup token from the server log, then set a login password for the account (at least 8 characters)": "首次使用 ARTEX？请输入服务器日志中的初始化令牌，然后设置账号登录密码（至少 8 个字符）",
   "Fixed": "已修复",
   "Fixed {value}": "固定值 {value}",
   "Fixed 3s": "固定 3s",
@@ -1656,7 +1656,7 @@
   "password (empty = agent generates)": "密码（留空由智能体生成）",
   "Password / auth code": "密码 / 授权码",
   "Password changed": "密码已修改",
-  "Password must be at least 12 characters": "密码至少需要 12 个字符",
+  "Password must be at least 8 characters": "密码至少需要 8 个字符",
   "Past call arguments": "历史调用参数",
   "Past calls provided to the model at the time (legacy)": "当时提供给模型的历史调用（旧版）",
   "Past execution result": "历史执行结果",
@@ -2720,5 +2720,8 @@
   "Search company…": "搜索企业…",
   "Failed to load companies": "加载企业失败",
   "No company found": "未找到企业",
-  "Manage companies": "管理企业"
+  "Manage companies": "管理企业",
+  "Bing (cn.bing.com · free, no key, China-direct)": "Bing（cn.bing.com · 免费无 Key，国内直连）",
+  "Baidu (free, no key, China-direct)": "Baidu（免费无 Key，国内直连）",
+  "fixed 10s": "固定 10s"
 }

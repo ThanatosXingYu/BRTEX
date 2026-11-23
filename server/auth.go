@@ -35,7 +35,7 @@ const (
 	// it. The upper bound is bcrypt's hard limit: past 72 bytes GenerateFromPassword returns ErrPasswordTooLong; rejecting early beats a cryptic "password encryption failed".
 	// Both apply to new passwords only (init, change-password); login never checks
 	// length, so passwords set under the old 8-character minimum still log in.
-	minPasswordRunes = 12
+	minPasswordRunes = 8
 	maxPasswordBytes = 72
 
 	pwdLimitTokenPrefix = "tok:"

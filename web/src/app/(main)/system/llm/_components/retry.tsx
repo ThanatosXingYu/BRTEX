@@ -81,8 +81,8 @@ export const RETRY_LAYERS = {
     skips: t("Quota exhausted (402 / insufficient_quota, handed to the pool to switch configs), context too long (413 / context length, handed to compression), and deterministic rejections (400 / 401 / 403 / 404 / 422) are never retried."),
     desc: t("Replays the same request on the same config. Since no output has been delivered yet, the replay cannot duplicate model output or tool executions."),
     attemptsLabel: t("Retry attempts"),
-    defAttempts: 2,
-    defInterval: t("0.5s→1s exponential (capped at 4s)"),
+    defAttempts: 10,
+    defInterval: t("fixed 10s"),
     offHint: t("-1 = a broken stream goes straight to the outer intent rerun"),
   },
   breaker: {

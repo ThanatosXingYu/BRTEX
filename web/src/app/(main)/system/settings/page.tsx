@@ -517,7 +517,7 @@ export default function SystemSettingsPage() {
               <br />
               {rich(
                 t(
-                  "Sources: <b>DuckDuckGo (ddgs)</b> (no key needed), <b>Brave (free tier)</b> (requires a Brave API Key), <b>Tavily</b> (requires a Tavily API Key) or <b>DeepSeek</b> (reuses the current LLM config). When the master switch is off, the per-agent web search switches are unavailable.",
+                  "Sources: <b>DuckDuckGo (ddgs)</b> (no key needed), <b>Bing (cn.bing.com)</b> and <b>Baidu</b> (both keyless and reachable from mainland China without a proxy), <b>Brave (free tier)</b> (requires a Brave API Key), <b>Tavily</b> (requires a Tavily API Key), <b>Keenable</b> (keyless, optional key) or <b>DeepSeek</b> (reuses the current LLM config). When the master switch is off, the per-agent web search switches are unavailable.",
                 ),
               )}
             </CardDescription>
@@ -556,6 +556,8 @@ export default function SystemSettingsPage() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="ddgs">{t("DuckDuckGo (ddgs · free, no key)")}</SelectItem>
+                    <SelectItem value="bing">{t("Bing (cn.bing.com · free, no key, China-direct)")}</SelectItem>
+                    <SelectItem value="baidu">{t("Baidu (free, no key, China-direct)")}</SelectItem>
                     <SelectItem value="brave-free">{t("Brave (free tier · requires key)")}</SelectItem>
                     <SelectItem value="tavily">{t("Tavily (requires key)")}</SelectItem>
                     <SelectItem value="keenable">{t("Keenable (keyless, optional key)")}</SelectItem>

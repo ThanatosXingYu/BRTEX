@@ -294,10 +294,10 @@ func FromEnv() (Config, bool) {
 // endpoint path itself), so a full endpoint URL is tolerated.
 func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 	c := Config{
-		Model:   strings.TrimSpace(model),
-		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:  strings.TrimSpace(apiKey),
-		Proxy:   strings.TrimSpace(proxy),
+		Model:   strings.TrimSpace(StripInvisible(model)),
+		BaseURL: strings.TrimRight(strings.TrimSpace(StripInvisible(baseURL)), "/"),
+		APIKey:  strings.TrimSpace(StripInvisible(apiKey)),
+		Proxy:   strings.TrimSpace(StripInvisible(proxy)),
 		Stream:  true, // streaming by default; the caller overrides per profile
 	}
 	switch strings.TrimSpace(provider) {

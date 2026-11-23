@@ -353,7 +353,7 @@
   "Assets listed per finding": "Bulgu başına listelenen varlık",
   "Assets to sync:": "Eşitlenecek varlıklar:",
   "Assets:": "Varlıklar:",
-  "At least 12 characters": "En az 12 karakter",
+  "At least 8 characters": "En az 8 karakter",
   "At most {count} characters": "En fazla {count} karakter",
   "Attempts": "Deneme",
   "Attribution basis (optional)": "Sahiplik dayanağı (isteğe bağlı)",
@@ -1023,7 +1023,7 @@
   "Findings": "Bulgular",
   "Fingerprint": "Parmak izi",
   "Fingerprints": "Parmak izleri",
-  "First time using ARTEX? Enter the setup token from the server log, then set a login password for the account (at least 12 characters)": "ARTEX'i ilk kez mi kullanıyorsunuz? Sunucu günlüğündeki kurulum token'ını girin, ardından hesap için bir giriş parolası belirleyin (en az 12 karakter)",
+  "First time using ARTEX? Enter the setup token from the server log, then set a login password for the account (at least 8 characters)": "ARTEX'i ilk kez mi kullanıyorsunuz? Sunucu günlüğündeki kurulum token'ını girin, ardından hesap için bir giriş parolası belirleyin (en az 8 karakter)",
   "Fixed": "Düzeltildi",
   "Fixed {value}": "Sabit {value}",
   "Fixed 3s": "Sabit 3 sn",
@@ -1656,7 +1656,7 @@
   "password (empty = agent generates)": "parola (boş = ajan oluşturur)",
   "Password / auth code": "Parola / yetkilendirme kodu",
   "Password changed": "Parola değiştirildi",
-  "Password must be at least 12 characters": "Parola en az 12 karakter olmalıdır",
+  "Password must be at least 8 characters": "Parola en az 8 karakter olmalıdır",
   "Past call arguments": "Geçmiş çağrı argümanları",
   "Past calls provided to the model at the time (legacy)": "O sırada modele sağlanan geçmiş çağrılar (eski)",
   "Past execution result": "Geçmiş çalıştırma sonucu",
@@ -2720,5 +2720,8 @@
   "Search company…": "Şirket ara…",
   "Failed to load companies": "Şirketler yüklenemedi",
   "No company found": "Şirket bulunamadı",
-  "Manage companies": "Şirketleri yönet"
+  "Manage companies": "Şirketleri yönet",
+  "Bing (cn.bing.com · free, no key, China-direct)": "Bing (cn.bing.com · ücretsiz, anahtarsız, Çin'den doğrudan)",
+  "Baidu (free, no key, China-direct)": "Baidu (ücretsiz, anahtarsız, Çin'den doğrudan)",
+  "fixed 10s": "sabit 10s"
 }

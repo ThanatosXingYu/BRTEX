@@ -630,10 +630,12 @@ func (m *Manager) SetLLMPoolBindFallback(on bool) error {
 }
 
 // WebSearch returns the current web-search config: whether it is enabled, the
-// backend ("ddgs" | "brave-free" | "tavily" | "keenable" | "deepseek"), the
+// backend ("ddgs" | "bing" | "baidu" | "brave-free" | "tavily" | "keenable" |
+// "deepseek"), the
 // Brave, Tavily and Keenable API keys (each empty unless set), and the
-// dedicated egress proxy (empty = direct). The Keenable key is optional: empty
-// selects the keyless public endpoint.
+// dedicated egress proxy (empty = direct). bing/baidu are keyless and
+// China-direct. The Keenable key is optional: empty selects the keyless public
+// endpoint.
 func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, keenableKey, proxy string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1022,6 +1024,8 @@ var searchBackendEndpoints = map[string]string{
 	"brave-free": "https://api.search.brave.com",
 	"tavily":     "https://api.tavily.com",
 	"keenable":   "https://api.keenable.ai",
+	"bing":       "https://cn.bing.com",
+	"baidu":      "https://www.baidu.com",
 }
 
 // targetGateEndpoints lists the endpoints of the platform's own services, which

@@ -1023,7 +1023,7 @@ export interface Settings {
   // Web search. brave_key_set / tavily_key_set / keenable_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
   web_search_enabled: boolean;
-  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "keenable" | "deepseek"
+  web_search_backend: string; // "ddgs" | "bing" | "baidu" | "brave-free" | "tavily" | "keenable" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
   keenable_key_set: boolean;
