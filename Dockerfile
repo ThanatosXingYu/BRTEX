@@ -15,9 +15,12 @@
 # only; the frontend static export is architecture-independent.
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 ENV NEXT_TELEMETRY_DISABLED=1
+# BRTEX: mainland-China builds pull npm packages from a domestic mirror.
+# Override with --build-arg NPM_REGISTRY=https://registry.npmjs.org when abroad.
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci --ignore-scripts
+RUN npm config set registry "$NPM_REGISTRY" && npm ci --ignore-scripts
 COPY web/ ./
 RUN npm run build:static
 
@@ -29,6 +32,9 @@ RUN npm run build:static
 FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+# BRTEX vendors a patched norma: go.mod replaces it with ./norma, so the module
+# graph cannot resolve until that module file is present. Sources are copied below.
+COPY norma/go.mod norma/go.sum ./norma/
 RUN go mod download
 COPY . .
 # Reuse the frontend built above; build.sh skips its own frontend step.
@@ -89,7 +95,8 @@ ARG DALFOX_SHA256_AMD64=c11cfd2f8261973f0a2a2a1eba5a147ce77712a29acfa6343f9847fb
 ARG DALFOX_SHA256_ARM64=fd56b0b7da2d06868cd73b504f41d21314629feffcd5bdc97718db1c9dd2fa70
 ARG SQLMAP_VERSION=1.9.9
 ARG SQLMAP_COMMIT=cceda39208b5aad478de2c3f731df4239d9881f6
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git unzip \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
@@ -161,7 +168,8 @@ RUN set -eux; \
 FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 # Common tools: ripgrep / curl / vim, plus a set of recon staples (add/remove as needed).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip xz-utils \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
     && rm -rf /var/lib/apt/lists/*
@@ -256,7 +264,8 @@ ARG PLAYWRIGHT_VERSION=1.64.1
 # playwright-core's exports map hides cli.js from require.resolve, so run the
 # binary npm links for @playwright/mcp instead: it is the copy MCP actually
 # loads, and it installs the Chromium revision that copy expects.
-RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}" "playwright@${PLAYWRIGHT_VERSION}" \
+RUN npm config set registry "${NPM_REGISTRY}" \
+    && npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}" "playwright@${PLAYWRIGHT_VERSION}" \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && "$(npm root -g)/@playwright/mcp/node_modules/.bin/playwright-core" install chromium \
