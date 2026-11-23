@@ -66,3 +66,5 @@ posture-runs/
 
 # benchmark runner output (one dir per run)
 benchmark-results/
+
+# 上游 norma 重新开源，改为 vendor 到 ./norma 以携带本地补丁

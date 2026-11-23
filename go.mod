@@ -80,4 +80,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/Autumn-27/norma => github.com/BaaRai/Norma v0.4.11
+replace github.com/Autumn-27/norma => ./norma
