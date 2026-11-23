@@ -100,7 +100,7 @@ const mainAgentDefaultTmpl = `You are the "main agent" of an authorized penetrat
    - The human wants to "course-correct a running intent (work) in realtime (stop doing X, focus on Y)" → use steer_work (no interruption, no progress lost; takes effect before the worker's next action); first check what it is doing with get_worker_output. If the direction is entirely wrong, dispatch a new intent with add_intent instead.
    - The human wants to "add a new final goal to achieve" → add the goal with set_goals. The system writes the goal into the task graph and **automatically pulls the completed/paused task back to running** (the planner will re-judge completion accordingly), no manual resume needed.
    - The human wants to "add/change test constraints (allow/forbid certain operations, e.g. 'only test the current port', 'no brute forcing', 'passive recon only')" → register them with set_constraints (type=allow / type=deny). Constraints are injected into the planner/worker prompts at the next planning round to bound exploration; they can also be managed in the overview's "Constraint management".
-3. Reply concisely in plain language, stating what you did.
+3. Reply concisely in plain language, stating what you did. When you still have planned steps left (TodoWrite items not completed), keep working in this turn: call the next tool instead of stopping to report. Only report when the plan is done.
 
 Current task goal: {{.Goal}}
 
@@ -137,6 +137,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
 	// the main run directory <workDir>/tasks/<taskID>/main, created up front.
+	todos := actool.NewTodoStore()
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
@@ -165,7 +166,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		ToolOutputDir:         TaskToolOutputDir(m.workDir, taskID, mainDir),
 		MaxTurns:              m.maxTurns,                             // 0 = unlimited (configurable in agent management)
 		Compaction:            compactionConfig(m.compactionWindow()), // long chats stay within the window
-		Todos:                 actool.NewTodoStore(),                  // session-level temporary todos (TodoWrite), planning only, dropped on exit
+		Todos:                 todos,                                   // session-level temporary todos (TodoWrite); the continuation hook watches it
 		// hitting the budget (steps) → the SDK runs wrap-up: output a one-line progress summary to the user. Prompt and wrap-up rounds are editable in the backend (default 10 rounds).
 		Settlement:   wrapupSettlement("mainagent", nil),
 		NonStreaming: m.nonStreaming(), // when this profile selects non-streaming, use Provider.Complete
@@ -174,9 +175,9 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		// On by default; ARTEX_UNTRUSTED_BOUNDARY=0 opts out: nonce-frame tool output as untrusted data.
 		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
-	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
-		opts.Hooks = hooks
-	}
+	// The main-agent run is one-shot (a text-only stop ends it). This layer adds a
+	// bounded continuation while the agent's own todo list still has open items.
+	opts.Hooks = newMainContinueHooks(hooks, todos)
 	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
 	// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
 	// load; each new session (seg>=1) gets its own file for a clean context. The id

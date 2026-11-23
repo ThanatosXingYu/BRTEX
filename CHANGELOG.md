@@ -2,9 +2,21 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [brtex-0.2.1] - 2026-11-24
+
+### 修复
+
+- 主 Agent 单轮"说一句就停"：新增有界续跑钩子——本轮无工具调用且 TodoWrite 仍有未完成项时注入一次续跑指令
+  （工具轮后重置配额，上限 3 次）；计划已清空或纯问答不受影响；提示词同时修正"汇报即收尾"倾向。
+
+### 变更
+
+- README 重写为中文专业版，上游原始 README 存档为 `docs/README-upstream.md`。
+- 移除 GitHub Actions 工作流（ci/release/bot 在私有分支上不可用），仅保留本地构建与发布包升级。
+
 ## [brtex-0.2.0] - 2026-11-23
 
-BRTEX 升级到 BaaRai/ARTEX v0.7.0 基线，并重新叠加自用改动。
+BRTEX 升级到 upstream ARTEX v0.7.0 基线，并重新叠加自用改动。
 
 ### 新增
 
@@ -82,7 +94,7 @@ Agent-driven traffic capture (SOCKS5, transparent TCP and raw UDP), operator tam
 - **Intercept risk score and batch approval**: a deterministic risk score (low, medium, high) is shown on each pending approval, and up to 100 pending decisions can be settled in one call, each through the existing single-decision path (#232).
 - **`ask_operator` target warning**: a request whose question names a host or URL outside the goal targets is tagged as containing target-derived text (#197).
 - **Opt-in update banner**: `ARTEX_UPDATE_CHECK` makes the backend check the latest GitHub release at most once per 24 hours and the UI show a banner; off by default (#202).
-- **Release provenance**: release archives carry GitHub build provenance attestations and a CycloneDX SBOM (`gh attestation verify <zip> --repo BaaRai/ARTEX`); release notes are the matching `CHANGELOG.md` section (#219, #201).
+- **Release provenance**: release archives carry GitHub build provenance attestations and a CycloneDX SBOM (`gh attestation verify <zip> --repo upstream ARTEX`); release notes are the matching `CHANGELOG.md` section (#219, #201).
 - **Opt-in constrained Go tampering hooks — backend, API & trace (P4.2 PR1)**: opt-in behind `ARTEX_TAMPER_HOOKS_ENABLED=1` (off by default; flag off loads zero hooks and keeps the no-hook baseline unchanged). Adds a small, deterministic, zero-dependency Go-subset evaluator (`traffic/hookvm`, parsed via `go/parser` with sorted map iteration, hard 100k step / 25 ms per-hook / 100 ms per-phase / 4 MiB memory bounds, and AST rejection of FS/network/exec/env/time/rand/goroutine/channel/defer/goto/global-var/pointer/switch constructs). Operator-only hooks (never an agent tool) are stored sealed at rest in `traffic_tamper_hooks` and `traffic_tamper_hook_versions` (migration `0011_traffic_tamper_hooks.sql`), managed via `/api/traffic/hooks*` (CRUD, toggle, version history, rollback, dry-run), prefiltered with `traffic/rewrite` matchers, executed after declarative rewrite rules per phase (fail-open only in 0.7; binary/compressed/>1 MiB bodies skipped; tainted sensitive fields stay HMAC-masked), and traced in SQLite `exchange_rewrites` (`source_kind`, `hook_id`, `hook_version`). See `docs/traffic-tamper-hooks.md`.
 - **Opt-in SOCKS5 UDP ASSOCIATE & raw UDP recording (P4.1c)**: when traffic capture is enabled, setting `ARTEX_SOCKS5_UDP_ENABLED=1` enables RFC 1928 `UDP ASSOCIATE` (`0x03`, IPv4 first) on the SOCKS5 listener (off by default: with flags off no listener starts; with SOCKS5 TCP on and UDP off, `UDP ASSOCIATE` returns `0x07` and no UDP socket is opened). Enforces per-datagram destination policy before forwarding using the existing target gate (`intercept.Interceptor.ResolveUDP4` / `intercept.PinnedUDP4Resolver`) and egress governor (`egress.Do`), dropping denied datagrams without passthrough; bounds associations (`UDPMaxDatagrams`, `UDPMaxBytes`, `UDPIdleTimeout`) and tears them down with the TCP control connection; drops `FRAG != 0` with no fragmentation reassembly; and records each forwarded datagram individually in SQLite `raw_udp_datagrams` with capped previews and atomic `_blobs` refs without writing HTTP `exchanges` rows or PG migrations. Transparent UDP (`IP_RECVORIGDSTADDR`) is deferred to C2. See `docs/traffic-socks5-udp.md`.
 - **Opt-in Linux transparent TCP inbound & raw TCP recording (P4.1b)**: on Linux when traffic capture is enabled, setting `ARTEX_TRANSPARENT_TCP_ENABLED=1` (loopback `127.0.0.1:1081` by default) or `ARTEX_TRANSPARENT_TCP_ADDR=<ipv4:port>` starts an IPv4 transparent TCP listener fed by operator-managed `iptables`/`nftables` `REDIRECT` rules (off by default; ARTEX never touches the host firewall; root/`CAP_NET_ADMIN` is required only for the operator's redirect rules; IPv6 is not covered). Recovers original IPv4 destinations via `SO_ORIGINAL_DST` with self-redirect loop protection, reuses the P4.1a target gate (`intercept.Interceptor.DialSOCKS5`), egress governor (`egress.Do`), half-close relay bounds, and SQLite `raw_tcp_streams` store (atomic `_blobs` spill, no HTTP `exchanges` row, no PostgreSQL migration). See `docs/traffic-transparent.md`.
@@ -1253,12 +1265,12 @@ First release of this fork. The engine underneath is still upstream's, but this 
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/BaaRai/ARTEX/compare/v0.7.0...HEAD
-[0.7.0]: https://github.com/BaaRai/ARTEX/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/BaaRai/ARTEX/compare/v0.5.1...v0.6.0
-[0.5.1]: https://github.com/BaaRai/ARTEX/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/BaaRai/ARTEX/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/BaaRai/ARTEX/compare/v0.3.15...v0.4.0
+[Unreleased]: https://github.com/upstream ARTEX/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/upstream ARTEX/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/upstream ARTEX/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/upstream ARTEX/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/upstream ARTEX/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/upstream ARTEX/compare/v0.3.15...v0.4.0
 [0.3.10]: https://github.com/Autumn-27/ARTEX/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/Autumn-27/ARTEX/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/Autumn-27/ARTEX/compare/v0.3.7...v0.3.8

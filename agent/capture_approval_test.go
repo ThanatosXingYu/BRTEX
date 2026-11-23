@@ -17,14 +17,14 @@ import (
 // Exercise the actual SDK event -> hook -> execution -> result path. No real
 // model or command is used; the probe tool only returns a fixed string.
 func TestCaptureApprovalLifecycle(t *testing.T) {
-	// Known failure with a freshly seeded database (BaaRai/ARTEX#9). Repro:
+	// Known failure with a freshly seeded database (upstream issue #9). Repro:
 	//   ARTEX_PG_DSN=postgres://artex:testpass@localhost:5432/artextest_agent \
 	//     go test ./agent -run TestCaptureApprovalLifecycle -count=1 -v
 	// The checks after ListTaskIntercepts / GetInterceptDetail and the
 	// "unexpected review" t.Fatalf below fail before any other test has seeded
 	// intercept state. Keep this skipped until the fresh-DB setup is fixed;
 	// do not simply delete the skip.
-	t.Skip("known failure with a fresh database; repro and failing assertion documented above; BaaRai/ARTEX#9")
+	t.Skip("known failure with a fresh database; repro and failing assertion documented above; upstream issue #9")
 	dsn, _, err := db.DSN()
 	if err != nil {
 		db.SkipPGUnavailable(t, err)

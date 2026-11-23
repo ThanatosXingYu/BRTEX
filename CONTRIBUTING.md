@@ -2,10 +2,10 @@
 
 ## First contribution
 
-- **Share feedback.** Check [open issues](https://github.com/BaaRai/ARTEX/issues) for the same problem or proposal and add any new details there. For a new idea, explain what you were trying to do and what would make it easier.
+- **Share feedback.** Check [open issues](https://github.com/ThanatosXingYu/BRTEX/issues) for the same problem or proposal and add any new details there. For a new idea, explain what you were trying to do and what would make it easier.
 - **Report a problem.** Include a short reproduction and the relevant environment. For a UI issue, a sanitized screenshot and the browser version can help. Remove credentials, private URLs, and sensitive task data before posting.
 - **Report a security issue.** Do not open a public issue for a vulnerability; follow [SECURITY.md](SECURITY.md) to report it privately.
-- **Send a small change.** A documentation correction or a focused UI improvement is a good place to start. Check [open pull requests](https://github.com/BaaRai/ARTEX/pulls) for overlapping work and refer to the relevant issue in your PR so readers can find the discussion.
+- **Send a small change.** A documentation correction or a focused UI improvement is a good place to start. Check [open pull requests](https://github.com/ThanatosXingYu/BRTEX/pulls) for overlapping work and refer to the relevant issue in your PR so readers can find the discussion.
 
 ## Pull requests
 

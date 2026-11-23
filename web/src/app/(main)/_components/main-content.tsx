@@ -34,7 +34,7 @@ function isFullBleed(pathname: string) {
   return normalized.startsWith("/function/tasks/");
 }
 
-const RELEASES_URL = "https://github.com/BaaRai/ARTEX/releases";
+const RELEASES_URL = "https://github.com/ThanatosXingYu/BRTEX/releases";
 const UPDATE_DISMISSED_KEY = "artex-update-dismissed";
 
 export function MainContent({ children }: { children: ReactNode }) {

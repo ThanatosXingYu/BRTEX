@@ -151,7 +151,7 @@ func (meteredStreamProvider) Stream(context.Context, llm.CompletionRequest) iter
 }
 
 func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
-	// Previously skipped as timing-sensitive (BaaRai/ARTEX#9). The recorder now
+	// Previously skipped as timing-sensitive (upstream issue #9). The recorder now
 	// decides the status at the point the consumer stops, so the result no
 	// longer depends on when the deferred finish runs.
 	dsn := os.Getenv("ARTEX_PG_DSN")

@@ -26,7 +26,7 @@ func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {
 }
 
 func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
-	// Known failure with a freshly seeded database (BaaRai/ARTEX#9). Repro:
+	// Known failure with a freshly seeded database (upstream issue #9). Repro:
 	//   ARTEX_PG_DSN=postgres://artex:testpass@localhost:5432/artextest_agent \
 	//     go test ./agent -run TestGraphOverviewExpandsAssociatedCompanyScope -count=1 -v
 	// On a fresh DB the company-scope expansion in graphOverviewData is not
@@ -34,7 +34,7 @@ func TestGraphOverviewExpandsAssociatedCompanyScope(t *testing.T) {
 	// graphOverviewData (company asset linkage, company_scope rows and
 	// company_keywords) fail. Keep the skip until seeding is ordered correctly;
 	// do not delete it.
-	t.Skip("known failure with a fresh database; repro and failing assertions documented above; BaaRai/ARTEX#9")
+	t.Skip("known failure with a fresh database; repro and failing assertions documented above; upstream issue #9")
 	d := testDB(t)
 	defer d.Close()
 
