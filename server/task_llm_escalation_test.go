@@ -21,6 +21,10 @@ func (f *failingProvider) Complete(ctx context.Context, req llm.CompletionReques
 }
 
 func TestEscalationAdvancesAfterConsecutiveFailures(t *testing.T) {
+	// BRTEX retries the same provider 10 times with a fixed 10s pause before the
+	// failure counts toward escalation; zero the pause or this test spends its
+	// whole budget asleep.
+	defer withZeroRetryBackoff()()
 	resetLLMFailStreaksForTest()
 	prov := &failingProvider{err: errors.New("boom: upstream 500")}
 	profile := int64(7)
