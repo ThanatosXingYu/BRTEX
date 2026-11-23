@@ -19,8 +19,8 @@ func TestResolveRetryUnconfigured(t *testing.T) {
 	if retries != sameProviderStreamRetries {
 		t.Fatalf("retries=%d, want %d", retries, sameProviderStreamRetries)
 	}
-	if d := backoff(1); d != time.Second {
-		t.Fatalf("backoff(1)=%v, want 1s (the default ladder)", d)
+	if d := backoff(1); d != 10*time.Second {
+		t.Fatalf("backoff(1)=%v, want 10s (BRTEX's fixed retry interval)", d)
 	}
 }
 

@@ -233,7 +233,7 @@ func TestLoginRateLimitBehindTrustedProxy(t *testing.T) {
 
 // The 12-character minimum applies to new passwords only. A hash stored under the
 // old 8-character minimum must still log in.
-func TestEightCharPasswordLogsInButIsRejectedAsNew(t *testing.T) {
+func TestEightCharPasswordIsAcceptedForLoginAndAsNew(t *testing.T) {
 	if n := len([]rune(oldPassword)); n != 8 {
 		t.Fatalf("oldPassword has %d characters, want 8", n)
 	}
@@ -242,9 +242,10 @@ func TestEightCharPasswordLogsInButIsRejectedAsNew(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"token"`) {
 		t.Fatalf("login with an existing 8-character password: status=%d body=%s", w.Code, w.Body.String())
 	}
-	// authInit and authChangePassword both refuse a new password through validatePassword.
-	if msg := validatePassword(oldPassword); msg == "" {
-		t.Fatal("validatePassword accepted an 8-character new password")
+	// BRTEX lowered the new-password minimum to 8 characters, so an 8-character
+	// password is accepted both for login and as a new password.
+	if msg := validatePassword(oldPassword); msg != "" {
+		t.Fatalf("validatePassword rejected an 8-character new password: %s", msg)
 	}
 }
 

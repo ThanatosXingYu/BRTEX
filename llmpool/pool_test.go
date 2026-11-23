@@ -166,7 +166,9 @@ func TestPassResetsCounters(t *testing.T) {
 func TestBackoffLadderGrows(t *testing.T) {
 	reg := NewRegistry(nil, nil)
 	var prev time.Duration
-	for i := range 4 {
+	// Walk every rung of BRTEX's 30s/1m/1m/2m/5m/10m ladder plus one past the top,
+	// where the cooldown plateaus at the last rung.
+	for i := range len(backoff) + 1 {
 		reg.Reset(1)
 		st := State{Trips: i}
 		reg.Restore(1, st)
@@ -179,8 +181,8 @@ func TestBackoffLadderGrows(t *testing.T) {
 		}
 		prev = d
 	}
-	if prev < 25*time.Minute {
-		t.Fatalf("ladder tops out at %v, want ~30m", prev)
+	if prev < 9*time.Minute {
+		t.Fatalf("ladder tops out at %v, want ~10m (BRTEX caps the cooldown)", prev)
 	}
 }
 
