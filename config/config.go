@@ -4,10 +4,13 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -48,6 +51,19 @@ func BaseDir() string {
 	dir := filepath.Dir(exe)
 	if isGoRunDir(dir) {
 		return "." // throwaway `go run` binary → use CWD
+	}
+	return dir
+}
+
+// KeyDir holds jwt.key and secret.key: ARTEX_JWT_KEY_DIR (the Docker image points
+// it at the /app/keys volume) or the base dir. Never the browsable data dir.
+func KeyDir() string {
+	dir := strings.TrimSpace(os.Getenv("ARTEX_JWT_KEY_DIR"))
+	if dir == "" {
+		dir = BaseDir()
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
 	}
 	return dir
 }
@@ -96,16 +112,23 @@ func Path() string {
 	return candidates[0]
 }
 
-// Load reads and parses the config file. A missing/unreadable file yields a zero
-// Config (so callers fall back to defaults) rather than an error.
-func Load() Config {
+// Load reads and parses the config file. A missing file yields a zero Config (so
+// callers fall back to defaults). A file that exists but cannot be read or parsed
+// is an error: ignoring it would run with defaults the operator did not choose.
+func Load() (Config, error) {
 	var c Config
-	b, err := os.ReadFile(Path())
-	if err != nil {
-		return c
+	path := Path()
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return c, nil
 	}
-	_ = json.Unmarshal(b, &c)
-	return c
+	if err != nil {
+		return c, fmt.Errorf("read config file %s: %w", path, err)
+	}
+	if err := json.Unmarshal(b, &c); err != nil {
+		return Config{}, fmt.Errorf("parse config file %s: %w", path, err)
+	}
+	return c, nil
 }
 
 // SkillDir returns the skill root directory with precedence:
@@ -113,22 +136,36 @@ func Load() Config {
 //	env ARTEX_SKILL_DIR  >  config file (skill_dir)  >  BaseDir()/skills
 //
 // The directory is created if it does not exist.
-func SkillDir() string {
+func SkillDir() (string, error) {
 	var d string
 	if v := strings.TrimSpace(os.Getenv("ARTEX_SKILL_DIR")); v != "" {
 		d = v
-	} else if v := strings.TrimSpace(Load().SkillDir); v != "" {
-		d = v
 	} else {
-		d = filepath.Join(BaseDir(), "skills")
+		c, err := Load()
+		if err != nil {
+			return "", err
+		}
+		if v := strings.TrimSpace(c.SkillDir); v != "" {
+			d = v
+		} else {
+			d = filepath.Join(BaseDir(), "skills")
+		}
 	}
 	_ = os.MkdirAll(d, 0o755)
-	return d
+	return d, nil
 }
 
 // PostgresDSN resolves the connection string with precedence:
 //
-//	env ARTEX_PG_DSN  >  config file (database.dsn, or assembled from fields)
+//	env ARTEX_PG_DSN
+//	  >  env ARTEX_PG_HOST / ARTEX_PG_PORT / ARTEX_PG_USER / ARTEX_PG_PASSWORD /
+//	     ARTEX_PG_DBNAME / ARTEX_PG_SSLMODE
+//	  >  config file (database.dsn, or assembled from fields)
+//
+// The component variables are how Docker Compose passes a password that contains
+// URL-special characters: the password stays a raw environment value, and
+// buildDSN percent-encodes it. An explicit ARTEX_PG_DSN is returned unchanged,
+// so a value that was already assembled by something else is not rewritten.
 //
 // There is NO built-in fallback: when neither source supplies a database config,
 // it returns an error naming the config path it inspected, so startup fails loudly
@@ -136,16 +173,49 @@ func SkillDir() string {
 // DSN came from (for startup logging).
 func PostgresDSN() (dsn, source string, err error) {
 	if v := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN")); v != "" {
-		return v, "环境变量 ARTEX_PG_DSN", nil
+		return v, "environment variable ARTEX_PG_DSN", nil
 	}
-	db := Load().Database
+	if d, ok, err := postgresDSNFromEnv(); ok || err != nil {
+		return d, "environment variables ARTEX_PG_HOST/USER/PASSWORD/DBNAME", err
+	}
+	c, err := Load()
+	if err != nil {
+		return "", "", err
+	}
+	db := c.Database
 	if d := strings.TrimSpace(db.DSN); d != "" {
-		return d, "配置文件 " + Path() + " (database.dsn)", nil
+		return d, "config file " + Path() + " (database.dsn)", nil
 	}
 	if db.Host != "" || db.DBName != "" || db.User != "" {
-		return db.buildDSN(), "配置文件 " + Path() + " (database 字段)", nil
+		return db.buildDSN(), "config file " + Path() + " (database fields)", nil
 	}
-	return "", "", fmt.Errorf("未找到数据库配置：环境变量 ARTEX_PG_DSN 未设置，且配置文件 %s 未提供 database（dsn 或 host/user/dbname）。请创建该配置文件或设置环境变量后重试", Path())
+	return "", "", fmt.Errorf("no database config found: ARTEX_PG_DSN is not set, ARTEX_PG_HOST/USER/PASSWORD/DBNAME are not set, and config file %s provides no database (dsn or host/user/dbname). Create the config file or set the environment variable and retry", Path())
+}
+
+// postgresDSNFromEnv assembles a URL from the component environment variables.
+// ok is false when none of them is set. The password is not trimmed: a space is
+// a legal character and is the case docker-compose used to break.
+func postgresDSNFromEnv() (dsn string, ok bool, err error) {
+	host := strings.TrimSpace(os.Getenv("ARTEX_PG_HOST"))
+	user := strings.TrimSpace(os.Getenv("ARTEX_PG_USER"))
+	password := os.Getenv("ARTEX_PG_PASSWORD")
+	dbname := strings.TrimSpace(os.Getenv("ARTEX_PG_DBNAME"))
+	portStr := strings.TrimSpace(os.Getenv("ARTEX_PG_PORT"))
+	ssl := strings.TrimSpace(os.Getenv("ARTEX_PG_SSLMODE"))
+	if host == "" && user == "" && password == "" && dbname == "" && portStr == "" && ssl == "" {
+		return "", false, nil
+	}
+	port := 0
+	if portStr != "" {
+		n, convErr := strconv.Atoi(portStr)
+		if convErr != nil || n <= 0 || n > 65535 {
+			return "", true, fmt.Errorf("ARTEX_PG_PORT %q is not a TCP port", portStr)
+		}
+		port = n
+	}
+	return Database{
+		Host: host, Port: port, User: user, Password: password, DBName: dbname, SSLMode: ssl,
+	}.buildDSN(), true, nil
 }
 
 func (d Database) buildDSN() string {
@@ -177,16 +247,30 @@ func (d Database) buildDSN() string {
 	return u.String()
 }
 
-// String is a redacted view of the resolved DSN (password masked) for logging.
+// libpqPassword matches a libpq keyword DSN password field, including quoted
+// values. pgx accepts this form as well as the URL form.
+var libpqPassword = regexp.MustCompile(`(?i)\b(password)\s*=\s*(?:'[^']*'|"[^"]*"|\S*)`)
+
+// Redact is a log-safe view of a PostgreSQL DSN. It masks URL userinfo
+// passwords, `?password=` query values, and libpq `password=` keywords.
+// Unrecognised input still runs the keyword mask so a parse failure cannot
+// print the secret.
 func Redact(dsn string) string {
-	u, err := url.Parse(dsn)
-	if err != nil {
+	if dsn == "" {
 		return dsn
 	}
-	if u.User != nil {
-		if _, hasPw := u.User.Password(); hasPw {
-			u.User = url.UserPassword(u.User.Username(), "****")
+	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") {
+		if u.User != nil {
+			if _, hasPw := u.User.Password(); hasPw {
+				u.User = url.UserPassword(u.User.Username(), "****")
+			}
 		}
+		q := u.Query()
+		if q.Has("password") {
+			q.Set("password", "****")
+			u.RawQuery = q.Encode()
+		}
+		return u.String()
 	}
-	return fmt.Sprintf("%s", u.String())
+	return libpqPassword.ReplaceAllString(dsn, `${1}=****`)
 }

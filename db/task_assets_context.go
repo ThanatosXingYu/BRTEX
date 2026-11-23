@@ -37,12 +37,13 @@ target AS (
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
+  WHERE ` + declaredScopeFilter + `
 	UNION
 	SELECT a.id, a.type,
 	       COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
 	FROM assets a
 	JOIN exploration_anchors ea ON ea.asset_id=a.id
-	JOIN exploration_nodes en ON en.id=ea.node_id
+	JOIN exploration_nodes en ON en.id=ea.node_id AND en.kind='fact'
 	JOIN context_tasks ctx ON ctx.exploration_id=en.exploration_id
 ),
 tested AS (
@@ -60,7 +61,7 @@ tested AS (
 // it carries neither the fact-anchor union nor the tested set — it is pure "in
 // declared scope", independent of what has already been touched. Used by the
 // agent's list_assets so a query returns the task's relevant assets, not the
-// whole shared库.
+// whole shared store.
 const scopeTargetCTE = `
 context_tasks AS (
   SELECT t.id AS task_id
@@ -118,8 +119,10 @@ ORDER BY CASE WHEN ts.task_id=$1 THEN 0 ELSE 1 END, ts.id`, taskID)
 }
 
 // TaskCoverageWithSources computes one coverage view over the union of the
-// current task and its direct sources: source scopes and anchored assets extend
-// the denominator, while fact anchors count as tested. No row is copied.
+// current task and its direct sources: source scopes and fact-anchored assets
+// extend the denominator, while fact anchors count as tested. Auto scope rows
+// count only under a declared domain or IP root (declaredScopeFilter), and an intent anchor
+// alone (insert_assets, asset_ids) no longer adds an asset. No row is copied.
 func (s *AssetStore) TaskCoverageWithSources(taskID int64) (*Coverage, error) {
 	cov := &Coverage{ByType: []CoverageByType{}}
 	_ = s.db.QueryRow(`WITH `+directTaskContextCTE+`

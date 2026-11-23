@@ -6,9 +6,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/intercept"
-	"github.com/ThanatosXingYu/BRTEX/sidequestion"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/sidequestion"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -37,6 +37,9 @@ func captureRun(ctx context.Context, opts agentcore.Options, input string, emit 
 func captureRunSession(ctx context.Context, s *agentcore.Session, input string, emit func(db.Activity)) (string, harness.TerminalReason, error) {
 	ctx, auditTrace := intercept.WithTrace(ctx, input, approvalHistory(s.Messages()))
 	defer auditTrace.Finish()
+	// Observe each model call's stop reason, so a provider refusal is reported as
+	// one (terminalText) and is not answered with an idle-turn rerun (steerHooks).
+	ctx = WithStopTracker(ctx)
 	var reason harness.TerminalReason
 	rec := func(r db.Activity) {
 		if r.Kind == "text" || r.Kind == "tool_result" {
@@ -85,7 +88,7 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 				rec(activityWithUsage(db.Activity{Kind: "result", Summary: firstLine(sum, 400), Detail: detail}, lastUsage))
 				return finalText, reason, ctx.Err()
 			}
-			rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: "执行出错: " + err.Error(), Detail: err.Error()}, lastUsage))
+			rec(activityWithUsage(db.Activity{Kind: "result", IsError: true, Summary: "execution error: " + err.Error(), Detail: err.Error()}, lastUsage))
 			return finalText, reason, err
 		}
 		switch ev.Kind {

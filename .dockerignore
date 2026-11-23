@@ -5,6 +5,11 @@ web/out
 server/webui/dist
 /artex
 data
+keys
+backups
+.env
+config.json
+jwt.key
 *.db
 transcripts
 bench/kv

@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 // DTO/serialization layer: each handler emits EXACTLY the frontend's spec shapes
@@ -32,7 +32,7 @@ func rawString(raw json.RawMessage) string {
 type TaskDTO struct {
 	ID                 string             `json:"id"`
 	ExplorationID      int64              `json:"exploration_id"`
-	Name               string             `json:"name"` // 可选任务名称;空=未命名
+	Name               string             `json:"name"` // optional task name; empty = unnamed
 	CategoryID         *int64             `json:"category_id,omitempty"`
 	CategoryName       string             `json:"category_name,omitempty"`
 	Pinned             bool               `json:"pinned"`
@@ -50,20 +50,23 @@ type TaskDTO struct {
 	Tokens             TokenTotalDTO      `json:"tokens"` // whole-task token consumption
 	GoalsTotal         int                `json:"goals_total"`
 	GoalsMet           int                `json:"goals_met"`
-	InFlight           int                `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
-	Findings           FindingSeverityDTO `json:"findings"`                 // 该任务已登记的漏洞数（findings 表，按严重度分档）
+	InFlight           int                `json:"in_flight"`                // number of running Workers (intents with state=running)
+	Findings           FindingSeverityDTO `json:"findings"`                 // findings registered for this task (findings table, bucketed by severity)
 	LLMProfileID       *int64             `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
 	LLMProfileIDs      []int64            `json:"llm_profile_ids"`
 	ActiveLLMProfileID *int64             `json:"active_llm_profile_id,omitempty"`
+	LLMRotate          bool               `json:"llm_rotate"`
 	LLMFailoverState   string             `json:"llm_failover_state"`
 	LLMFailoverReason  string             `json:"llm_failover_reason,omitempty"`
 	SourceTaskIDs      []string           `json:"source_task_ids"`
 	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
 	CompanyIDs         []int64            `json:"company_ids"`
-	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	CoverageEnabled    bool               `json:"coverage_enabled"` // asset coverage feature switch (fixed at creation)
+	PlanQuietMode      bool               `json:"plan_quiet_mode"`  // planner quiet-mode switch (#86), editable mid-run
+	TargetGate         bool               `json:"target_gate"`      // approval gate for asset targets, opt-in, editable mid-run
 }
 
-// FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
+// FindingSeverityDTO is the per-severity finding count shown in the task list (critical/high/medium/low).
 type FindingSeverityDTO struct {
 	Critical int `json:"critical"`
 	High     int `json:"high"`
@@ -79,9 +82,16 @@ func applyTaskArchiveBlocker(dto *TaskDTO, blockers map[int64]int64) {
 	if err != nil {
 		return
 	}
-	if dependentID := blockers[taskID]; dependentID > 0 {
-		dto.ArchiveBlockedBy = strconv.FormatInt(dependentID, 10)
+	applyTaskArchiveBlockerID(dto, blockers[taskID])
+}
+
+// applyTaskArchiveBlockerID records dependentID as the task's archive blocker;
+// 0 (nothing blocks it) leaves the DTO unchanged.
+func applyTaskArchiveBlockerID(dto *TaskDTO, dependentID int64) {
+	if dto == nil || dependentID <= 0 {
+		return
 	}
+	dto.ArchiveBlockedBy = strconv.FormatInt(dependentID, 10)
 }
 
 // TokenTotalDTO is a whole-task (all agents) token aggregate.
@@ -129,11 +139,14 @@ func taskDTO(t *Task, status string) TaskDTO {
 		LLMProfileID:       llmState.ProfileID,
 		LLMProfileIDs:      profileIDs,
 		ActiveLLMProfileID: llmState.ActiveID,
+		LLMRotate:          llmState.Rotate,
 		LLMFailoverState:   llmState.FailoverState,
 		LLMFailoverReason:  llmState.FailoverReason,
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		PlanQuietMode:      t.PlanQuietMode,
+		TargetGate:         t.targetGate.Load(),
 	}
 }
 
@@ -155,6 +168,7 @@ type TrafficExchangeDTO struct {
 	Status      int    `json:"status"`
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
+	Rewritten   bool   `json:"rewritten"`
 }
 
 func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
@@ -169,6 +183,7 @@ func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
 			Status:      e.Status,
 			ContentType: e.ContentType,
 			RespLen:     e.RespLen,
+			Rewritten:   e.Rewritten,
 		})
 	}
 	return out
@@ -186,7 +201,7 @@ type TaskNodeDTO struct {
 	TS           string `json:"ts"`
 	SourceTaskID string `json:"source_task_id,omitempty"`
 	Inherited    bool   `json:"inherited,omitempty"`
-	DeleteReason string `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
+	DeleteReason string `json:"delete_reason,omitempty"` // deletion reason when the intent is soft-deleted (state='deleted')
 }
 
 func taskNodeDTO(n *db.Node) TaskNodeDTO {
@@ -208,7 +223,7 @@ func taskNodeDTO(n *db.Node) TaskNodeDTO {
 }
 
 // GoalDTO is a goal node with its payload unpacked into text/vulnclass — the shape
-// the 总览「目标管理」UI works with (vs TaskNodeDTO which carries raw payload JSON).
+// the overview "Goal Management" UI works with (vs TaskNodeDTO which carries raw payload JSON).
 type GoalDTO struct {
 	ID        string `json:"id"`
 	Text      string `json:"text"`
@@ -242,7 +257,7 @@ func goalDTOs(in []*db.Node) []GoalDTO {
 	return out
 }
 
-// ConstraintDTO is one operation constraint (allow/deny) for the 总览「约束管理」UI.
+// ConstraintDTO is one operation constraint (allow/deny) for the overview "Constraint Management" UI.
 type ConstraintDTO struct {
 	ID     string `json:"id"`
 	Kind   string `json:"kind"` // allow | deny
@@ -308,16 +323,22 @@ type FindingDTO struct {
 	ReportEvidenceVersion int64                      `json:"report_evidence_version"`
 	ReportStale           bool                       `json:"report_stale"`
 	TrafficBindings       []db.FindingTrafficBinding `json:"traffic_bindings,omitempty"`
+	PoELevel              int                        `json:"poe_level"`
+	VerificationStatus    string                     `json:"verification_status"`
+	VerificationNote      string                     `json:"verification_note"`
+	Counterevidence       string                     `json:"counterevidence,omitempty"`      // what was tested and did not work; optional
+	ConfidenceRationale   string                     `json:"confidence_rationale,omitempty"` // why the conclusion holds; optional
 
-	ID        string `json:"id"`
-	FindingID string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
-	VulnClass string `json:"vulnclass"`
-	Name      string `json:"name,omitempty"` // 漏洞名称;为空时前端回退展示 vulnclass
-	Severity  string `json:"severity"`       // critical | high | medium | low
-	Status    string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
-	Summary   string `json:"summary"`
-	Evidence  string `json:"evidence"`
-	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
+	ID          string `json:"id"`
+	FindingID   string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
+	VulnClass   string `json:"vulnclass"`
+	Name        string `json:"name,omitempty"` // vulnerability name; the frontend falls back to displaying vulnclass when empty
+	Severity    string `json:"severity"`       // critical | high | medium | low
+	Status      string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
+	ReportState string `json:"report_state"`   // none | submitted | accepted | rejected | duplicate; workflow stage, not a triage verdict
+	Summary     string `json:"summary"`
+	Evidence    string `json:"evidence"`
+	Report      string `json:"report,omitempty"` // detailed report (Markdown); returned only by the detail endpoint, empty in lists
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -398,7 +419,7 @@ func findingDTO(n *db.Node) FindingDTO {
 }
 
 // findingDTOsForTask converts a task's finding nodes to DTOs, stamping each with
-// the owning task's id/description so the global 发现 page can group across tasks.
+// the owning task's id/description so the global findings page can group across tasks.
 // meta maps node id → the standalone findings row (id + status + asset ids), so the
 // per-task view shows the same triage state and anchored assets as the global page;
 // nodes with no row keep the 'pending' default and no finding_id (not editable).
@@ -443,19 +464,26 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 	if status == "" {
 		status = db.FindingPending
 	}
+	reportState := f.ReportState
+	if reportState == "" {
+		reportState = db.FindingReportNone
+	}
 	d := FindingDTO{
 		ID:           i64s(f.ID),
 		FindingID:    i64s(f.ID),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
-		VulnClass: f.VulnClass,
-		Name:      f.Name,
-		Severity:  f.Severity,
-		Status:    status,
-		Summary:   f.Summary,
-		Evidence:  f.Evidence,
-		Report:    f.Report,
-		TS:        rfc3339(f.CreatedAt),
+		PoELevel: f.PoELevel, VerificationStatus: f.VerificationStatus, VerificationNote: f.VerificationNote,
+		Counterevidence: f.Counterevidence, ConfidenceRationale: f.ConfidenceRationale,
+		VulnClass:   f.VulnClass,
+		Name:        f.Name,
+		Severity:    f.Severity,
+		Status:      status,
+		ReportState: reportState,
+		Summary:     f.Summary,
+		Evidence:    f.Evidence,
+		Report:      f.Report,
+		TS:          rfc3339(f.CreatedAt),
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {
@@ -544,8 +572,8 @@ type AgentDTO struct {
 	RunSecs          int    `json:"run_seconds"`
 	WebSearch        bool   `json:"web_search"`
 	InteractiveShell bool   `json:"interactive_shell"`
-	LLMProfileID     *int64 `json:"llm_profile_id"` // 绑定的 LLM 配置;null=跟随任务/全局
-	// P3 触发后处理策略(仅自定义 agent 有意义)。
+	LLMProfileID     *int64 `json:"llm_profile_id"` // bound LLM profile; null = follow the task/global setting
+	// P3 post-trigger handling policy (only meaningful for custom agents).
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
@@ -590,7 +618,8 @@ type LLMProfileDTO struct {
 	Name            string  `json:"name"`
 	Format          string  `json:"format"`
 	BaseURL         string  `json:"base_url,omitempty"`
-	Proxy           string  `json:"proxy,omitempty"`
+	Proxy           string  `json:"proxy,omitempty"` // masked: the placeholder when set
+	ProxySet        bool    `json:"proxy_set"`
 	Model           string  `json:"model"`
 	APIKeyHint      string  `json:"api_key_hint,omitempty"`
 	RatePerSecond   float64 `json:"rate_per_second"`
@@ -599,23 +628,26 @@ type LLMProfileDTO struct {
 	ThinkingType    string  `json:"thinking_type"`
 	ReasoningEffort string  `json:"reasoning_effort"`
 	IsDefault       bool    `json:"is_default"`
-	// 轮询(故障转移)参数：priority 越大越先被选中(激活配置恒为链首)；
-	// pool_exclude=true 则不作为故障转移目标，但仍可被 agent/任务显式绑定。
+	// Pooling (failover) parameters: higher priority is picked first (the active
+	// profile is always the chain head); pool_exclude=true excludes it as a failover target, though agents/tasks can still bind it explicitly.
 	Priority    int  `json:"priority"`
 	PoolExclude bool `json:"pool_exclude"`
-	// 收发模式：true=流式(SSE) | false=非流式。没有 omitempty —— false 必须出现在
-	// 响应里，否则前端读不到「非流式」，开关会回落成默认的流式。
+	// Send/receive mode: true=streaming (SSE) | false=non-streaming. No omitempty —
+	// false must appear in the response, otherwise the frontend cannot read "non-streaming" and the switch falls back to streaming by default.
 	Streaming bool `json:"streaming"`
-	// 单次回复输出上限(0=不发送，由服务端默认值决定)，以及它用哪个请求字段名
-	// (''=max_tokens | 'max_completion_tokens'，仅 openai 格式有意义)。
+	// Per-reply output cap (0=do not send; the server default applies) and which
+	// request field name it uses (''=max_tokens | 'max_completion_tokens', only meaningful for the openai format).
 	MaxTokens      int    `json:"max_tokens"`
 	MaxTokensField string `json:"max_tokens_field"`
-	// 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
-	// ''=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
+	// Custom session header name: when non-empty, every request carries this HTTP header,
+	// its value = the current session/intent's session id. '' = do not send. For gateways that key prompt caching/sticky routing off a session-id header.
 	SessionHeaderKey string `json:"session_header_key"`
-	// 本配置对重试的覆盖(建连/空响应/同 provider 安全窗口)。每项 attempts:
-	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
-	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
+	// Custom User-Agent: when non-empty, every outbound LLM request overrides its
+	// User-Agent header with this value. '' = do not override (keep the default UA).
+	UserAgent string `json:"user_agent"`
+	// This profile's retry overrides (connect / empty response / same-provider safe
+	// window). Per item attempts: 0=inherit the global policy | -1=disable that retry
+	// layer | >0=count; interval_ms: 0=default exponential backoff | >0=use that fixed millisecond interval. All zero = fully follow the global policy, i.e. the historical behavior.
 	Retry db.RetryOverride `json:"retry"`
 }
 
@@ -625,7 +657,8 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		Name:             p.Name,
 		Format:           p.Format,
 		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
+		Proxy:            maskedSecret(p.Proxy),
+		ProxySet:         p.Proxy != "",
 		Model:            p.Model,
 		APIKeyHint:       p.APIKeyHint,
 		RatePerSecond:    p.RatePerSecond,
@@ -640,6 +673,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,
 		SessionHeaderKey: p.SessionHeaderKey,
+		UserAgent:        p.UserAgent,
 		Retry:            p.Retry,
 	}
 }

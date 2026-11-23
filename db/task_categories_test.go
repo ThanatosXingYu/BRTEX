@@ -11,9 +11,10 @@ import (
 func TestTaskCategoryCRUDAndTaskAssignment(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanup below.
+	t.Cleanup(func() { d.Close() })
 
 	name := fmt.Sprintf("Category %d", time.Now().UnixNano())
 	category, err := d.CreateTaskCategory("  " + strings.ReplaceAll(name, " ", "   ") + "  ")
@@ -31,7 +32,7 @@ func TestTaskCategoryCRUDAndTaskAssignment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupErr(t, "task", d.DeleteTask(task.ID)) })
 	loaded, err := d.GetTask(task.ID)
 	if err != nil || loaded == nil || loaded.CategoryID == nil || *loaded.CategoryID != category.ID || loaded.CategoryName != name {
 		t.Fatalf("categorized task=%+v err=%v", loaded, err)
@@ -72,7 +73,7 @@ func TestTaskCategoryCRUDAndTaskAssignment(t *testing.T) {
 func TestCreateTaskRejectsMissingCategoryAtomically(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -93,16 +94,20 @@ func TestCreateTaskRejectsMissingCategoryAtomically(t *testing.T) {
 func TestSetTasksCategoryBatch(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	stamp := time.Now().UnixNano()
 	category, err := d.CreateTaskCategory(fmt.Sprintf("Batch %d", stamp))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.DeleteTaskCategory(category.ID) })
+	t.Cleanup(func() {
+		_, err := d.DeleteTaskCategory(category.ID)
+		cleanupErr(t, "category", err)
+	})
 
 	ids := make([]int64, 0, 3)
 	for i := range 3 {
@@ -110,7 +115,7 @@ func TestSetTasksCategoryBatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+		t.Cleanup(func() { cleanupErr(t, "task", d.DeleteTask(task.ID)) })
 		ids = append(ids, task.ID)
 	}
 
@@ -150,16 +155,17 @@ func TestSetTasksCategoryBatch(t *testing.T) {
 func TestSetTasksCategoryRejectsBadInputAtomically(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanup below.
+	t.Cleanup(func() { d.Close() })
 
 	stamp := time.Now().UnixNano()
 	task, err := d.CreateTaskWithOptions(fmt.Sprintf("batch-reject-%d", stamp), "goal", TaskCreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupErr(t, "task", d.DeleteTask(task.ID)) })
 
 	missingCategory := int64(1 << 62)
 	if _, _, err := d.SetTasksCategory([]int64{task.ID}, &missingCategory); !errors.Is(err, ErrTaskCategoryNotFound) {

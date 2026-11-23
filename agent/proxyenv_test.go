@@ -49,3 +49,26 @@ func TestProxyEnvInjectsCAWhenRecording(t *testing.T) {
 		}
 	}
 }
+
+// Only the recording proxy (a CA is present) gets the pace marker; the global
+// proxy of the capture-off path is passed as configured.
+func TestProxyEnvMarksOnlyTheRecordingProxy(t *testing.T) {
+	proxyVars := map[string]bool{"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true}
+	check := func(env []string, want, what string) {
+		t.Helper()
+		n := 0
+		for _, e := range env {
+			if k, v, _ := strings.Cut(e, "="); proxyVars[strings.ToUpper(k)] {
+				n++
+				if v != want {
+					t.Errorf("%s: %s, want %s", what, e, want)
+				}
+			}
+		}
+		if n != 6 {
+			t.Errorf("%s: %d proxy variables, want 6", what, n)
+		}
+	}
+	check(proxyEnv("http://127.0.0.1:8788", "/data/ca.pem"), "http://artex-pace:artex-pace@127.0.0.1:8788", "capture on")
+	check(proxyEnv("http://u:p@10.0.0.1:3128", ""), "http://u:p@10.0.0.1:3128", "capture off")
+}

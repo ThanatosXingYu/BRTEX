@@ -7,6 +7,7 @@ import {
   ArrowUpNarrowWideIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DownloadIcon,
   EraserIcon,
   FilterXIcon,
   ListChecksIcon,
@@ -14,11 +15,14 @@ import {
   RadioTowerIcon,
   SearchIcon,
   Trash2Icon,
+  UploadIcon,
+  XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { HttpCodeBlock } from "@/components/http-code-block";
 import { LinkTrafficDialog } from "@/components/link-traffic-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,12 +46,19 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { setVisibleInterval } from "@/lib/polling";
 import { useStoredSortPreference } from "@/lib/sort-preference";
-import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
+import type { TrafficDetail, TrafficExchange, TrafficHARImportResult, TrafficHost, TrafficResp } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useActiveCompanyID } from "@/stores/company/company-store";
+import { intlLocale, t } from "@/i18n";
+
+import { ReplayPanel } from "./_components/replay-panel";
+import { StreamMessagesPanel } from "./_components/stream-messages";
+import { TamperHooksPanel } from "./_components/tamper-hooks-panel";
 
 function fmtTime(ts: string) {
-  return new Date(ts).toLocaleString("zh-CN", {
+  return new Date(ts).toLocaleString(intlLocale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -112,6 +123,9 @@ const SORT_STORAGE_KEY = "traffic-sort";
 const STATUS_BUCKETS = ["2xx", "3xx", "4xx", "5xx"];
 
 export default function TrafficPage() {
+  const [viewTab, setViewTab] = React.useState<"exchanges" | "hooks">("exchanges");
+  // The sidebar's company switcher narrows the list to that company's hosts.
+  const companyId = useActiveCompanyID();
   const [selectedFlows, setSelectedFlows] = React.useState<Set<string>>(() => new Set());
   const [linking, setLinking] = React.useState(false);
   const [page, setPage] = React.useState(0);
@@ -130,6 +144,7 @@ export default function TrafficPage() {
   const [path, setPath] = React.useState("");
   const [pathQ, setPathQ] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState("all");
+  const [rewrittenFilter, setRewrittenFilter] = React.useState("all");
   const [respMin, setRespMin] = React.useState("");
   const [respMinQ, setRespMinQ] = React.useState("");
   const [respMax, setRespMax] = React.useState("");
@@ -140,6 +155,9 @@ export default function TrafficPage() {
   const [selected, setSelected] = React.useState<TrafficExchange | null>(null);
   const [detail, setDetail] = React.useState<TrafficDetail | null>(null);
   const [detailLoading, setDetailLoading] = React.useState(false);
+  const [detailTab, setDetailTab] = React.useState("request");
+  const streamKind = detail?.stream_kind === "websocket" || detail?.stream_kind === "sse" ? detail.stream_kind : null;
+  const hasStream = streamKind !== null;
 
   const [hosts, setHosts] = React.useState<TrafficHost[]>([]); // target picker
   const [selectedHosts, setSelectedHosts] = React.useState<string[]>([]); // checked in picker
@@ -149,6 +167,13 @@ export default function TrafficPage() {
   const [deleteMode, setDeleteMode] = React.useState<"filter" | "selected" | "all" | null>(null); // null = dialog closed
   const [deleting, setDeleting] = React.useState(false);
   const [reloadTick, setReloadTick] = React.useState(0); // manual refetch trigger
+
+  // HAR 1.2 import/export state
+  const harInputRef = React.useRef<HTMLInputElement | null>(null);
+  const [harImporting, setHarImporting] = React.useState(false);
+  const [harExporting, setHarExporting] = React.useState(false);
+  const [harSummary, setHarSummary] = React.useState<TrafficHARImportResult | null>(null);
+  const [harError, setHarError] = React.useState<string | null>(null);
 
   // Debounce both filters so we don't refetch on every keystroke.
   React.useEffect(() => {
@@ -176,13 +201,15 @@ export default function TrafficPage() {
     return () => clearTimeout(t);
   }, [respMax]);
 
-  const hasAdvancedFilter = Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all";
+  const hasAdvancedFilter =
+    Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all" || rewrittenFilter !== "all";
   const resetAdvancedFilters = () => {
     setBody("");
     setBodyQ("");
     setPath("");
     setPathQ("");
     setStatusFilter("all");
+    setRewrittenFilter("all");
     setRespMin("");
     setRespMinQ("");
     setRespMax("");
@@ -193,7 +220,7 @@ export default function TrafficPage() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, rewrittenFilter, respMinQ, respMaxQ, sort, companyId]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -206,10 +233,12 @@ export default function TrafficPage() {
           body: bodyQ,
           path: pathQ,
           status: statusFilter,
+          rewritten: rewrittenFilter,
           respMin: respMinQ,
           respMax: respMaxQ,
           sort: sort.field,
           order: sort.direction,
+          company: companyId,
         })
         .then((r) => {
           if (alive) setTraffic(r);
@@ -227,15 +256,30 @@ export default function TrafficPage() {
         });
     };
     load();
-    const t = setInterval(() => {
+    const stopPolling = setVisibleInterval(() => {
       if (page !== 0) return; // only auto-refresh the newest page
       load();
     }, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stopPolling();
     };
-  }, [page, size, hostQ, method, queryQ, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, reloadTick]);
+  }, [
+    page,
+    size,
+    hostQ,
+    method,
+    queryQ,
+    bodyQ,
+    pathQ,
+    statusFilter,
+    rewrittenFilter,
+    respMinQ,
+    respMaxQ,
+    sort,
+    reloadTick,
+    companyId,
+  ]);
 
   // Delete traffic for the current host filter (substring) or the checked
   // hosts (exact batch), then refetch.
@@ -249,14 +293,14 @@ export default function TrafficPage() {
     [hosts, hostCountSortDirection],
   );
 
-  // "清空" for the unfiltered purge, "删除" for the host-scoped ones — the dialog's
+  // "Purge" for the unfiltered purge, "Delete" for the host-scoped ones — the dialog's
   // title and its confirm button both follow from which is in play.
-  const deleteVerb = deleteMode === "all" ? "清空" : "删除";
+  const purging = deleteMode === "all";
   const deleteTitle = deleteMode
     ? {
-        all: "清空全部流量记录？",
-        selected: `删除选中的 ${selectedHosts.length} 个目标的全部流量？`,
-        filter: "删除该目标的全部流量？",
+        all: t("Purge all traffic records?"),
+        selected: t("Delete all traffic for the {count} selected targets?", { count: selectedHosts.length }),
+        filter: t("Delete all traffic for this target?"),
       }[deleteMode]
     : "";
 
@@ -284,21 +328,29 @@ export default function TrafficPage() {
         if (mode === "all") {
           // Reclaimed space is the whole point of compacting an emptied index, so say so.
           const reclaimed = r.reclaimed ?? 0;
-          const freed = reclaimed > 0 ? `，释放 ${fmtBytes(reclaimed)} 存储` : "";
-          toast.success(`已清空 ${r.deleted} 条流量${freed}`);
+          toast.success(
+            reclaimed > 0
+              ? t("Purged {count} traffic records, freeing {size} of storage", {
+                  count: r.deleted,
+                  size: fmtBytes(reclaimed),
+                })
+              : t("Purged {count} traffic records", { count: r.deleted }),
+          );
         }
         setPage(0);
         setReloadTick((t) => t + 1);
       })
       .catch((e) => {
         // Keep the confirmation open so the user can retry a failed deletion.
-        if (mode === "all") toast.error(`清空失败：${(e as Error).message}`);
+        if (mode === "all") toast.error(t("Purge failed: {error}", { error: (e as Error).message }));
       })
       .finally(() => setDeleting(false));
   };
 
-  // Lazy-load the raw request/response for the selected exchange.
+  // Lazy-load the raw request/response for the selected exchange. A new
+  // selection opens on Request; a WebSocket/SSE exchange then opens on Stream.
   React.useEffect(() => {
+    setDetailTab("request");
     if (!selected) {
       setDetail(null);
       return;
@@ -309,10 +361,12 @@ export default function TrafficPage() {
     api
       .trafficExchange(selected.id)
       .then((d) => {
-        if (alive) setDetail(d);
+        if (!alive) return;
+        setDetail(d);
+        if (d.stream_kind === "websocket" || d.stream_kind === "sse") setDetailTab("stream");
       })
       .catch(() => {
-        if (alive) setDetail({ req: "（无法加载报文）", resp: "" });
+        if (alive) setDetail({ req: t("(failed to load the messages)"), resp: "" });
       })
       .finally(() => {
         if (alive) setDetailLoading(false);
@@ -331,6 +385,76 @@ export default function TrafficPage() {
         : { field, direction: "desc" },
     );
 
+  const handleHarFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setHarError(null);
+    setHarSummary(null);
+    if (file.size > 32 * 1024 * 1024) {
+      const msg = t("HAR file exceeds the 32 MiB limit");
+      setHarError(msg);
+      toast.error(msg);
+      return;
+    }
+    setHarImporting(true);
+    try {
+      const raw = await file.text();
+      const res = await api.trafficImportHAR(raw);
+      setHarSummary(res);
+      const summary = t("HAR import complete: {imported} imported, {skipped} skipped, {failed} failed", {
+        imported: res.imported,
+        skipped: res.skipped,
+        failed: res.failed,
+      });
+      if (res.failed > 0 || res.truncated) {
+        toast.warning(summary);
+      } else {
+        toast.success(summary);
+      }
+      setPage(0);
+      setReloadTick((n) => n + 1);
+    } catch (e) {
+      const msg = t("HAR import failed: {error}", { error: (e as Error).message });
+      setHarError(msg);
+      toast.error(msg);
+    } finally {
+      setHarImporting(false);
+    }
+  };
+
+  const handleHarExport = async () => {
+    setHarExporting(true);
+    try {
+      const meta = await api.trafficExportHAR({
+        host: hostQ,
+        method,
+        q: queryQ,
+        body: bodyQ,
+        path: pathQ,
+        status: statusFilter,
+        rewritten: rewrittenFilter,
+        respMin: respMinQ,
+        respMax: respMaxQ,
+      });
+      if (meta.truncated) {
+        toast.warning(
+          t("Exported {exported} of {matched} matching exchanges (truncated: {reason})", {
+            exported: meta.exported,
+            matched: meta.matched,
+            reason: meta.truncatedReason ?? "limit",
+          }),
+        );
+      } else {
+        toast.success(t("Exported {count} exchanges to HAR", { count: meta.exported }));
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setHarExporting(false);
+    }
+  };
+
   const exchanges = React.useMemo(() => traffic?.exchanges ?? [], [traffic]);
   const total = traffic?.total ?? exchanges.length;
   const pageCount = Math.max(1, Math.ceil(total / size));
@@ -341,8 +465,8 @@ export default function TrafficPage() {
     <div className="flex min-h-0 flex-1 flex-col gap-4">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">流量</h1>
-          <p className="text-muted-foreground text-sm">全局录制代理 · 所有 HTTP 往来</p>
+          <h1 className="text-xl font-semibold tracking-tight">{t("Traffic")}</h1>
+          <p className="text-muted-foreground text-sm">{t("Global recording proxy · all HTTP traffic")}</p>
         </div>
         <div className="flex items-center gap-4 text-sm">
           <span
@@ -354,14 +478,97 @@ export default function TrafficPage() {
             )}
           >
             <RadioTowerIcon className="size-3.5" />
-            {traffic?.enabled ? "录制中" : "已停用"}
+            {traffic?.enabled ? t("Recording") : t("Disabled")}
           </span>
           {traffic?.proxy && <span className="font-mono text-xs text-muted-foreground">{traffic.proxy}</span>}
-          <span className="text-xs text-muted-foreground">
-            共 <span className="tabular-nums">{traffic?.count ?? 0}</span> 条
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {t("{count} records", { count: traffic?.count ?? 0 })}
           </span>
+          <input
+            ref={harInputRef}
+            type="file"
+            accept=".har,application/json"
+            className="hidden"
+            onChange={(e) => void handleHarFileChange(e)}
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8"
+            disabled={harImporting}
+            onClick={() => harInputRef.current?.click()}
+          >
+            {harImporting ? <Loader2Icon className="size-3.5 animate-spin" /> : <UploadIcon className="size-3.5" />}
+            {harImporting ? t("Importing HAR…") : t("Import HAR")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8"
+            disabled={harExporting || !traffic?.count}
+            onClick={() => void handleHarExport()}
+          >
+            {harExporting ? <Loader2Icon className="size-3.5 animate-spin" /> : <DownloadIcon className="size-3.5" />}
+            {harExporting ? t("Exporting HAR…") : t("Export HAR")}
+          </Button>
         </div>
       </div>
+
+      <Tabs
+        value={viewTab}
+        onValueChange={(v) => setViewTab(v as "exchanges" | "hooks")}
+        className="flex min-h-0 flex-1 flex-col gap-4"
+      >
+        <TabsList className="w-fit">
+          <TabsTrigger value="exchanges">{t("Exchanges")}</TabsTrigger>
+          <TabsTrigger value="hooks">{t("Hooks")}</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="hooks" className="mt-0 flex min-h-0 flex-1 flex-col gap-4">
+          <TamperHooksPanel recentExchanges={exchanges} />
+        </TabsContent>
+
+        <TabsContent value="exchanges" className="mt-0 flex min-h-0 flex-1 flex-col gap-4">
+
+      {harError ? (
+        <Alert variant="destructive" className="flex items-center justify-between gap-2 py-2">
+          <AlertDescription className="text-xs">{harError}</AlertDescription>
+          <Button variant="ghost" size="icon-xs" aria-label={t("Dismiss")} onClick={() => setHarError(null)}>
+            <XIcon className="size-3.5" />
+          </Button>
+        </Alert>
+      ) : null}
+
+      {harSummary ? (
+        <Alert className="flex items-start justify-between gap-2 py-2">
+          <AlertDescription className="space-y-1 text-xs">
+            <p>
+              {t("HAR import complete: {imported} imported, {skipped} skipped, {failed} failed", {
+                imported: harSummary.imported,
+                skipped: harSummary.skipped,
+                failed: harSummary.failed,
+              })}
+            </p>
+            {harSummary.truncated ? (
+              <p className="text-amber-600 dark:text-amber-400">
+                {t("HAR import stopped early at the 32 MiB decoded body cap.")}
+              </p>
+            ) : null}
+            {harSummary.errors && harSummary.errors.length > 0 ? (
+              <ul className="list-disc pl-4 text-muted-foreground">
+                {harSummary.errors.slice(0, 5).map((item) => (
+                  <li key={`${item.index}-${item.reason}`} className="font-mono">
+                    #{item.index}: {item.reason}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </AlertDescription>
+          <Button variant="ghost" size="icon-xs" aria-label={t("Dismiss")} onClick={() => setHarSummary(null)}>
+            <XIcon className="size-3.5" />
+          </Button>
+        </Alert>
+      ) : null}
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
@@ -369,7 +576,9 @@ export default function TrafficPage() {
           <PopoverTrigger asChild>
             <Button variant="outline" size="sm" className="h-8">
               <ListChecksIcon className="size-3.5" />
-              {selectedHosts.length > 0 ? `选择目标（${selectedHosts.length}）` : "选择目标…"}
+              {selectedHosts.length > 0
+                ? t("Select targets ({count})", { count: selectedHosts.length })
+                : t("Select targets…")}
             </Button>
           </PopoverTrigger>
           <PopoverContent
@@ -378,7 +587,7 @@ export default function TrafficPage() {
             collisionPadding={16}
           >
             <div className="flex items-center justify-between border-b px-3 py-2">
-              <span className="text-xs font-medium text-muted-foreground">按目标批量删除</span>
+              <span className="text-xs font-medium text-muted-foreground">{t("Batch delete by target")}</span>
               <div className="flex items-center gap-1">
                 {hosts.length > 0 && (
                   <Tooltip>
@@ -389,14 +598,18 @@ export default function TrafficPage() {
                         onClick={() => setHostCountSortDirection((current) => (current === "desc" ? "asc" : "desc"))}
                         aria-label={
                           hostCountSortDirection === "desc"
-                            ? "数据包数量当前倒序，点击切换为正序"
-                            : "数据包数量当前正序，点击切换为倒序"
+                            ? t("Packet count is currently descending; click to switch to ascending")
+                            : t("Packet count is currently ascending; click to switch to descending")
                         }
                       >
                         {hostCountSortDirection === "desc" ? <ArrowDownWideNarrowIcon /> : <ArrowUpNarrowWideIcon />}
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent>按数据包数量{hostCountSortDirection === "desc" ? "倒序" : "正序"}</TooltipContent>
+                    <TooltipContent>
+                      {hostCountSortDirection === "desc"
+                        ? t("By packet count, descending")
+                        : t("By packet count, ascending")}
+                    </TooltipContent>
                   </Tooltip>
                 )}
                 {hosts.length > 0 && (
@@ -406,14 +619,14 @@ export default function TrafficPage() {
                     className="h-6 px-2 text-xs"
                     onClick={() => setSelectedHosts(allSelected ? [] : hosts.map((h) => h.host))}
                   >
-                    {allSelected ? "取消全选" : "全选"}
+                    {allSelected ? t("Clear all") : t("Select all")}
                   </Button>
                 )}
               </div>
             </div>
             <div className="max-h-64 overflow-y-auto">
               {hosts.length === 0 ? (
-                <div className="px-3 py-6 text-center text-xs text-muted-foreground">暂无流量记录</div>
+                <div className="px-3 py-6 text-center text-xs text-muted-foreground">{t("No traffic records")}</div>
               ) : (
                 sortedHosts.map((h, index) => (
                   <label
@@ -447,7 +660,7 @@ export default function TrafficPage() {
                   setPickerOpen(false);
                 }}
               >
-                删除选中（{selectedHosts.length}）
+                {t("Delete selected ({count})", { count: selectedHosts.length })}
               </Button>
             </div>
           </PopoverContent>
@@ -460,29 +673,29 @@ export default function TrafficPage() {
           size="sm"
           className="h-8"
           disabled={!hostQ || deleting}
-          title={hostQ ? undefined : "先在左侧选择目标或输入 host"}
+          title={hostQ ? undefined : t("Select a target on the left or enter a host first")}
           onClick={() => setDeleteMode("filter")}
         >
           <Trash2Icon className="size-3.5" />
-          删除该目标
+          {t("Delete this target")}
         </Button>
         {/* Outline rather than a second destructive button: this one ignores every
-            filter, so it must not look one mis-click away from "删除该目标". */}
+            filter, so it must not look one mis-click away from "Delete this target". */}
         <Button
           variant="outline"
           size="sm"
           className="h-8 text-destructive hover:bg-destructive/10 hover:text-destructive"
           disabled={!traffic?.count || deleting}
-          title={traffic?.count ? "删除全部流量并压实存储" : "当前没有流量记录"}
+          title={traffic?.count ? t("Delete all traffic and compact storage") : t("No traffic records yet")}
           onClick={() => setDeleteMode("all")}
         >
           <EraserIcon className="size-3.5" />
-          清空全部
+          {t("Purge all")}
         </Button>
         <div className="relative max-w-sm flex-1">
           <SearchIcon className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            placeholder="搜索全部（URL / 方法 / 类型 / 状态码…）"
+            placeholder={t("Search everything (URL / method / type / status…)")}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             className="h-8 pl-8"
@@ -490,10 +703,10 @@ export default function TrafficPage() {
         </div>
         <Select value={method} onValueChange={setMethod}>
           <SelectTrigger size="sm" className="w-32">
-            <SelectValue placeholder="方法" />
+            <SelectValue placeholder={t("Method")} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">全部方法</SelectItem>
+            <SelectItem value="all">{t("All methods")}</SelectItem>
             {METHODS.map((m) => (
               <SelectItem key={m} value={m}>
                 {m}
@@ -508,7 +721,7 @@ export default function TrafficPage() {
           <SelectContent>
             {PAGE_SIZES.map((n) => (
               <SelectItem key={n} value={String(n)}>
-                {n} / 页
+                {t("{count} / page", { count: n })}
               </SelectItem>
             ))}
           </SelectContent>
@@ -544,10 +757,10 @@ export default function TrafficPage() {
 
       {/* Advanced filters (issue #177): narrow 660k+ exchanges down to the one packet. */}
       <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
-        <span className="pl-1 text-xs font-medium text-muted-foreground">高级筛选</span>
+        <span className="pl-1 text-xs font-medium text-muted-foreground">{t("Advanced filters")}</span>
         <div className="relative w-56">
           <Input
-            placeholder="响应内容（正文关键词，≥3字）"
+            placeholder={t("Response content (body keyword, ≥3 chars)")}
             value={body}
             onChange={(e) => setBody(e.target.value)}
             className="h-8"
@@ -555,7 +768,7 @@ export default function TrafficPage() {
         </div>
         <div className="relative w-52">
           <Input
-            placeholder="路径（如 /api/user/…）"
+            placeholder={t("Path (e.g. /api/user/…)")}
             value={path}
             onChange={(e) => setPath(e.target.value)}
             className="h-8"
@@ -563,10 +776,10 @@ export default function TrafficPage() {
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
           <SelectTrigger size="sm" className="w-28">
-            <SelectValue placeholder="状态码" />
+            <SelectValue placeholder={t("Status")} />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">全部状态码</SelectItem>
+            <SelectItem value="all">{t("All statuses")}</SelectItem>
             {STATUS_BUCKETS.map((s) => (
               <SelectItem key={s} value={s}>
                 {s}
@@ -574,12 +787,22 @@ export default function TrafficPage() {
             ))}
           </SelectContent>
         </Select>
+        <Select value={rewrittenFilter} onValueChange={setRewrittenFilter}>
+          <SelectTrigger size="sm" className="w-32">
+            <SelectValue placeholder={t("Rewritten")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{t("All traffic")}</SelectItem>
+            <SelectItem value="rewritten">{t("Rewritten")}</SelectItem>
+            <SelectItem value="original">{t("Original")}</SelectItem>
+          </SelectContent>
+        </Select>
         <div className="flex items-center gap-1 text-xs text-muted-foreground">
-          <span>响应长度</span>
+          <span>{t("Response size")}</span>
           <Input
             type="number"
             min={0}
-            placeholder="最小(B)"
+            placeholder={t("Min (B)")}
             value={respMin}
             onChange={(e) => setRespMin(e.target.value)}
             className="h-8 w-24"
@@ -588,7 +811,7 @@ export default function TrafficPage() {
           <Input
             type="number"
             min={0}
-            placeholder="最大(B)"
+            placeholder={t("Max (B)")}
             value={respMax}
             onChange={(e) => setRespMax(e.target.value)}
             className="h-8 w-24"
@@ -597,19 +820,21 @@ export default function TrafficPage() {
         {hasAdvancedFilter ? (
           <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
             <FilterXIcon className="size-3.5" />
-            清除筛选
+            {t("Clear filters")}
           </Button>
         ) : null}
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm text-muted-foreground">已选 {selectedFlows.size} 条流量</span>
+        <span className="text-sm text-muted-foreground">
+          {t("{count} flows selected", { count: selectedFlows.size })}
+        </span>
         <Button variant="outline" size="sm" disabled={selectedFlows.size === 0} onClick={() => setLinking(true)}>
-          关联到漏洞
+          {t("Link to finding")}
         </Button>
         {selectedFlows.size > 0 ? (
           <Button variant="ghost" size="sm" onClick={() => setSelectedFlows(new Set())}>
-            清空选择
+            {t("Clear selection")}
           </Button>
         ) : null}
       </div>
@@ -622,7 +847,7 @@ export default function TrafficPage() {
                 <TableRow>
                   <TableHead className="w-10">
                     <Checkbox
-                      aria-label="选择本页流量"
+                      aria-label={t("Select this page's traffic")}
                       checked={exchanges.length > 0 && exchanges.every((e) => selectedFlows.has(e.id))}
                       onCheckedChange={(checked) =>
                         setSelectedFlows((previous) => {
@@ -638,18 +863,18 @@ export default function TrafficPage() {
                   </TableHead>
                   <SortableHead
                     field="ts"
-                    label="时间"
+                    label={t("Time")}
                     activeField={sort.field}
                     direction={sort.direction}
                     onSort={toggleSort}
                     className="w-36"
                   />
                   <TableHead className="w-44">host</TableHead>
-                  <TableHead className="w-20">方法</TableHead>
+                  <TableHead className="w-20">{t("Method")}</TableHead>
                   <TableHead>URL</TableHead>
                   <SortableHead
                     field="status"
-                    label="状态码"
+                    label={t("Status")}
                     activeField={sort.field}
                     direction={sort.direction}
                     onSort={toggleSort}
@@ -658,7 +883,7 @@ export default function TrafficPage() {
                   <TableHead className="w-36">content-type</TableHead>
                   <SortableHead
                     field="resp_len"
-                    label="响应长度"
+                    label={t("Response size")}
                     activeField={sort.field}
                     direction={sort.direction}
                     onSort={toggleSort}
@@ -676,7 +901,7 @@ export default function TrafficPage() {
                   >
                     <TableCell>
                       <Checkbox
-                        aria-label={`选择流量 ${e.id}`}
+                        aria-label={t("Select traffic {id}", { id: e.id })}
                         checked={selectedFlows.has(e.id)}
                         onClick={(event) => event.stopPropagation()}
                         onCheckedChange={(checked) =>
@@ -695,7 +920,17 @@ export default function TrafficPage() {
                       <MethodBadge method={e.method} />
                     </TableCell>
                     <TableCell className="max-w-0">
-                      <span className="block truncate font-mono text-xs">{e.url}</span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="min-w-0 truncate font-mono text-xs">{e.url}</span>
+                        {e.rewritten ? (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 border-amber-500/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                          >
+                            {t("Rewritten")}
+                          </Badge>
+                        ) : null}
+                      </div>
                     </TableCell>
                     <TableCell>
                       <span className={cn("font-mono text-xs font-semibold tabular-nums", statusTone(e.status))}>
@@ -709,7 +944,7 @@ export default function TrafficPage() {
                 {exchanges.length === 0 && (
                   <TableRow>
                     <TableCell colSpan={8} className="py-12 text-center text-sm text-muted-foreground">
-                      {traffic === null ? "加载中…" : "没有匹配的流量。"}
+                      {traffic === null ? t("Loading…") : t("No matching traffic.")}
                     </TableCell>
                   </TableRow>
                 )}
@@ -736,21 +971,46 @@ export default function TrafficPage() {
                   <Badge variant="secondary" className={cn("font-mono tabular-nums", statusTone(selected.status))}>
                     {selected.status}
                   </Badge>
+                  {selected.rewritten ? (
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                    >
+                      {t("Rewritten")}
+                    </Badge>
+                  ) : null}
                   <span className="ml-auto text-xs text-muted-foreground tabular-nums">{fmtTime(selected.ts)}</span>
                 </div>
                 <SheetTitle className="break-all font-mono">{selected.host}</SheetTitle>
                 <SheetDescription className="break-all font-mono">{selected.url}</SheetDescription>
               </SheetHeader>
-              <Tabs defaultValue="request" className="min-h-0 flex-1 gap-0">
-                <TabsList className="mx-5 mt-4 grid w-auto grid-cols-2">
-                  <TabsTrigger value="request">请求 Request</TabsTrigger>
-                  <TabsTrigger value="response">响应 Response</TabsTrigger>
+              <Tabs value={detailTab} onValueChange={setDetailTab} className="min-h-0 flex-1 gap-0">
+                <TabsList className={cn("mx-5 mt-4 grid w-auto", hasStream ? "grid-cols-4" : "grid-cols-3")}>
+                  <TabsTrigger value="request">{t("Request")}</TabsTrigger>
+                  <TabsTrigger value="response">{t("Response")}</TabsTrigger>
+                  {hasStream && (
+                    <TabsTrigger value="stream">
+                      {t("Stream")}
+                      {(detail?.stream_count ?? 0) > 0 && (
+                        <span className="text-muted-foreground text-xs tabular-nums">{detail?.stream_count}</span>
+                      )}
+                    </TabsTrigger>
+                  )}
+                  {hasStream ? (
+                    <span title={t("stream replay is not supported")} className="flex">
+                      <TabsTrigger value="replay" disabled>
+                        {t("Replay")}
+                      </TabsTrigger>
+                    </span>
+                  ) : (
+                    <TabsTrigger value="replay">{t("Replay")}</TabsTrigger>
+                  )}
                 </TabsList>
                 <TabsContent value="request" className="min-h-0 overflow-auto">
                   {detailLoading ? (
                     <div className="flex items-center gap-2 p-5 text-xs text-muted-foreground">
                       <Loader2Icon className="size-3.5 animate-spin" />
-                      加载报文…
+                      {t("Loading messages…")}
                     </div>
                   ) : (
                     <HttpCodeBlock raw={requestWithHost(detail?.req ?? "", selected)} />
@@ -760,12 +1020,35 @@ export default function TrafficPage() {
                   {detailLoading ? (
                     <div className="flex items-center gap-2 p-5 text-xs text-muted-foreground">
                       <Loader2Icon className="size-3.5 animate-spin" />
-                      加载报文…
+                      {t("Loading messages…")}
                     </div>
                   ) : (
                     <HttpCodeBlock raw={detail?.resp ?? ""} />
                   )}
                 </TabsContent>
+                {streamKind && (
+                  <TabsContent value="stream" className="min-h-0 overflow-auto">
+                    <StreamMessagesPanel exchangeId={selected.id} kind={streamKind} />
+                  </TabsContent>
+                )}
+                {!hasStream && (
+                  // Kept mounted so edits survive a look at another tab.
+                  <TabsContent value="replay" forceMount className="min-h-0 overflow-auto data-[state=inactive]:hidden">
+                    {detailLoading || !detail ? (
+                      <div className="flex items-center gap-2 p-5 text-muted-foreground text-xs">
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                        {t("Loading…")}
+                      </div>
+                    ) : (
+                      <ReplayPanel
+                        exchange={selected}
+                        raw={requestWithHost(detail.req, selected)}
+                        methods={METHODS}
+                        onRecorded={() => setReloadTick((n) => n + 1)}
+                      />
+                    )}
+                  </TabsContent>
+                )}
               </Tabs>
             </>
           )}
@@ -784,34 +1067,41 @@ export default function TrafficPage() {
             <AlertDialogDescription>
               {deleteMode === "all" && (
                 <>
-                  将永久删除全部 <span className="font-semibold tabular-nums">{traffic?.count ?? 0}</span>{" "}
-                  条流量记录（含请求/响应原文），忽略当前的筛选条件，此操作不可撤销。已绑定到漏洞的流量证据保存在独立的证据库中，不受影响。
+                  {t(
+                    "This will permanently delete all {count} traffic records (including raw requests/responses), ignoring the current filters. This action cannot be undone. Traffic evidence already bound to findings lives in a separate evidence store and is unaffected.",
+                    { count: traffic?.count ?? 0 },
+                  )}
                   <br />
                   <span className="text-muted-foreground">
-                    清空后会顺带压实存储，把索引占用的磁盘空间还给系统；这期间流量录制会短暂暂停。
+                    {t(
+                      "Purging also compacts storage, returning the index's disk space to the system; traffic recording pauses briefly during this time.",
+                    )}
                   </span>
                 </>
               )}
               {deleteMode === "selected" && (
                 <>
-                  将永久删除 <span className="font-semibold tabular-nums">{selectedHosts.length}</span> 个目标（
-                  <span className="font-mono">
-                    {selectedHosts.slice(0, 3).join("、")}
-                    {selectedHosts.length > 3 ? "…" : ""}
-                  </span>
-                  ）的所有流量记录（含请求/响应原文），此操作不可撤销。
+                  {t(
+                    "This will permanently delete all traffic records for {count} targets ({hosts}), including raw requests/responses. This action cannot be undone.",
+                    {
+                      count: selectedHosts.length,
+                      hosts: `${selectedHosts.slice(0, 3).join(", ")}${selectedHosts.length > 3 ? "…" : ""}`,
+                    },
+                  )}
                 </>
               )}
               {deleteMode === "filter" && (
                 <>
-                  将永久删除 host 包含 <span className="font-mono font-semibold">{hostQ}</span>{" "}
-                  的所有流量记录（含请求/响应原文），此操作不可撤销。
+                  {t(
+                    "This will permanently delete all traffic records for hosts containing {host} (including raw requests/responses). This action cannot be undone.",
+                    { host: hostQ },
+                  )}
                 </>
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleting}>{t("Cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={(e) => {
                 e.preventDefault();
@@ -820,11 +1110,19 @@ export default function TrafficPage() {
               disabled={deleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {deleting ? `${deleteVerb}中…` : `确认${deleteVerb}`}
+              {deleting
+                ? purging
+                  ? t("Purging…")
+                  : t("Deleting…")
+                : purging
+                  ? t("Confirm purge")
+                  : t("Confirm delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

@@ -123,7 +123,7 @@ func TestTaskArchiveFormatCompatibility(t *testing.T) {
 func TestTaskArchiveDatabaseRoundTrip(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 	if err := d.EnsureLLMRecordsTable(); err != nil {
@@ -154,19 +154,28 @@ func TestTaskArchiveDatabaseRoundTrip(t *testing.T) {
 VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmProfileID, exhaustedAt, chainCreatedAt); err != nil {
 		t.Fatal(err)
 	}
+	var assetID, findingID int64
 	defer func() {
 		_, _ = d.Exec(`DELETE FROM llm_usage WHERE task_id=$1 OR exploration_id=$2`, fmt.Sprint(task.ID), task.ExplorationID)
+		_, _ = d.Exec(`DELETE FROM llm_records WHERE task_id=$1`, fmt.Sprint(task.ID))
 		_, _ = d.Exec(`DELETE FROM skill_usage WHERE task_id=$1 OR exploration_id=$2`, task.ID, task.ExplorationID)
 		_, _ = d.Exec(`DELETE FROM tool_usage WHERE task_id=$1 OR exploration_id=$2`, task.ID, task.ExplorationID)
+		_, _ = d.DeleteFindingsByTask(task.ID)
+		if findingID != 0 {
+			_, _ = d.DeleteFinding(findingID)
+		}
 		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
 		_ = d.DeleteTask(task.ID)
+		if assetID != 0 {
+			_, _ = d.Exec(`DELETE FROM assets WHERE id=$1`, assetID)
+		}
 		_, _ = d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, llmProfileID)
 		_, _ = d.Exec(`DELETE FROM companies WHERE id=$1`, companyID)
 	}()
 	if err := d.SetPaused(task.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	assetID, err := d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("archive-%d.example", task.ID), TaskID: task.ID})
+	assetID, err = d.Assets().UpsertRootDomain(UpsertRootDomainReq{Domain: fmt.Sprintf("archive-%d.example", task.ID), TaskID: task.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,12 +206,19 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.AddFinding(task.ID, nodeID, vulnclass, "archive finding", SeverityCritical, "summary", "evidence", "worker", []int64{assetID}); err != nil {
+	if findingID, err = d.AddFinding(task.ID, nodeID, vulnclass, "archive finding", SeverityCritical, "summary", "evidence", "worker", []int64{assetID}); err != nil {
 		t.Fatal(err)
 	}
 	archive, err := d.QueueTaskArchive(task.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if archive.Storage != "" {
+		t.Fatalf("queued archive without a location has storage %q", archive.Storage)
+	}
+	encoded, err := json.Marshal(archive)
+	if err != nil || bytes.Contains(encoded, []byte(`"storage"`)) {
+		t.Fatalf("unknown storage must be omitted from JSON: %s, %v", encoded, err)
 	}
 	claimed, err := d.ClaimTaskArchiveJob(t.Context())
 	if err != nil || claimed == nil || claimed.ID != archive.ID || claimed.State != Archiving {
@@ -242,7 +258,7 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 		t.Fatalf("hot compaction left nodes=%d assets=%d usage=%d", nodes, assets, usage)
 	}
 	ready, err := d.GetTaskArchive(archive.ID)
-	if err != nil || ready == nil || ready.State != ArchiveReady {
+	if err != nil || ready == nil || ready.State != ArchiveReady || ready.Storage != "local" {
 		t.Fatalf("ready archive = %+v, %v", ready, err)
 	}
 	var stats map[string]any
@@ -271,7 +287,7 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	}
 	warningFound := false
 	for _, warning := range warnings {
-		if strings.Contains(warning, fmt.Sprintf("任务企业 %d 已删除", companyID)) {
+		if strings.Contains(warning, fmt.Sprintf("task company %d has been deleted", companyID)) {
 			warningFound = true
 		}
 	}
@@ -335,7 +351,7 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 func TestTaskArchiveBlockersIgnoreQueuedDependents(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 	source, err := d.CreateTaskWithOptions("archive blocker source", "source", TaskCreateOptions{})
@@ -362,6 +378,7 @@ func TestTaskArchiveBlockersIgnoreQueuedDependents(t *testing.T) {
 	if blockers[source.ID] != dependent.ID {
 		t.Fatalf("source blocker=%d, want dependent %d", blockers[source.ID], dependent.ID)
 	}
+	assertPerTaskBlockers(t, d, blockers, map[int64]int64{source.ID: dependent.ID, dependent.ID: 0})
 	if err := d.SetPaused(dependent.ID, true); err != nil {
 		t.Fatal(err)
 	}
@@ -375,12 +392,31 @@ func TestTaskArchiveBlockersIgnoreQueuedDependents(t *testing.T) {
 	if blocker := blockers[source.ID]; blocker != 0 {
 		t.Fatalf("queued dependent must not block source, got %d", blocker)
 	}
+	assertPerTaskBlockers(t, d, blockers, map[int64]int64{source.ID: 0, dependent.ID: 0})
+}
+
+// assertPerTaskBlockers checks TaskArchiveBlocker against the expected blocker
+// of each task and against the global TaskArchiveBlockers map.
+func assertPerTaskBlockers(t *testing.T, d *DB, global map[int64]int64, want map[int64]int64) {
+	t.Helper()
+	for taskID, wantBlocker := range want {
+		got, err := d.TaskArchiveBlocker(taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != wantBlocker {
+			t.Fatalf("TaskArchiveBlocker(%d)=%d, want %d", taskID, got, wantBlocker)
+		}
+		if got != global[taskID] {
+			t.Fatalf("TaskArchiveBlocker(%d)=%d, TaskArchiveBlockers()[%d]=%d", taskID, got, taskID, global[taskID])
+		}
+	}
 }
 
 func TestRecoverInterruptedArchiveRequiresManualRetry(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 	task, err := d.CreateTaskWithOptions("interrupted archive", "must not restart automatically", TaskCreateOptions{})
@@ -464,5 +500,78 @@ func assertArchiveGlobalStats(t *testing.T, d *DB, profileName, skillName, toolN
 	}
 	if !foundClass {
 		t.Fatalf("archive finding class %q missing", vulnclass)
+	}
+}
+
+// An archive written before report_state existed restores with the column's
+// default instead of failing on the NOT NULL constraint.
+func TestFillArchiveDefaults(t *testing.T) {
+	raw := json.RawMessage(`[{"id":1,"summary":"old"},{"id":2,"report_state":null},{"id":3,"report_state":"submitted"}]`)
+	out, err := fillArchiveDefaults("findings", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(out, &rows); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`"none"`, `"none"`, `"submitted"`}
+	for i, row := range rows {
+		if string(row["report_state"]) != want[i] {
+			t.Fatalf("row %d report_state=%s, want %s", i, row["report_state"], want[i])
+		}
+	}
+
+	// Side memory keeps its own default, and other tables pass through.
+	out, err = fillArchiveDefaults("side_question_sessions", json.RawMessage(`[{"id":1}]`))
+	if err != nil || !strings.Contains(string(out), `"memory":{}`) {
+		t.Fatalf("side memory default missing: %s err=%v", out, err)
+	}
+	in := json.RawMessage(`[{"id":1}]`)
+	out, err = fillArchiveDefaults("activity", in)
+	if err != nil || string(out) != string(in) {
+		t.Fatalf("activity changed: %s err=%v", out, err)
+	}
+}
+
+// FailTaskArchiveJob fails a job that is still running. A failure reported after
+// the archive committed (the worker recovers a panic in the cleanup that follows
+// the commit) must not turn a ready archive into archive_failed: it could then
+// be neither restored nor deleted.
+func TestFailTaskArchiveJobKeepsCommittedState(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		SkipPGUnavailable(t, err)
+	}
+	defer d.Close()
+	task, err := d.CreateTaskWithOptions("late archive failure", "must stay ready", TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+		_ = d.DeleteTask(task.ID)
+	}()
+	if err := d.SetPaused(task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := d.QueueTaskArchive(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ state, want string }{{Archiving, ArchiveFailed}, {ArchiveReady, ArchiveReady}} {
+		if _, err := d.Exec(`UPDATE task_archives SET state=$2,error='' WHERE id=$1`, queued.ID, c.state); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.FailTaskArchiveJob(queued.ID, Archiving, errors.New("late failure")); err != nil {
+			t.Fatal(err)
+		}
+		item, err := d.GetTaskArchive(queued.ID)
+		if err != nil || item == nil {
+			t.Fatalf("archive %d: %v", queued.ID, err)
+		}
+		if item.State != c.want || (c.want == ArchiveFailed) != (item.Error == "late failure") {
+			t.Fatalf("failing a job in state %s: state=%s error=%q, want state %s", c.state, item.State, item.Error, c.want)
+		}
 	}
 }

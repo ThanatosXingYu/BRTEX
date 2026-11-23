@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 // TestTaskCategoryBatchRoute pins the contract of the batch move endpoint: it is
@@ -16,12 +18,14 @@ import (
 func TestTaskCategoryBatchRoute(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, td, td, td)
+	defer stopTestServer(t, s, cancel)
 	h := s.Handler()
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
@@ -45,7 +49,7 @@ func TestTaskCategoryBatchRoute(t *testing.T) {
 
 	// An empty selection is rejected before any database work.
 	if rec := post(`{"task_ids":[],"category_id":null}`); rec.Code != http.StatusBadRequest ||
-		!strings.Contains(rec.Body.String(), "task_ids 数量必须为") {
+		!strings.Contains(rec.Body.String(), "task_ids count must be") {
 		t.Fatalf("empty task_ids: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 

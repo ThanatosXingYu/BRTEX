@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 )
 
 func TestEngineDeleteBarrierRejectsNewTaskOperations(t *testing.T) {
@@ -120,7 +121,7 @@ func TestTaskLifecycleRechecksDeleteBarrierAfterConcLock(t *testing.T) {
 		t.Fatal("install delete barrier")
 	}
 	s.concMu.Unlock()
-	if err := <-pauseDone; err == nil || !strings.Contains(err.Error(), "正在删除") {
+	if err := <-pauseDone; err == nil || !strings.Contains(err.Error(), "being deleted") {
 		t.Fatalf("pause passed a delete barrier installed while waiting for concMu: %v", err)
 	}
 	s.engine.AbortDelete(task.ID, false)
@@ -147,7 +148,7 @@ func TestTaskLifecycleRechecksDeleteBarrierAfterConcLock(t *testing.T) {
 func TestAbortTaskDeleteUsesPersistedPauseAndQueueState(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	task, err := m.CreateTask("delete abort state", "restore persisted barrier", nil, 0, 0)

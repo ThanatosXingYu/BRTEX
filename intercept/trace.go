@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 const (
@@ -147,7 +147,7 @@ func (t *Trace) Finish() {
 	t.mu.Unlock()
 	for _, c := range calls {
 		if c.complete != nil {
-			c.complete("unknown", "执行结束但未收到工具结果", false)
+			c.complete("unknown", "execution ended but no tool result was received", false)
 		}
 	}
 }
@@ -161,6 +161,7 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 	a.ModelFallback = dec.ModelFallback
 	a.ModelInput, a.ModelInputDigest = dec.ModelInput, dec.ModelInputDigest
 	a.RuleName, a.ConfigDigest, a.ProfileID = dec.RuleName, dec.ConfigDigest, dec.ProfileID
+	a.JudgeAnswers = dec.JudgeAnswers
 	a.ExecutionStatus = "not_started"
 	if status == "allowed" {
 		a.EffectiveAction, a.ExecutionStatus = "allow", "awaiting_result"

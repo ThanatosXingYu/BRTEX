@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -44,6 +45,46 @@ func TestBuiltinToolSeeds(t *testing.T) {
 			t.Errorf("SDK tool %q should not be seeded", k)
 		}
 	}
+}
+
+// TestObjDropsBlankRequired: obj never emits a blank required name, and omits the
+// "required" key entirely when no real name is left.
+func TestObjDropsBlankRequired(t *testing.T) {
+	if got, ok := obj(map[string]any{}, "")["required"]; ok {
+		t.Errorf(`obj(props, "") required = %v, want no required key`, got)
+	}
+	got, _ := obj(map[string]any{}, " ", "x")["required"].([]string)
+	if len(got) != 1 || got[0] != "x" {
+		t.Errorf(`obj(props, " ", "x") required = %v, want [x]`, got)
+	}
+}
+
+// TestListTaskCredentialsSchemaHasNoBlankRequired guards the seeded schema of the
+// parameterless list_task_credentials tool: "required": [""] is rejected by strict
+// providers, which fails every worker run.
+func TestListTaskCredentialsSchemaHasNoBlankRequired(t *testing.T) {
+	for _, s := range BuiltinToolSeeds() {
+		if s.Key != "list_task_credentials" {
+			continue
+		}
+		raw, err := json.Marshal(s.Schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema struct {
+			Required []string `json:"required"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("schema %s: %v", raw, err)
+		}
+		for _, r := range schema.Required {
+			if strings.TrimSpace(r) == "" {
+				t.Errorf("blank required entry in schema %s", raw)
+			}
+		}
+		return
+	}
+	t.Fatal("list_task_credentials not seeded")
 }
 
 // TestDecorateToolInjectsDefaults verifies a schema "default" fills a missing param

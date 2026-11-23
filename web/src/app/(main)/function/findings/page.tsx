@@ -8,8 +8,10 @@ import {
   ArrowUpRightIcon,
   BugIcon,
   ChevronRightIcon,
+  CircleCheckIcon,
   ClockIcon,
   DownloadIcon,
+  FileUpIcon,
   InfoIcon,
   SearchIcon,
   ShieldAlertIcon,
@@ -46,14 +48,18 @@ import type {
   Finding,
   FindingAssetNode,
   FindingGroup,
+  FindingReportState,
   FindingStats,
   FindingStatus,
   Severity,
+  VerificationStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useActiveCompany } from "@/stores/company/company-store";
 
 import { AssetTree, assetPathOf } from "./_components/asset-tree";
 import {
+  FINDING_REPORT_STATES,
   FINDING_STATUSES,
   type FindingEdit,
   type FindingReport,
@@ -61,20 +67,25 @@ import {
   findingRowKey,
   fmtTime,
   isSameFinding,
+  REPORT_STATE_META,
   SEVERITIES,
   UNASSIGNED_TASK,
+  VERIFICATION_META,
+  VERIFICATION_STATUSES,
 } from "./_components/findings-table";
+import { setVisibleInterval } from "@/lib/polling";
+import { t } from "@/i18n";
 
 const FINDING_LIST_PREFERENCE_KEY = "artex_finding_list_preferences";
 
-// 列表视图:flat = 跨任务平铺大表(默认);grouped = 按任务分组折叠;
-// asset = 左侧资产树 + 右侧该子树下的发现。
+// List views: flat = one big cross-task table (default); grouped = collapsible groups by task;
+// asset = left asset tree + the findings under that subtree on the right.
 type FindingView = "flat" | "grouped" | "asset";
 
 const FINDING_VIEWS: FindingView[] = ["flat", "grouped", "asset"];
 
-// 资产树的一次性快照。与另外两个视图不同,资产视图不轮询:进入视图、改筛选、
-// 或本页改动了发现之后才重新查询。
+// One-shot snapshot of the asset tree. Unlike the other two views, the asset view doesn't poll:
+// it re-queries on view entry, filter changes, or finding mutations made on this page.
 interface AssetTreeState {
   nodes: FindingAssetNode[];
   findingTotal: number;
@@ -93,7 +104,7 @@ const EMPTY_ASSET_TREE: AssetTreeState = {
   loading: false,
 };
 
-// 分组视图里每个已展开任务组自带一份分页状态,彼此独立。
+// In the grouped view, every expanded task group carries its own pagination state, independent of the others.
 interface GroupFindingsState {
   items: Finding[];
   total: number;
@@ -103,7 +114,7 @@ interface GroupFindingsState {
   loading: boolean;
 }
 
-// 平铺视图的页码单独放 state(而非塞进快照),筛选一变就能连带重置并触发重新加载。
+// The flat view's page number lives in its own state (not inside the snapshot), so a filter change resets it and triggers a reload.
 interface FlatFindingsState {
   items: Finding[];
   total: number;
@@ -120,6 +131,8 @@ function findingGroupKey(group: FindingGroup) {
 const EMPTY_STATS: FindingStats = {
   total: 0,
   pending: 0,
+  submitted: 0,
+  accepted: 0,
   critical: 0,
   high: 0,
   medium: 0,
@@ -129,9 +142,15 @@ const EMPTY_STATS: FindingStats = {
 };
 
 export default function FindingsPage() {
+  // The sidebar's company switcher narrows everything below on the server: the
+  // flat and grouped lists, the asset tree and the stat cards all send `company`.
+  // Undefined means all companies.
+  const company = useActiveCompany();
   const [view, setView] = React.useState<FindingView>("flat");
   const [severity, setSeverity] = React.useState<"all" | Severity>("all");
   const [status, setStatus] = React.useState<"all" | FindingStatus>("all");
+  const [reportState, setReportState] = React.useState<"all" | FindingReportState>("all");
+  const [verificationStatus, setVerificationStatus] = React.useState<"all" | VerificationStatus>("all");
   const [vulnclass, setVulnclass] = React.useState<string>("all");
   const [task, setTask] = React.useState<string>("all");
   const [sort, setSort] = React.useState<"severity" | "time">("severity");
@@ -162,11 +181,21 @@ export default function FindingsPage() {
   const retestRefreshVersion = React.useRef(0);
   const [deepenDescription, setDeepenDescription] = React.useState("");
   const [deepening, setDeepening] = React.useState(false);
-  const filterFingerprint = JSON.stringify([severity, status, vulnclass, task, sort, query]);
+  const filterFingerprint = JSON.stringify([
+    severity,
+    status,
+    reportState,
+    verificationStatus,
+    vulnclass,
+    task,
+    sort,
+    query,
+    company,
+  ]);
   const activeFilterFingerprint = React.useRef(filterFingerprint);
   activeFilterFingerprint.current = filterFingerprint;
 
-  // 一个轻量请求覆盖所有行/视图，避免逐行拉取完整复测历史；等待上一轮完成再轮询。
+  // One lightweight request covers all rows/views, avoiding per-row fetches of full retest history; wait for the previous round to finish before polling again.
   React.useEffect(() => {
     let disposed = false;
     let failed = false;
@@ -179,7 +208,8 @@ export default function FindingsPage() {
         setActiveRetests(Object.fromEntries(rows.map((item) => [item.finding_id, item])));
         failed = false;
       } catch (error) {
-        if (!disposed && !failed) toast.error(`加载复测状态失败：${(error as Error).message}`);
+        if (!disposed && !failed)
+          toast.error(t("Failed to load retest status: {error}", { error: (error as Error).message }));
         failed = true;
       } finally {
         if (!disposed) timer = setTimeout(() => void refreshRetests(), 3000);
@@ -200,6 +230,8 @@ export default function FindingsPage() {
           view?: unknown;
           severity?: unknown;
           status?: unknown;
+          reportState?: unknown;
+          verificationStatus?: unknown;
           vulnclass?: unknown;
           task?: unknown;
           sort?: unknown;
@@ -210,6 +242,15 @@ export default function FindingsPage() {
         }
         if (parsed.status === "all" || FINDING_STATUSES.includes(parsed.status as FindingStatus)) {
           setStatus(parsed.status as "all" | FindingStatus);
+        }
+        if (parsed.reportState === "all" || FINDING_REPORT_STATES.includes(parsed.reportState as FindingReportState)) {
+          setReportState(parsed.reportState as "all" | FindingReportState);
+        }
+        if (
+          parsed.verificationStatus === "all" ||
+          VERIFICATION_STATUSES.includes(parsed.verificationStatus as VerificationStatus)
+        ) {
+          setVerificationStatus(parsed.verificationStatus as "all" | VerificationStatus);
         }
         if (typeof parsed.vulnclass === "string" && parsed.vulnclass) setVulnclass(parsed.vulnclass);
         if (typeof parsed.task === "string" && parsed.task) setTask(parsed.task);
@@ -225,16 +266,16 @@ export default function FindingsPage() {
     if (!preferencesHydrated) return;
     setLocalStorageValue(
       FINDING_LIST_PREFERENCE_KEY,
-      JSON.stringify({ view, severity, status, vulnclass, task, sort }),
+      JSON.stringify({ view, severity, status, reportState, verificationStatus, vulnclass, task, sort }),
     );
-  }, [preferencesHydrated, severity, sort, status, task, view, vulnclass]);
+  }, [preferencesHydrated, reportState, severity, sort, status, task, verificationStatus, view, vulnclass]);
 
   React.useEffect(() => {
     const timer = window.setTimeout(() => setQuery(search.trim()), 300);
     return () => window.clearTimeout(timer);
   }, [search]);
 
-  // setFindings 同时改写两个视图缓存里的同一条发现,切换视图不会看到过期状态。
+  // setFindings rewrites the same finding in both view caches at once, so switching views never shows stale state.
   const setFindings = React.useCallback((update: (current: Finding[]) => Finding[]) => {
     setFlat((current) => ({ ...current, items: update(current.items) }));
     setGroupFindings((current) => {
@@ -246,9 +287,10 @@ export default function FindingsPage() {
     });
   }, []);
 
-  // 勾选导出:按 finding_id(独立表 id)记选中项,跨页保留。
+  // Export selection: tracked by finding_id (the standalone table's id), preserved across pages.
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set());
-  // 导出弹窗状态:范围(当前筛选/全部/选中) × 格式(md 单文件/md 分文件 zip/csv/json)。
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  // Export dialog state: scope (current filter / all / selected) × format (single md / per-finding md zip / csv / json).
   const [exportOpen, setExportOpen] = React.useState(false);
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
   const [exportFormat, setExportFormat] = React.useState<"md-single" | "md-zip" | "csv" | "json">("md-single");
@@ -274,7 +316,7 @@ export default function FindingsPage() {
     });
   }, []);
 
-  // 打开导出弹窗时,若有勾选项则默认范围切到「选中」,否则「当前筛选」。
+  // When opening the export dialog, default the scope to "Selected" if any rows are checked, else "Current filter".
   function openExport() {
     setExportScope(selectedIds.size > 0 ? "selected" : "filtered");
     setExportOpen(true);
@@ -286,13 +328,24 @@ export default function FindingsPage() {
       await api.exportFindings({
         format: exportFormat,
         scope: exportScope,
-        filters: { severity, status, vulnclass, task, query, sort },
+        filters: {
+          severity,
+          status,
+          reportState,
+          verificationStatus,
+          vulnclass,
+          task,
+          query,
+          sort,
+          assetScope: activeAssetScope ?? undefined,
+          company,
+        },
         ids: [...selectedIds],
       });
       setExportOpen(false);
-      toast.success("已开始下载导出文件");
+      toast.success(t("Export download started"));
     } catch (e) {
-      toast.error(`导出失败：${(e as Error).message}`);
+      toast.error(t("Export failed: {error}", { error: (e as Error).message }));
     } finally {
       setExporting(false);
     }
@@ -311,10 +364,18 @@ export default function FindingsPage() {
   groupFindingsRef.current = groupFindings;
   visibleGroupKeysRef.current = new Set(groups.map(findingGroupKey));
 
-  // 资产视图右侧列表 = 平铺列表 + 选中子树的筛选,所以两个视图共用一份列表状态。
+  // A company switch drops the picked asset node: the node may belong to the
+  // company we just left, and the tree is about to be reloaded under the new one.
+  React.useEffect(() => {
+    // company is a trigger here, not a value the effect reads.
+    void company;
+    setAssetScope(null);
+  }, [company]);
+
+  // The asset view's right-hand list = the flat list + a filter for the selected subtree, so both views share one list state.
   const activeAssetScope = view === "asset" ? assetScope : null;
 
-  // loadFlat 拉取平铺视图的当前页;task 筛选交给后端,与分组视图共用同一批筛选条件。
+  // loadFlat fetches the flat view's current page; the task filter goes to the backend, sharing the same filter set as the grouped view.
   const loadFlat = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
     if (activeFilterFingerprint.current !== requestFilter) return;
@@ -326,11 +387,14 @@ export default function FindingsPage() {
         pageSize: flatPageSize,
         severity,
         status,
+        reportState,
+        verificationStatus,
         vulnclass,
         task,
         query,
         sort,
         assetScope: activeAssetScope ?? undefined,
+        company,
       });
       if (request !== flatRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setFlat({ items: result.items, total: result.total, loaded: true, loading: false });
@@ -339,17 +403,41 @@ export default function FindingsPage() {
       // Polling keeps the last successful snapshot visible.
       setFlat((current) => ({ ...current, loading: false }));
     }
-  }, [activeAssetScope, filterFingerprint, flatPage, flatPageSize, severity, status, vulnclass, task, query, sort]);
+  }, [
+    activeAssetScope,
+    company,
+    filterFingerprint,
+    flatPage,
+    flatPageSize,
+    severity,
+    status,
+    reportState,
+    verificationStatus,
+    vulnclass,
+    task,
+    query,
+    sort,
+  ]);
 
-  // loadAssetTree 取整棵资产树。树不随选中节点变化(否则选一下就塌成一条链),
-  // 所以这里不带 assetScope。
+  // loadAssetTree fetches the whole asset tree. The tree doesn't change with the selected node (otherwise
+  // picking one would collapse it into a single chain), so no picked node here — only the active company.
   const loadAssetTree = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
     if (activeFilterFingerprint.current !== requestFilter) return;
     const request = ++assetTreeRequest.current;
     setAssetTree((current) => ({ ...current, loading: true }));
     try {
-      const result = await api.findingAssetTree({ severity, status, vulnclass, task, query, sort });
+      const result = await api.findingAssetTree({
+        severity,
+        status,
+        reportState,
+        verificationStatus,
+        vulnclass,
+        task,
+        query,
+        sort,
+        company,
+      });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
         nodes: result.nodes ?? [],
@@ -362,9 +450,20 @@ export default function FindingsPage() {
     } catch (e) {
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree((current) => ({ ...current, loading: false }));
-      toast.error(`资产树加载失败：${(e as Error).message}`);
+      toast.error(t("Failed to load the asset tree: {error}", { error: (e as Error).message }));
     }
-  }, [filterFingerprint, severity, status, vulnclass, task, query, sort]);
+  }, [
+    company,
+    filterFingerprint,
+    reportState,
+    severity,
+    status,
+    verificationStatus,
+    vulnclass,
+    task,
+    query,
+    sort,
+  ]);
 
   const refreshGroups = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
@@ -376,10 +475,13 @@ export default function FindingsPage() {
         pageSize,
         severity,
         status,
+        reportState,
+        verificationStatus,
         vulnclass,
         task,
         query,
         sort,
+        company,
       });
       if (request !== groupsRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setGroups(result.items);
@@ -388,7 +490,20 @@ export default function FindingsPage() {
     } catch {
       // Polling keeps the last successful snapshot visible.
     }
-  }, [filterFingerprint, page, pageSize, severity, status, vulnclass, task, query, sort]);
+  }, [
+    company,
+    filterFingerprint,
+    page,
+    pageSize,
+    reportState,
+    severity,
+    status,
+    verificationStatus,
+    vulnclass,
+    task,
+    query,
+    sort,
+  ]);
 
   const loadGroup = React.useCallback(
     async (key: string, groupPage: number, groupPageSize: number) => {
@@ -413,10 +528,13 @@ export default function FindingsPage() {
           pageSize: groupPageSize,
           severity,
           status,
+          reportState,
+          verificationStatus,
           vulnclass,
           task: key,
           query,
           sort,
+          company,
         });
         if (groupRequests.current[key] !== request || activeFilterFingerprint.current !== requestFilter) return;
         setGroupFindings((current) => ({
@@ -447,7 +565,7 @@ export default function FindingsPage() {
         }));
       }
     },
-    [filterFingerprint, severity, status, vulnclass, query, sort],
+    [company, filterFingerprint, reportState, severity, status, verificationStatus, vulnclass, query, sort],
   );
 
   React.useEffect(() => {
@@ -473,17 +591,17 @@ export default function FindingsPage() {
     [expandedGroups, groupFindings, loadGroup],
   );
 
-  // 行内改动后刷新当前视图:平铺视图重拉当前页,分组视图刷组头 + 该发现所在的组。
+  // Refresh the current view after an inline mutation: the flat view reloads its page, the grouped view refreshes group headers + the finding's group.
   const refreshAfterMutation = React.useCallback(
     (finding: Finding, removed = false) => {
       if (view === "asset") {
-        // 资产视图不轮询,所以改完要顺带把树的计数也重新算一次。
+        // The asset view doesn't poll, so recount the tree after a mutation too.
         void loadFlat();
         void loadAssetTree();
         return;
       }
       if (view === "flat") {
-        // 删空最后一页时,页码由越界修正 effect 回退并连带重新加载。
+        // When the last page is emptied, the out-of-range correction effect rolls the page number back and reloads.
         void loadFlat();
         return;
       }
@@ -508,31 +626,31 @@ export default function FindingsPage() {
     setGroupFindings({});
     setFlatPage(1);
     setFlat(EMPTY_FLAT_STATE);
-    // 筛选变了树也会变,原先选中的节点可能已经不在树里,退回「全部资产」。
+    // Filters change the tree too; the previously selected node may no longer be in it, so fall back to "All assets".
     setAssetScope(null);
     setAssetTree(EMPTY_ASSET_TREE);
   }, [filterFingerprint]);
 
-  // 换资产节点等于换了一份结果集,回到第一页。
+  // Switching asset nodes means a different result set; go back to page one.
   React.useEffect(() => {
     void assetScope;
     setFlatPage(1);
   }, [assetScope]);
 
-  // 资产树只在进入视图 / 筛选变化时查一次(以及本页改动发现后由
-  // refreshAfterMutation 主动重拉),不做轮询。
+  // The asset tree is queried once on view entry / filter change (plus actively re-pulled by
+  // refreshAfterMutation after this page mutates a finding); no polling.
   React.useEffect(() => {
     if (!preferencesHydrated || view !== "asset") return;
-    void activeRetestFingerprint; // 复测结束可能改变状态筛选下的资产计数。
+    void activeRetestFingerprint; // a finished retest may change asset counts under the status filter.
     void loadAssetTree();
   }, [activeRetestFingerprint, loadAssetTree, preferencesHydrated, view]);
 
-  // 只轮询当前视图:平铺视图刷当前页,分组视图刷组头与每个已展开的组(其分页彼此独立)。
-  // 资产视图只查一次(见下面的 return),它的左树是导航结构,没必要每 5 秒重算。
-  // 等偏好水合后再发首个请求,否则会先按默认视图/筛选白拉一次。
+  // Poll only the current view: the flat view refreshes its page, the grouped view refreshes group headers and every expanded group (their paginations are independent).
+  // The asset view queries once (see the return below); its left tree is a navigation structure, no need to recompute it every 5 seconds.
+  // Wait for preferences to hydrate before the first request, otherwise one fetch fires with the default view/filters for nothing.
   React.useEffect(() => {
     if (!preferencesHydrated) return;
-    void activeRetestFingerprint; // 包括不定时轮询的资产视图，也在复测结束后刷新处置状态。
+    void activeRetestFingerprint; // including the non-polling asset view, refresh triage status after a retest finishes.
     const refresh = () => {
       if (view === "flat" || view === "asset") {
         if (!flatStateRef.current.loading) void loadFlat();
@@ -547,8 +665,8 @@ export default function FindingsPage() {
     };
     refresh();
     if (view === "asset") return;
-    const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
+    const stopPolling = setVisibleInterval(refresh, 5000);
+    return stopPolling;
   }, [activeRetestFingerprint, loadFlat, loadGroup, preferencesHydrated, refreshGroups, view]);
 
   React.useEffect(() => {
@@ -568,7 +686,7 @@ export default function FindingsPage() {
     let alive = true;
     const load = () => {
       api
-        .findingStats()
+        .findingStats(company)
         .then((s) => {
           if (alive) {
             setStats(s);
@@ -580,12 +698,12 @@ export default function FindingsPage() {
         });
     };
     load();
-    const t = setInterval(load, 5000);
+    const stopPolling = setVisibleInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stopPolling();
     };
-  }, []);
+  }, [company]);
 
   React.useEffect(() => {
     if (!statsLoaded) return;
@@ -607,10 +725,10 @@ export default function FindingsPage() {
       setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, status: next } : x)));
       try {
         await api.setFindingStatus(f.finding_id, next);
-        toast.success(`已标记为「${statusMeta("finding", next).label}」`);
+        toast.success(t('Marked as "{label}"', { label: statusMeta("finding", next).label }));
         // refresh stat cards (pending count) and drop the row if it no longer matches the status filter
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The row update remains valid even if the aggregate refresh fails.
@@ -623,22 +741,104 @@ export default function FindingsPage() {
         refreshAfterMutation(f);
       } catch (e) {
         setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, status: prev } : x)));
-        toast.error(`更新失败：${(e as Error).message}`);
+        toast.error(t("Update failed: {error}", { error: (e as Error).message }));
       }
     },
-    [refreshAfterMutation, setFindings, status],
+    [refreshAfterMutation, setFindings, status, company],
   );
 
-  // 行内展开的详细报告缓存按全局稳定行键存。report 是大段 Markdown,列表查询不带它,
-  // 故展开时才按 finding_id 单独拉取一次;done 且文本为空 = 该漏洞暂无报告。
+  const updateReportState = React.useCallback(
+    async (f: Finding, next: FindingReportState) => {
+      if (!f.finding_id || next === (f.report_state ?? "none")) return;
+      const prev = f.report_state ?? "none";
+      setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, report_state: next } : x)));
+      try {
+        await api.setFindingReportState(f.finding_id, next);
+        toast.success(t('Report stage set to "{label}"', { label: REPORT_STATE_META[next].label }));
+        api
+          .findingStats(company)
+          .then(setStats)
+          .catch(() => {
+            // The row update remains valid even if the aggregate refresh fails.
+          });
+        if (reportState !== "all" && next !== reportState) {
+          setFindings((cur) => cur.filter((x) => !isSameFinding(x, f)));
+          setTotal((t) => Math.max(0, t - 1));
+          setFlat((cur) => ({ ...cur, total: Math.max(0, cur.total - 1) }));
+        }
+        refreshAfterMutation(f);
+      } catch (e) {
+        setFindings((cur) => cur.map((x) => (isSameFinding(x, f) ? { ...x, report_state: prev } : x)));
+        toast.error(t("Update failed: {error}", { error: (e as Error).message }));
+      }
+    },
+    [refreshAfterMutation, reportState, setFindings, company],
+  );
+
+  // applyBulkStatus sets the same triage status on every selected finding, then
+  // reloads the current view so rows hidden by the status filter disappear.
+  const applyBulkStatus = React.useCallback(
+    async (next: FindingStatus) => {
+      if (selectedIds.size === 0 || bulkBusy) return;
+      setBulkBusy(true);
+      try {
+        const r = await api.bulkSetFindingStatus([...selectedIds], next);
+        setSelectedIds(new Set());
+        const label = statusMeta("finding", next).label;
+        toast.success(t('Marked {count} findings as "{label}"', { count: r.updated, label }));
+        void loadFlat();
+        if (view === "asset") void loadAssetTree();
+        api
+          .findingStats(company)
+          .then(setStats)
+          .catch(() => {
+            // The list reload remains valid even if the aggregate refresh fails.
+          });
+      } catch (e) {
+        toast.error(t("Bulk update failed: {error}", { error: (e as Error).message }));
+      } finally {
+        setBulkBusy(false);
+      }
+    },
+    [bulkBusy, loadAssetTree, loadFlat, selectedIds, view, company],
+  );
+
+  const applyBulkReportState = React.useCallback(
+    async (next: FindingReportState) => {
+      if (selectedIds.size === 0 || bulkBusy) return;
+      setBulkBusy(true);
+      try {
+        const r = await api.bulkSetFindingReportState([...selectedIds], next);
+        setSelectedIds(new Set());
+        const label = REPORT_STATE_META[next].label;
+        toast.success(t('Set report stage of {count} findings to "{label}"', { count: r.updated, label }));
+        void loadFlat();
+        if (view === "asset") void loadAssetTree();
+        api
+          .findingStats(company)
+          .then(setStats)
+          .catch(() => {
+            // The list reload remains valid even if the aggregate refresh fails.
+          });
+      } catch (e) {
+        toast.error(t("Bulk update failed: {error}", { error: (e as Error).message }));
+      } finally {
+        setBulkBusy(false);
+      }
+    },
+    [bulkBusy, loadAssetTree, loadFlat, selectedIds, view, company],
+  );
+
+  // The inline expanded detailed-report cache is keyed by the globally stable row key. report is long-form
+  // Markdown the list query doesn't include, so it is fetched once by finding_id on expand; done with empty text = no report yet.
   const [reports, setReports] = React.useState<Record<string, FindingReport>>({});
 
-  // 行内可编辑缓冲:当前展开行的名称/类别/严重等级,展开时用该行数据初始化,收起清空。
-  // 单行展开,故一份缓冲即可。
+  // Inline editable buffer: the expanded row's name/category/severity, initialized from the row on expand and cleared on collapse.
+  // Only one row expands at a time, so one buffer suffices.
   const [edit, setEdit] = React.useState<FindingEdit | null>(null);
   const [saving, setSaving] = React.useState(false);
 
-  // toggle 展开/收起一行;新展开时初始化编辑缓冲,并(尚未取过时)按 finding_id 拉一次报告缓存。
+  // toggle expands/collapses a row; a fresh expand initializes the edit buffer and (if not yet fetched) pulls the report cache once by finding_id.
   const toggleRow = React.useCallback(
     (f: Finding) => {
       const key = findingRowKey(f);
@@ -660,7 +860,7 @@ export default function FindingsPage() {
     [expanded, reports],
   );
 
-  // saveEdit 保存当前展开行的名称/类别/严重等级,回写本地列表并刷新统计(类别下拉/严重计数可能变)。
+  // saveEdit saves the expanded row's name/category/severity, writes back to the local list and refreshes stats (the category dropdown / severity counts may change).
   const saveEdit = React.useCallback(
     async (f: Finding) => {
       if (!f.finding_id || !edit) return;
@@ -678,24 +878,24 @@ export default function FindingsPage() {
               : x,
           ),
         );
-        toast.success("已保存");
+        toast.success(t("Saved"));
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The edit remains valid even if the aggregate refresh fails.
           });
         refreshAfterMutation(f);
       } catch (e) {
-        toast.error(`保存失败：${(e as Error).message}`);
+        toast.error(t("Save failed: {error}", { error: (e as Error).message }));
       } finally {
         setSaving(false);
       }
     },
-    [edit, refreshAfterMutation, setFindings],
+    [edit, refreshAfterMutation, setFindings, company],
   );
 
-  // deleteFinding 删除一个漏洞(需二次确认):删成功后从列表移除、收起行、刷新统计。
+  // deleteFinding deletes one vulnerability (with confirmation): on success it removes it from the list, collapses the row, and refreshes stats.
   const deleteFinding = React.useCallback(
     async (f: Finding) => {
       if (!f.finding_id) return;
@@ -711,19 +911,19 @@ export default function FindingsPage() {
         setFlat((cur) => ({ ...cur, total: Math.max(0, cur.total - 1) }));
         const rowKey = findingRowKey(f);
         setExpanded((cur) => (cur === rowKey ? null : cur));
-        toast.success("已删除漏洞");
+        toast.success(t("Vulnerability deleted"));
         api
-          .findingStats()
+          .findingStats(company)
           .then(setStats)
           .catch(() => {
             // The deletion remains valid even if the aggregate refresh fails.
           });
         refreshAfterMutation(f, true);
       } catch (e) {
-        toast.error(`删除失败：${(e as Error).message}`);
+        toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
       }
     },
-    [refreshAfterMutation, setFindings],
+    [refreshAfterMutation, setFindings, company],
   );
 
   const openDeepen = React.useCallback((f: Finding) => {
@@ -738,30 +938,32 @@ export default function FindingsPage() {
       const result = await api.deepenFinding(deepenFinding.finding_id, deepenDescription.trim());
       toast.success(
         result.queued
-          ? `深入意图 #${result.intent_id} 已进入任务队列`
-          : `已创建高优先级 Worker 意图 #${result.intent_id}`,
+          ? t("Deepen intent #{id} has entered the task queue", { id: result.intent_id })
+          : t("Created high-priority worker intent #{id}", { id: result.intent_id }),
       );
       refreshAfterMutation(deepenFinding);
       setDeepenFinding(null);
       setDeepenDescription("");
     } catch (error) {
-      toast.error(`提交失败：${(error as Error).message}`);
+      toast.error(t("Submit failed: {error}", { error: (error as Error).message }));
     } finally {
       setDeepening(false);
     }
   }
 
   const statCards = [
-    { label: "发现总数", value: stats.total, icon: BugIcon },
-    { label: "待处理", value: stats.pending, tone: "text-amber-500", icon: ClockIcon },
-    { label: "严重", value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon },
-    { label: "高危", value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon },
-    { label: "中危", value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon },
-    { label: "低危", value: stats.low, tone: "text-slate-500", icon: InfoIcon },
+    { label: t("Total findings"), value: stats.total, icon: BugIcon },
+    { label: t("Pending"), value: stats.pending, tone: "text-amber-500", icon: ClockIcon },
+    { label: t("Submitted"), value: stats.submitted, tone: "text-amber-500", icon: FileUpIcon },
+    { label: t("Accepted"), value: stats.accepted, tone: "text-emerald-500", icon: CircleCheckIcon },
+    { label: t("Critical"), value: stats.critical, tone: "text-rose-600", icon: ShieldAlertIcon },
+    { label: t("High"), value: stats.high, tone: "text-red-500", icon: TriangleAlertIcon },
+    { label: t("Medium"), value: stats.medium, tone: "text-amber-500", icon: TriangleAlertIcon },
+    { label: t("Low"), value: stats.low, tone: "text-slate-500", icon: InfoIcon },
   ];
 
-  // 导出弹窗里「当前筛选」的条数:两个视图的筛选一致,只是统计口径来源不同。
-  // 平铺与资产视图共用 flat 列表状态,分组视图的口径来自组接口的 finding_total。
+  // The "current filter" count in the export dialog: both views share the same filters, only the counting source differs.
+  // The flat and asset views share the flat list state; the grouped view's figure comes from the group API's finding_total.
   const filteredTotal = view === "grouped" ? total : flat.total;
   const assetPath = React.useMemo(
     () => (view === "asset" ? assetPathOf(assetTree.nodes, assetScope) : []),
@@ -780,13 +982,14 @@ export default function FindingsPage() {
     saving,
     onSave: saveEdit,
     onStatusChange: updateStatus,
+    onReportStateChange: updateReportState,
     onRetest: setRetestFinding,
     activeRetests,
     onDeepen: openDeepen,
     onDelete: deleteFinding,
   };
 
-  // 平铺视图与资产视图右侧是同一张表 + 同一份分页,只是筛选条件不同。
+  // The flat view and the asset view's right side are the same table + pagination, differing only in filter conditions.
   const flatListCard = (
     <Card className="gap-0 py-0">
       <CardContent className="px-0">
@@ -796,7 +999,7 @@ export default function FindingsPage() {
           </div>
         ) : (
           <>
-            <FindingsTable items={flat.items} selectAllLabel="选择当前页全部" {...rowProps} />
+            <FindingsTable items={flat.items} selectAllLabel={t("Select all on this page")} {...rowProps} />
             <TablePagination
               page={flatPage}
               pageSize={flatPageSize}
@@ -818,19 +1021,19 @@ export default function FindingsPage() {
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">发现</h1>
-          <p className="text-muted-foreground text-sm">跨任务漏洞汇总</p>
+          <h1 className="text-xl font-semibold tracking-tight">{t("Findings")}</h1>
+          <p className="text-muted-foreground text-sm">{t("Cross-task vulnerability overview")}</p>
         </div>
         <Tabs value={view} onValueChange={(v) => setView(v as FindingView)}>
           <TabsList>
-            <TabsTrigger value="flat">全部发现</TabsTrigger>
-            <TabsTrigger value="grouped">按任务分组</TabsTrigger>
-            <TabsTrigger value="asset">按资产</TabsTrigger>
+            <TabsTrigger value="flat">{t("All findings")}</TabsTrigger>
+            <TabsTrigger value="grouped">{t("By task")}</TabsTrigger>
+            <TabsTrigger value="asset">{t("By asset")}</TabsTrigger>
           </TabsList>
         </Tabs>
       </div>
       <div className="flex flex-1 flex-col gap-4 md:gap-6">
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-8">
           {statCards.map((stat) => {
             const StatIcon = stat.icon;
             return (
@@ -853,8 +1056,8 @@ export default function FindingsPage() {
               type="search"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="检索漏洞内容"
-              aria-label="检索漏洞内容"
+              placeholder={t("Search findings")}
+              aria-label={t("Search findings")}
             />
             <InputGroupAddon>
               <SearchIcon aria-hidden="true" />
@@ -871,14 +1074,14 @@ export default function FindingsPage() {
           >
             {(
               [
-                ["all", "全部"],
-                ["critical", "严重"],
-                ["high", "高危"],
-                ["medium", "中危"],
-                ["low", "低危"],
+                ["all", t("All")],
+                ["critical", t("Critical")],
+                ["high", t("High")],
+                ["medium", t("Medium")],
+                ["low", t("Low")],
               ] as const
             ).map(([val, label]) => (
-              <ToggleGroupItem key={val} value={val} aria-label={`按${label}等级筛选`}>
+              <ToggleGroupItem key={val} value={val} aria-label={t("Filter by {label} severity", { label })}>
                 {label}
               </ToggleGroupItem>
             ))}
@@ -886,10 +1089,10 @@ export default function FindingsPage() {
 
           <Select value={status} onValueChange={(v) => setStatus(v as "all" | FindingStatus)}>
             <SelectTrigger size="sm" className="w-32">
-              <SelectValue placeholder="状态" />
+              <SelectValue placeholder={t("Status")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部状态</SelectItem>
+              <SelectItem value="all">{t("All statuses")}</SelectItem>
               {FINDING_STATUSES.map((st) => (
                 <SelectItem key={st} value={st}>
                   {statusMeta("finding", st).label}
@@ -898,12 +1101,43 @@ export default function FindingsPage() {
             </SelectContent>
           </Select>
 
-          <Select value={vulnclass} onValueChange={setVulnclass}>
+          <Select value={reportState} onValueChange={(v) => setReportState(v as "all" | FindingReportState)}>
             <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder="漏洞类型" />
+              <SelectValue placeholder={t("Report stage")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部类型</SelectItem>
+              <SelectItem value="all">{t("All report stages")}</SelectItem>
+              {FINDING_REPORT_STATES.map((st) => (
+                <SelectItem key={st} value={st}>
+                  {REPORT_STATE_META[st].label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select
+            value={verificationStatus}
+            onValueChange={(v) => setVerificationStatus(v as "all" | VerificationStatus)}
+          >
+            <SelectTrigger size="sm" className="w-48">
+              <SelectValue placeholder={t("Verification")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("All verification states")}</SelectItem>
+              {VERIFICATION_STATUSES.map((st) => (
+                <SelectItem key={st} value={st}>
+                  {VERIFICATION_META[st].label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select value={vulnclass} onValueChange={setVulnclass}>
+            <SelectTrigger size="sm" className="w-40">
+              <SelectValue placeholder={t("Vulnerability type")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("All types")}</SelectItem>
               {stats.vulnclasses.map((vc) => (
                 <SelectItem key={vc} value={vc}>
                   {vc}
@@ -914,14 +1148,14 @@ export default function FindingsPage() {
 
           <Select value={task} onValueChange={setTask}>
             <SelectTrigger size="sm" className="w-48">
-              <SelectValue placeholder="任务" />
+              <SelectValue placeholder={t("Task")} />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部任务</SelectItem>
-              <SelectItem value={UNASSIGNED_TASK}>未关联 / 任务已删除</SelectItem>
-              {(stats.tasks ?? []).map((t) => {
-                const id = String(t.id);
-                const label = t.name || t.description || `任务 #${id}（已删除）`;
+              <SelectItem value="all">{t("All tasks")}</SelectItem>
+              <SelectItem value={UNASSIGNED_TASK}>{t("Unlinked / task deleted")}</SelectItem>
+              {(stats.tasks ?? []).map((option) => {
+                const id = String(option.id);
+                const label = option.name || option.description || t("Task #{id} (deleted)", { id });
                 return (
                   <SelectItem key={id} value={id}>
                     <span className="flex w-full items-center gap-2">
@@ -930,7 +1164,7 @@ export default function FindingsPage() {
                       </span>
                       <span className="inline-flex items-center gap-1 text-muted-foreground tabular-nums">
                         <BugIcon className="size-3.5" aria-hidden="true" />
-                        {t.count}
+                        {option.count}
                       </span>
                     </span>
                   </SelectItem>
@@ -944,17 +1178,61 @@ export default function FindingsPage() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="severity">按严重度</SelectItem>
-              <SelectItem value="time">按时间</SelectItem>
+              <SelectItem value="severity">{t("By severity")}</SelectItem>
+              <SelectItem value="time">{t("By time")}</SelectItem>
             </SelectContent>
           </Select>
 
           <div className="ml-auto flex items-center gap-3">
             {selectedIds.size > 0 && (
-              <span className="text-xs text-muted-foreground tabular-nums">已选 {selectedIds.size} 条</span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  {t("{count} selected", { count: selectedIds.size })}
+                </span>
+                <Select
+                  value=""
+                  onValueChange={(v) => {
+                    if (v) void applyBulkStatus(v as FindingStatus);
+                  }}
+                  disabled={bulkBusy}
+                >
+                  <SelectTrigger size="sm" className="w-40" aria-label={t("Set the status of the selected findings")}>
+                    <SelectValue placeholder={bulkBusy ? t("Updating…") : t("Set status")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FINDING_STATUSES.map((st) => (
+                      <SelectItem key={st} value={st}>
+                        {statusMeta("finding", st).label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value=""
+                  onValueChange={(v) => {
+                    if (v) void applyBulkReportState(v as FindingReportState);
+                  }}
+                  disabled={bulkBusy}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    className="w-44"
+                    aria-label={t("Set the report stage of the selected findings")}
+                  >
+                    <SelectValue placeholder={bulkBusy ? t("Updating…") : t("Set report stage")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FINDING_REPORT_STATES.map((st) => (
+                      <SelectItem key={st} value={st}>
+                        {REPORT_STATE_META[st].label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             )}
             <Button size="sm" variant="outline" onClick={openExport}>
-              <DownloadIcon /> 导出
+              <DownloadIcon /> {t("Export")}
             </Button>
           </div>
         </div>
@@ -990,7 +1268,7 @@ export default function FindingsPage() {
                   className={cn("hover:text-foreground", assetScope === null && "font-medium text-foreground")}
                   onClick={() => setAssetScope(null)}
                 >
-                  全部资产
+                  {t("All assets")}
                 </button>
                 {assetPath.map((node) => (
                   <React.Fragment key={node.key}>
@@ -1008,7 +1286,9 @@ export default function FindingsPage() {
                     </button>
                   </React.Fragment>
                 ))}
-                <span className="ml-auto shrink-0 text-xs tabular-nums">共 {flat.total} 条</span>
+                <span className="ml-auto shrink-0 text-xs tabular-nums">
+                  {t("{count} in total", { count: flat.total })}
+                </span>
               </div>
               {flatListCard}
             </div>
@@ -1047,13 +1327,13 @@ export default function FindingsPage() {
                         <div className="flex min-w-0 flex-col gap-1">
                           <CardTitle className="truncate text-sm">
                             {group.task_id === null
-                              ? "未关联 / 任务已删除"
+                              ? t("Unlinked / task deleted")
                               : group.task_name
-                                ? `${group.task_name}（任务 #${group.task_id}）`
-                                : `任务 #${group.task_id}`}
+                                ? t("{name} (task #{id})", { name: group.task_name, id: group.task_id })
+                                : t("Task #{id}", { id: group.task_id })}
                           </CardTitle>
                           <CardDescription className="truncate" title={group.task_description}>
-                            {group.task_description || "来源任务不可用"}
+                            {group.task_description || t("Source task unavailable")}
                           </CardDescription>
                         </div>
                       </button>
@@ -1076,7 +1356,7 @@ export default function FindingsPage() {
                           <Button size="icon-sm" variant="ghost" asChild>
                             <Link
                               href={`/function/tasks/detail?id=${group.task_id}`}
-                              aria-label={`查看任务 #${group.task_id}`}
+                              aria-label={t("View task #{id}", { id: group.task_id })}
                             >
                               <ArrowUpRightIcon />
                             </Link>
@@ -1093,7 +1373,11 @@ export default function FindingsPage() {
                         </div>
                       ) : (
                         <>
-                          <FindingsTable items={state.items} selectAllLabel="选择本组当前页全部" {...rowProps} />
+                          <FindingsTable
+                            items={state.items}
+                            selectAllLabel={t("Select all on this page in this group")}
+                            {...rowProps}
+                          />
                           <TablePagination
                             page={state.page}
                             pageSize={state.pageSize}
@@ -1110,7 +1394,9 @@ export default function FindingsPage() {
             })}
             {groups.length === 0 && (
               <Card>
-                <CardContent className="py-12 text-center text-sm text-muted-foreground">没有匹配的发现。</CardContent>
+                <CardContent className="py-12 text-center text-sm text-muted-foreground">
+                  {t("No matching findings.")}
+                </CardContent>
               </Card>
             )}
             <TablePagination
@@ -1159,25 +1445,30 @@ export default function FindingsPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>深入利用漏洞</DialogTitle>
+            <DialogTitle>{t("Deepen exploitation")}</DialogTitle>
             <DialogDescription className="break-words">
-              将在原任务 #{deepenFinding?.task_id} 中创建优先级 10 的 Worker 意图，基于当前漏洞开展二次验证：
+              {t(
+                "A priority-10 worker intent will be created in the original task #{id} to run secondary verification based on this vulnerability:",
+                { id: deepenFinding?.task_id ?? "" },
+              )}{" "}
               {deepenFinding?.name || deepenFinding?.vulnclass || deepenFinding?.summary}
             </DialogDescription>
           </DialogHeader>
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="finding-deepen-description">利用描述</FieldLabel>
+              <FieldLabel htmlFor="finding-deepen-description">{t("Exploitation description")}</FieldLabel>
               <Textarea
                 id="finding-deepen-description"
                 value={deepenDescription}
                 onChange={(event) => setDeepenDescription(event.target.value)}
                 maxLength={4000}
-                placeholder="描述需要验证的利用路径、边界条件、目标或期望证据"
+                placeholder={t(
+                  "Describe the exploitation path to verify, boundary conditions, targets, or expected evidence",
+                )}
                 disabled={deepening}
               />
               <FieldDescription className="flex justify-between gap-3">
-                <span>新意图会继承该漏洞的资产锚点。</span>
+                <span>{t("The new intent inherits this vulnerability's asset anchors.")}</span>
                 <span className="shrink-0 tabular-nums">{deepenDescription.length} / 4000</span>
               </FieldDescription>
             </Field>
@@ -1191,11 +1482,11 @@ export default function FindingsPage() {
               }}
               disabled={deepening}
             >
-              取消
+              {t("Cancel")}
             </Button>
             <Button onClick={submitDeepen} disabled={deepening || !deepenDescription.trim()}>
               {deepening && <Spinner data-icon="inline-start" />}
-              创建深入意图
+              {t("Create deepen intent")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1204,45 +1495,49 @@ export default function FindingsPage() {
       <Dialog open={exportOpen} onOpenChange={setExportOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>导出发现</DialogTitle>
-            <DialogDescription>选择导出范围与格式,生成后浏览器会自动下载。</DialogDescription>
+            <DialogTitle>{t("Export findings")}</DialogTitle>
+            <DialogDescription>
+              {t("Choose the export scope and format; the browser downloads the file automatically once generated.")}
+            </DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col gap-5 py-1">
             <div className="flex flex-col gap-2">
-              <span className="text-xs text-muted-foreground">导出范围</span>
+              <span className="text-xs text-muted-foreground">{t("Export scope")}</span>
               <RadioGroup value={exportScope} onValueChange={(v) => setExportScope(v as typeof exportScope)}>
                 <label htmlFor="export-scope-filtered" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-scope-filtered" value="filtered" /> 导出当前筛选结果（共 {filteredTotal}{" "}
-                  条）
+                  <RadioGroupItem id="export-scope-filtered" value="filtered" />{" "}
+                  {t("Export the current filter results ({count} items)", { count: filteredTotal })}
                 </label>
                 <label htmlFor="export-scope-all" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-scope-all" value="all" /> 导出全部
+                  <RadioGroupItem id="export-scope-all" value="all" /> {t("Export all")}
                 </label>
                 <label
                   htmlFor="export-scope-selected"
                   className={cn("flex items-center gap-2 text-sm", selectedIds.size === 0 && "text-muted-foreground")}
                 >
                   <RadioGroupItem id="export-scope-selected" value="selected" disabled={selectedIds.size === 0} />
-                  导出勾选的 {selectedIds.size} 条
+                  {t("Export the {count} selected items", { count: selectedIds.size })}
                 </label>
               </RadioGroup>
             </div>
 
             <div className="flex flex-col gap-2">
-              <span className="text-xs text-muted-foreground">导出格式</span>
+              <span className="text-xs text-muted-foreground">{t("Export format")}</span>
               <RadioGroup value={exportFormat} onValueChange={(v) => setExportFormat(v as typeof exportFormat)}>
                 <label htmlFor="export-format-md-single" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-md-single" value="md-single" /> Markdown 汇总报告（单个 .md 文件）
+                  <RadioGroupItem id="export-format-md-single" value="md-single" />{" "}
+                  {t("Markdown summary report (a single .md file)")}
                 </label>
                 <label htmlFor="export-format-md-zip" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-md-zip" value="md-zip" /> Markdown 分文件（一漏洞一 .md,打包 .zip）
+                  <RadioGroupItem id="export-format-md-zip" value="md-zip" />{" "}
+                  {t("Markdown per finding (one .md per vulnerability, packaged as .zip)")}
                 </label>
                 <label htmlFor="export-format-csv" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-csv" value="csv" /> CSV 表格（.csv）
+                  <RadioGroupItem id="export-format-csv" value="csv" /> {t("CSV table (.csv)")}
                 </label>
                 <label htmlFor="export-format-json" className="flex items-center gap-2 text-sm">
-                  <RadioGroupItem id="export-format-json" value="json" /> JSON（.json）
+                  <RadioGroupItem id="export-format-json" value="json" /> JSON (.json)
                 </label>
               </RadioGroup>
             </div>
@@ -1250,10 +1545,10 @@ export default function FindingsPage() {
 
           <DialogFooter>
             <Button variant="outline" onClick={() => setExportOpen(false)} disabled={exporting}>
-              取消
+              {t("Cancel")}
             </Button>
             <Button onClick={doExport} disabled={exporting || (exportScope === "selected" && selectedIds.size === 0)}>
-              <DownloadIcon /> {exporting ? "导出中…" : "导出"}
+              <DownloadIcon /> {exporting ? t("Exporting…") : t("Export")}
             </Button>
           </DialogFooter>
         </DialogContent>

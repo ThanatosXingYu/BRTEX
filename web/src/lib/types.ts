@@ -1,12 +1,12 @@
 // ARTEX domain model — types used across the UI.
-// Derived from the functional spec (section 7: 关键数据形状).
+// Derived from the functional spec (section 7: key data shapes).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
 export interface Task {
   id: string;
-  name?: string; // 可选任务名称;空/缺省=未命名,展示时回退到描述
+  name?: string; // optional task name; empty/absent = untitled, display falls back to the description
   category_id?: number;
   category_name?: string;
   pinned?: boolean;
@@ -23,7 +23,7 @@ export interface Task {
   queued?: boolean;
   active?: boolean;
   in_flight?: number;
-  findings?: { critical: number; high: number; medium: number; low: number }; // 已登记漏洞数(按严重度分档)
+  findings?: { critical: number; high: number; medium: number; low: number }; // registered vulnerability counts (bucketed by severity)
   last_activity?: string;
   stalled?: boolean;
   goals_total?: number;
@@ -32,13 +32,14 @@ export interface Task {
   tokens?: TokenTotal; // whole-task token consumption
   llm_profile_id?: number; // LLM profile used; absent = default profile
   llm_profile_ids?: number[]; // ordered task-level failover chain
+  llm_rotate?: boolean;
   active_llm_profile_id?: number; // profile used by the next LLM call
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
-  coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  coverage_enabled?: boolean; // asset coverage feature switch (fixed at creation, on by default); false = do not compute/show coverage
 }
 
 export interface TaskCategory {
@@ -54,8 +55,8 @@ export interface TaskTemplate {
   name: string;
   description: string;
   goal: string;
-  category_id?: number | null; // 预设分类；null/缺省=无
-  intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
+  category_id?: number | null; // preset category; null/absent = none
+  intercept_rules?: AssetInterceptRuleInput[]; // preset task-level interception/allow rules
   created_at: string;
   updated_at: string;
 }
@@ -100,6 +101,7 @@ export interface TaskArchiveTokenStats {
 }
 
 export interface TaskArchive {
+  storage?: "local" | "s3";
   id: number;
   task_id: number;
   state: TaskArchiveState;
@@ -169,7 +171,7 @@ export interface AssetNode {
   name: string;
   key: string; // nkey
   value?: string;
-  company_id?: string; // 归属公司资产 id；空=未归属
+  company_id?: string; // owning company asset id; empty = unassigned
   state: NodeState;
   confidence: number; // 0..1
   attrs?: Record<string, unknown>;
@@ -284,8 +286,8 @@ export interface TaskAssetScopeMutation {
 }
 
 // ---- Asset coverage graph (per task) ----
-// 力导向「资产覆盖图」的一个节点。key 唯一：资产="a:<id>"、公司="c:<id>"、
-// 无资产行的根域名="r:<domain>"。in_scope=false 的是仅用于连线的灰色上下文节点。
+// One node of the force-directed "asset coverage graph". key is unique: asset="a:<id>",
+// company="c:<id>", root domain without an asset row="r:<domain>". in_scope=false nodes are grey context nodes used only for connecting.
 export interface CoverageGraphNode {
   key: string;
   kind: "company" | "root_domain" | "subdomain" | "ip" | "service" | "app" | "endpoint";
@@ -315,7 +317,7 @@ export interface CoverageGraphData {
   edges: CoverageGraphEdge[];
 }
 
-// 某资产在本任务探索图里关联到的意图/事实/发现（覆盖图节点抽屉用）。
+// Intents/facts/findings of an asset in this task's exploration graph (for the coverage graph node drawer).
 export interface CoverageAssetRef {
   id: number;
   kind: string;
@@ -350,13 +352,13 @@ export interface WorkspaceFile {
   content?: string;
 }
 
-// 任务测试范围的一条（覆盖度分母 + 授权边界）。
+// One row of a task's test scope (coverage denominator; coverage scope, not enforced).
 export interface TaskScopeRow {
   id: number;
   task_id: number;
   kind: "company" | "root_domain" | "subdomain" | "ip" | "cidr" | "icp" | "keyword";
   company_id?: number;
-  company_name?: string; // 后端 JOIN companies 解析，仅 kind=company 有值
+  company_name?: string; // resolved by a backend JOIN on companies; present only for kind=company
   domain?: string;
   net?: string;
   value?: string;
@@ -366,14 +368,14 @@ export interface TaskScopeRow {
 
 export type CompanyScopeKind = "domain" | "ip" | "cidr" | "icp" | "keyword";
 
-// 新增企业时提交的结构化资产范围规则。
+// Structured asset scope rules submitted when creating a company.
 export interface CompanyScopeRule {
   kind: CompanyScopeKind;
   value: string;
 }
 
-// 资产范围写入的结果。errors 是本次提交里不合法的行；warnings 是与本次提交无关、
-// 但会让归属结果不符合预期的既有数据问题（如 ip 字段存了主机名的资产）。
+// Result of writing asset scopes. errors are invalid rows from this submission; warnings
+// are pre-existing data problems unrelated to this submission that would make ownership results miss expectations (e.g. an asset whose ip field stores a hostname).
 export interface CompanyScopeMutation {
   added: number;
   skipped: number;
@@ -382,23 +384,23 @@ export interface CompanyScopeMutation {
   warnings?: string[];
 }
 
-// 公司资产范围规则的一条（归属唯一真值来源）。
+// One row of a company's asset scope rules (the single source of truth for ownership).
 export interface ScopeRow {
   id: number;
   company_id: number;
   kind: CompanyScopeKind;
-  domain?: string; // kind=domain 时有值
-  net?: string; // kind=ip|cidr 时有值
-  value?: string; // kind=icp|keyword 时可能由后端直接返回
-  raw: string; // 原始用户输入，用于显示和回填
+  domain?: string; // present when kind=domain
+  net?: string; // present when kind=ip|cidr
+  value?: string; // may be returned directly by the backend when kind=icp|keyword
+  raw: string; // raw user input, for display and backfill
   reason?: string;
 }
 
-// 企业：type=company 的资产节点 + 图标 + 资产计数 + 资产范围规则。
+// Company: the type=company asset node + logo + asset counts + asset scope rules.
 export interface Company {
   id: number;
   name: string;
-  logo?: string; // 远程图标 URL；空则前端用名称首字母
+  logo?: string; // remote logo URL; when empty the frontend uses the first letter of the name
   asset_count: number;
   scope?: ScopeRow[];
 }
@@ -421,11 +423,11 @@ export interface TaskNode {
   ts: string;
   source_task_id?: string;
   inherited?: boolean;
-  delete_reason?: string; // 意图假删除(state='deleted')时的删除原因
+  delete_reason?: string; // deletion reason when the intent is soft-deleted (state='deleted')
 }
 
-// 播报板一页:按创建顺序分页的节点 + 这一页涉及的边 + 边另一端的节点(refs,按 id 索引),
-// 这样每条播报都能说清「从哪来、产出了什么」,而不用把整张图拉下来。
+// One broadcast board page: nodes paginated by creation order + the edges involved on this
+// page + the nodes at the other ends (refs, indexed by id), so each broadcast can say "where it came from, what it produced" without pulling the whole graph.
 export interface ExplorationNodePage {
   items: TaskNode[];
   total: number;
@@ -433,7 +435,7 @@ export interface ExplorationNodePage {
   size: number;
   edges: Edge[];
   refs: Record<string, TaskNode>;
-  // 节点 id → 该节点锚定的资产(播报板展开时顺带展示,含本页节点与其邻居)。
+  // node id → assets anchored to that node (shown alongside broadcast expansion, incl. this page's nodes and their neighbors).
   assets: Record<string, FindingAsset[]>;
 }
 
@@ -446,7 +448,7 @@ export interface ExplorationNodeQuery {
   order?: "asc" | "desc";
 }
 
-// 目标管理卡片用的目标(后端已把 payload 拆成 text/vulnclass)。
+// Goals for the goal management card (the backend already splits payload into text/vulnclass).
 export interface TaskGoal {
   id: string;
   text: string;
@@ -456,7 +458,7 @@ export interface TaskGoal {
   ts: string;
 }
 
-// 约束管理卡片用的操作约束(allow=允许 / deny=禁止)。
+// Operation constraints for the constraint management card (allow=permit / deny=forbid).
 export type ConstraintKind = "allow" | "deny";
 export interface TaskConstraint {
   id: string;
@@ -469,7 +471,7 @@ export interface TaskConstraint {
 // ---- Findings ----
 export type Severity = "critical" | "high" | "medium" | "low";
 
-// 漏洞处置状态:待处理 / 处理中 / 已确认 / 已处理 / 已修复 / 误报 / 忽略 / 重复 / 风险接受。
+// Vulnerability handling status: Pending / In progress / Confirmed / Resolved / Fixed / False positive / Ignored / Duplicate / Risk accepted.
 export type FindingStatus =
   | "pending"
   | "in_progress"
@@ -481,7 +483,14 @@ export type FindingStatus =
   | "duplicate"
   | "risk_accepted";
 
-// FindingAsset 是一个漏洞绑定的资产(已在后端预渲染 label)。
+// Verification status (S1): the automated proof-of-exploitation outcome, distinct from the
+// human triage status above. "blocked" is produced by no path yet but is displayed when present.
+export type VerificationStatus = "verified" | "unverified" | "blocked" | "not_assessed" | "false_positive";
+
+// Report stage after triage: a finding can be confirmed and submitted at the same time.
+export type FindingReportState = "none" | "submitted" | "accepted" | "rejected" | "duplicate";
+
+// FindingAsset is an asset bound to a vulnerability (label pre-rendered by the backend).
 export interface FindingAsset {
   id: string;
   type: string;
@@ -493,15 +502,21 @@ export interface Finding {
   evidence_version?: number;
   report_evidence_version?: number;
   report_stale?: boolean;
+  poe_level?: number; // proof-of-exploitation level (3 or 4 when verified); 0 = none declared
+  verification_status?: VerificationStatus; // automated verification outcome (S1)
+  verification_note?: string; // why the status was reached; empty when verified
+  counterevidence?: string; // what was tested and did not work; optional, omitted when empty
+  confidence_rationale?: string; // why the conclusion holds; optional, omitted when empty
   id: string;
-  finding_id?: string; // 独立 findings 表的行 id,状态更新的句柄(任务内旧节点可能缺失)
+  finding_id?: string; // row id in the standalone findings table, the handle for status updates (may be missing for old in-task nodes)
   vulnclass: string;
-  name?: string; // 漏洞名称;为空时展示回退到 vulnclass
+  name?: string; // vulnerability name; display falls back to vulnclass when empty
   severity: Severity;
   status: FindingStatus;
+  report_state?: FindingReportState; // workflow stage after triage; default none
   summary: string;
   evidence: string;
-  report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  report?: string; // detailed report (Markdown); returned only by the detail endpoint, empty in lists
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -512,7 +527,7 @@ export interface Finding {
   ts: string;
 }
 
-// FindingsPage 是发现列表的服务端分页响应。
+// FindingsPage is the server-side paginated response of the findings list.
 export interface FindingsPage {
   items: Finding[];
   total: number;
@@ -522,7 +537,7 @@ export interface FindingsPage {
 
 export interface FindingGroup {
   task_id: string | number | null;
-  task_name?: string; // 可选任务名称;空/缺省=未命名
+  task_name?: string; // optional task name; empty/absent = untitled
   task_description: string;
   task_status: string;
   count: number;
@@ -548,10 +563,12 @@ export interface FindingDeepenResponse {
   queued: boolean;
 }
 
-// FindingStats 是发现全表聚合(统计卡 + 漏洞类型下拉),服务端计算,不受分页影响。
+// FindingStats is the whole-table findings aggregate (stat cards + vulnerability type dropdown), computed server-side, unaffected by pagination.
 export interface FindingStats {
   total: number;
   pending: number;
+  submitted: number;
+  accepted: number;
   critical: number;
   high: number;
   medium: number;
@@ -560,34 +577,38 @@ export interface FindingStats {
   tasks: FindingTaskOption[];
 }
 
-// FindingTaskOption 是发现页「按任务」筛选下拉的一项:有漏洞的任务(描述为空表示任务已删除,
-// 前端回退展示 id)及其漏洞条数。
+// FindingTaskOption is one entry of the findings page's "by task" filter dropdown: tasks
+// with vulnerabilities (an empty description means the task was deleted; the frontend falls back to showing the id) and their vulnerability counts.
 export interface FindingTaskOption {
   id: string | number;
-  name?: string; // 可选任务名称;空/缺省=未命名
+  name?: string; // optional task name; empty/absent = untitled
   description: string;
   count: number;
 }
 
-// FindingQuery 是发现列表分页/筛选/排序参数。
+// FindingQuery is the findings list pagination/filter/sort parameters.
 export interface FindingQuery {
   page: number;
   pageSize: number;
   severity?: "all" | Severity;
   status?: "all" | FindingStatus;
+  reportState?: "all" | FindingReportState;
+  verificationStatus?: "all" | VerificationStatus;
   vulnclass?: string;
-  task?: string; // 任务 id;"all"/空 = 不按任务筛选
+  task?: string; // task id; "all"/empty = no task filter
   query?: string;
   sort?: "severity" | "time";
-  // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。
+  // asset tree node key; selecting a node selects its whole subtree. Empty = no asset filter.
   assetScope?: string;
+  // company id from the sidebar switcher; also narrows the asset tree. Empty = all companies.
+  company?: string;
 }
 
-// ---- Findings by asset (资产视图) ----
+// ---- Findings by asset (asset view) ----
 export type FindingAssetKind = "company" | "root_domain" | "subdomain" | "ip" | "service" | "app" | "endpoint" | "none";
 
-// FindingAssetNode 是资产树的一个节点。key 形如 a:<id>(资产)、c:<id>(企业)、
-// r:<domain>(库里没有资产行的根域名)、__none__(未关联资产)。
+// FindingAssetNode is one node of the asset tree. keys look like a:<id> (asset), c:<id>
+// (company), r:<domain> (root domain with no asset row), __none__ (no linked asset).
 export interface FindingAssetNode {
   key: string;
   parent?: string;
@@ -595,8 +616,8 @@ export interface FindingAssetNode {
   label: string;
   asset_id?: number;
   company_id?: number;
-  self: number; // 直接挂在该资产上的发现数
-  total: number; // 含子孙、按发现去重
+  self: number; // findings attached directly to this asset
+  total: number; // including descendants, deduplicated by finding
   critical: number;
   high: number;
   medium: number;
@@ -611,7 +632,7 @@ export interface FindingAssetTree {
   dropped_kinds?: string[];
 }
 
-// FINDING_UNASSIGNED_ASSET 与后端 db.FindingUnassignedAsset 对应。
+// FINDING_UNASSIGNED_ASSET corresponds to the backend's db.FindingUnassignedAsset.
 export const FINDING_UNASSIGNED_ASSET = "__none__";
 
 // ---- Activity / sessions ----
@@ -629,12 +650,12 @@ export type ActivityKind =
   | "llm_failover" // task-level provider switch / chain exhaustion audit event
   | "intercept_request"; // user-approval request from the intercept layer
 
-// ChatAttachment 是一次上传的文件:path 相对该会话/任务工作目录(即 agent 的 CWD)。
+// ChatAttachment is an uploaded file: path is relative to the session/task working directory (the agent's CWD).
 export interface ChatAttachment {
   name: string;
   path: string;
   size: number;
-  abs?: string; // 绝对路径(scope=staging 暂存上传时返回;建任务前把它写进描述)
+  abs?: string; // absolute path (returned for scope=staging uploads; write it into the description before creating the task)
 }
 
 export interface Activity {
@@ -691,24 +712,24 @@ export interface TaskLLMResolutions {
   worker: TaskLLMResolution;
 }
 
-// ---- Agent triggers (P3 调度，仅自定义 agent) ----
+// ---- Agent triggers (P3 scheduling, custom agents only) ----
 export interface AgentTrigger {
   id: number;
   agent_key: string;
   enabled: boolean;
-  interval_sec: number; // 定时:每 N 秒(0=不定时)
-  on_finding: boolean; // 任意任务发现 finding 时触发
-  on_goal_met: boolean; // 任意任务达成目标时触发
-  on_task_timeout: boolean; // 任意任务超时时触发
-  on_tool_call: boolean; // 选中工具被调用(执行完成)时触发
-  on_task_create: boolean; // 任意任务被创建时触发
-  interval_message: string; // 各触发条件的独立用户消息
+  interval_sec: number; // scheduled: every N seconds (0 = not scheduled)
+  on_finding: boolean; // fires when any task finds a finding
+  on_goal_met: boolean; // fires when any task meets a goal
+  on_task_timeout: boolean; // fires when any task times out
+  on_tool_call: boolean; // fires when a selected tool is called (execution finished)
+  on_task_create: boolean; // fires when any task is created
+  interval_message: string; // standalone user message for each trigger condition
   finding_message: string;
   goal_message: string;
   task_timeout_message: string;
   tool_call_message: string;
   task_create_message: string;
-  tool_names: string[]; // on_tool_call 选中的工具 key(至少一个)
+  tool_names: string[]; // selected tool keys for on_tool_call (at least one)
   last_fire?: string;
 }
 
@@ -794,7 +815,7 @@ export interface BatchControlItem {
   error?: string;
 }
 
-// 批量改分类的逐任务结果。失败只可能是任务已被删除，分类本身的写入是原子的。
+// Per-task results of batch category changes. The only failure is the task already being deleted; the category write itself is atomic.
 export interface BatchCategoryItem {
   id: string;
   ok: boolean;
@@ -818,6 +839,8 @@ export interface ProfileUsage {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  // EUR cost from the profile's stored prices; absent when the profile has no price set.
+  cost_eur?: number | null;
 }
 
 // One (profile, UTC day) token bucket for the dashboard's daily chart (new source).
@@ -883,6 +906,36 @@ export interface TrafficExchange {
   status: number;
   content_type: string;
   resp_len: number;
+  rewritten?: boolean;
+}
+
+export interface TrafficRewriteStats {
+  large_responses: number;
+  capacity_refusals: number;
+  tombstone_drops: number;
+  conversions: number;
+  sweeps: number;
+}
+
+export interface TrafficHARImportError {
+  index: number;
+  url?: string;
+  reason: string;
+}
+
+export interface TrafficHARImportResult {
+  imported: number;
+  skipped: number;
+  failed: number;
+  truncated?: boolean;
+  errors?: TrafficHARImportError[];
+}
+
+export interface TrafficHARExportMeta {
+  exported: number;
+  matched: number;
+  truncated: boolean;
+  truncatedReason?: string;
 }
 
 export interface TrafficResp {
@@ -893,12 +946,67 @@ export interface TrafficResp {
   page?: number;
   size?: number;
   exchanges?: TrafficExchange[];
+  rewrite?: TrafficRewriteStats;
 }
 
 // Full raw request/response of one exchange (lazy-loaded on row select).
 export interface TrafficDetail {
   req: string;
   resp: string;
+  // WebSocket/SSE exchanges carry their messages separately (trafficStream);
+  // stream_kind is "" for an ordinary exchange.
+  stream_count?: number;
+  stream_kind?: "websocket" | "sse" | "";
+}
+
+// One recorded WebSocket message or SSE event. ts is in Unix seconds; seq
+// orders. payload is a preview of at most 4 KiB (base64 when encoding is
+// "base64"); blob names the full payload when it was stored separately.
+export interface TrafficStreamMessage {
+  seq: number;
+  ts: number;
+  direction: "c2s" | "s2c" | "meta" | (string & {});
+  kind: number;
+  type: "text" | "binary" | "event" | "meta" | (string & {});
+  event?: string;
+  event_id?: string;
+  retry?: number;
+  size: number;
+  payload: string;
+  encoding?: string;
+  blob?: string;
+  truncated?: boolean;
+}
+
+export interface TrafficStreamPage {
+  items: TrafficStreamMessage[];
+  total: number;
+}
+
+export interface TrafficReplayHeader {
+  name: string;
+  value: string;
+}
+
+// POST /api/traffic/replay. Host is not sent: the server takes it from url.
+// apply_rules defaults to false (bypasses capture rewrite rules).
+export interface TrafficReplayRequest {
+  method: string;
+  url: string;
+  headers: TrafficReplayHeader[];
+  body: string;
+  body_base64: boolean;
+  apply_rules?: boolean;
+}
+
+export interface TrafficReplayResult {
+  status: number;
+  headers: TrafficReplayHeader[];
+  raw: string;
+  duration_ms: number;
+  truncated: boolean;
+  // false when the host is in passthrough: the response was not recorded.
+  recorded: boolean;
 }
 
 // One distinct recorded host with its exchange count (target picker).
@@ -910,60 +1018,82 @@ export interface TrafficHost {
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
-  agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
-  llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
-  // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
+  agent_traffic_binding: boolean; // agents auto-bind traffic evidence, off by default; does not affect manual binding
+  llm_record: boolean; // LLM recording switch (off by default); when off no LLM calls are recorded
+  // Web search. brave_key_set / tavily_key_set / keenable_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
   web_search_enabled: boolean;
-  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "deepseek" | "bing" | "baidu"
+  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "keenable" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
+  keenable_key_set: boolean;
   // write-only: only sent on PUT to store/clear the key.
   brave_search_api_key?: string;
   tavily_search_api_key?: string;
-  // 独立出口代理(http/https/socks5)，用于访问搜索端点；与记录流量的 MITM 代理无关。空=直连。
+  keenable_search_api_key?: string;
+  // Dedicated egress proxy (http/https/socks5) for reaching search endpoints; unrelated to the MITM proxy that records traffic. Empty = direct.
   web_search_proxy?: string;
-  // 全局出口代理(http/https/socks5，可带 user:pass)，所有目标流量走它。开启流量捕获时作为
-  // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
+  // Global egress proxy (http/https/socks5, may carry user:pass) that all target traffic goes
+  // through. Acts as the MITM upstream when traffic capture is on; injected directly into the agent's bash/WebFetch when capture is off. Empty = direct.
   global_proxy?: string;
-  python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
-  workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
-  // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
-  task_concurrency_enabled?: boolean; // 默认 false
-  task_concurrency_limit?: number; // 开启后默认 5
-  // LLM 轮询(故障转移)。默认关；开启后「未指定模型」的 agent 在当前配置不可用
-  // （余额不足/key 失效/限流/服务异常）时自动切到下一个配置。
-  llm_pool_enabled?: boolean; // 默认 false
-  // 绑定了指定配置的 agent/任务失败时是否也回落到轮询链。默认 false = 绑定即独占。
+  python_interpreter?: string; // python interpreter path for custom script tools (empty = detect at runtime)
+  workers?: number; // concurrent worker agent count (default 3); applies to tasks started afterwards
+  // Task concurrency cap: max simultaneously "running" tasks. Off = unlimited; on, new tasks beyond the limit queue and start automatically when a slot frees up.
+  task_concurrency_enabled?: boolean; // false by default
+  task_concurrency_limit?: number; // defaults to 5 when enabled
+  // LLM pooling (failover). Off by default; when on, an agent with "no model specified"
+  // automatically switches to the next profile when the current one is unavailable (out of balance / dead key / rate limited / service error).
+  llm_pool_enabled?: boolean; // false by default
+  // Whether agents/tasks bound to a specific profile also fall back to the pool chain on failure. Default false = binding is exclusive.
   llm_pool_bind_fallback?: boolean;
-  // 操作约束注入范围(默认都开):把任务的 allow/deny 约束拼进对应 agent 的系统提示。
+  // Operation constraint injection scope (both on by default): splice the task's allow/deny constraints into the matching agent's system prompt.
   constraints_inject_planner?: boolean;
   constraints_inject_worker?: boolean;
-  // 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent(planner/
-  // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
-  // 之后启动的 run 生效。
+  // Experimental: noa model-driven context compression (off by default). When on, the
+  // platform's four agent kinds (planner/worker/main agent/chat) have context compression
+  // taken over by noa, replacing built-in compaction; read once per run, applying to runs started afterwards.
   noa_compaction?: boolean;
-  // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
-  notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
-  notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
-  notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+  // ---- Vulnerability IM push (channels are a standalone resource, see /api/notify/*; only three global settings live here) ----
+  notify_enabled?: boolean; // master push switch, on by default; one-click kill switch for maintenance windows
+  notify_public_base_url?: string; // external base URL for vulnerability detail links; empty = messages carry no link
+  notify_digest_interval_min?: number; // digest mode period (minutes), default 30
+  // Render limits of IM messages; 0 = no truncation. The backend answers 400 outside the bounds.
+  notify_summary_max_runes?: number; // summary characters per finding, 0-4000, default 120
+  notify_assets_max_shown?: number; // asset names listed per finding, 0-50, default 3
+  // Target noise profile; the stored setting wins over ARTEX_NOISE_PROFILE. Applies to the next request.
+  noise_profile?: NoiseProfileName;
 }
 
-// ---- 漏洞 IM 推送 ----
+export type NoiseProfileName = "off" | "quiet" | "balanced" | "aggressive";
 
-// NotificationFilter 是渠道的过滤条件，字段全部可选，缺省即不过滤。
-// 后端对所有字段都不加校验：配置畸形时按「命中」处理（宁可多推不可漏推）。
+// GET /api/settings/noise: the current profile and its per-host counters (current minute, no reset).
+export interface NoiseStatus {
+  profile: NoiseProfileName;
+  hosts: {
+    host: string;
+    rpm: number;
+    peak_rpm: number;
+    peak_inflight: number;
+    inflight: number;
+    duplicates_avoided: number;
+  }[];
+}
+
+// ---- Vulnerability IM push ----
+
+// NotificationFilter is a channel's filter conditions; all fields are optional, absent means no filtering.
+// The backend validates none of them: a malformed config counts as "matched" (better to over-push than to miss).
 export interface NotificationFilter {
   min_severity?: string; // "" | low | medium | high | critical
-  task_ids?: number[]; // 空=不限；非空则要求与漏洞所属任务有交集
-  asset_ids?: number[]; // 空=不限；非空则要求与漏洞锚定资产有交集
-  vulnclass_include?: string[]; // 空=全收；非空则要求漏洞类型命中任一关键词（大小写不敏感子串）
-  vulnclass_exclude?: string[]; // 命中任一关键词即排除（排除优先于包含）
-  on_status_change?: boolean; // 是否也接收漏洞处置状态变更事件
+  task_ids?: number[]; // empty = no limit; non-empty requires overlap with the vulnerability's task
+  asset_ids?: number[]; // empty = no limit; non-empty requires overlap with the vulnerability's anchored assets
+  vulnclass_include?: string[]; // empty = accept all; non-empty requires the vulnerability type to match any keyword (case-insensitive substring)
+  vulnclass_exclude?: string[]; // matching any keyword excludes (exclusion wins over inclusion)
+  on_status_change?: boolean; // whether to also receive vulnerability status change events
 }
 
-// NotificationChannel 是一个渠道实例。config 的字段随 kind 而异，
-// 且凭据字段在读取时被替换成 "__masked__" 开头的掩码值——原样回传即表示「不改」。
+// NotificationChannel is one channel instance. config fields vary by kind, and
+// credential fields are replaced on read with mask values starting with "__masked__" — passing them back as-is means "do not change".
 export interface NotificationChannel {
   id: number;
   name: string;
@@ -975,12 +1105,12 @@ export interface NotificationChannel {
   rate_per_min: number;
   created_at: string;
   updated_at: string;
-  // secret_keys 由后端按渠道类型给出，前端据此渲染密码框与「留空即不改」提示，
-  // 不硬编码任何渠道知识。
+  // secret_keys come from the backend per channel kind; the frontend renders password fields
+  // and "leave empty to keep" hints from them, hardcoding no channel knowledge.
   secret_keys: string[];
 }
 
-// NotificationKind 是 /api/notify/meta 返回的渠道类型元数据。
+// NotificationKind is the channel kind metadata returned by /api/notify/meta.
 export interface NotificationKind {
   kind: string;
   default_rate_per_min: number;
@@ -1003,7 +1133,7 @@ export interface NotificationMeta {
   };
 }
 
-// NotificationDelivery 是一条投递记录，用于投递历史与失败重发。
+// NotificationDelivery is one delivery record, for delivery history and retrying failures.
 export interface NotificationDelivery {
   id: number;
   finding_id: string;
@@ -1026,7 +1156,7 @@ export interface NotificationDelivery {
 export interface LLMProfile {
   id: string;
   name: string;
-  format: "openai" | "anthropic" | "openai-responses";
+  format: "openai" | "anthropic" | "openai-responses" | "ollama";
   base_url?: string;
   proxy?: string;
   model: string;
@@ -1034,67 +1164,74 @@ export interface LLMProfile {
   rate_per_second: number;
   rate_per_minute: number;
   context_window_k?: number;
-  // 思考开关(thinking.type): ""=不发送(默认) | "disabled"=关闭 | "enabled"=开启
+  // Thinking switch (thinking.type): ""=not sent (default) | "disabled"=off | "enabled"=on
   thinking_type?: string;
-  // 思考强度: ""=不发送(默认) | "low"/"medium"/"high"/"xhigh"/"max"
+  // Thinking effort: ""=not sent (default) | "low"/"medium"/"high"/"xhigh"/"max"
   reasoning_effort?: string;
   is_default: boolean;
-  // 轮询顺位：越大越先被选中。激活配置恒为链首，与本值无关。
+  // Pool order: the larger, the earlier chosen. The active profile is always chain head, regardless of this value.
   priority?: number;
-  // true = 不作为故障转移目标（仍可被 agent/任务显式绑定使用）。
+  // true = not a failover target (still usable via explicit agent/task binding).
   pool_exclude?: boolean;
-  // true（默认）= 流式(SSE) | false = 真·非流式(stream:false，一次性返回)。
+  // true (default) = streaming (SSE) | false = genuinely non-streaming (stream:false, one-shot response).
   streaming?: boolean;
-  // 单次回复的输出上限(token)。0 = 不发送该字段，由服务端默认值决定。
-  // 注意与 context_window_k 区分：后者是模型总容量，只在本地用于压缩阈值。
+  // Cost ledger: EUR per 1M tokens (0/absent = unset).
+  price_input_per_m?: number;
+  price_output_per_m?: number;
+  price_cache_read_per_m?: number;
+  price_cache_write_per_m?: number;
+  // Output cap per reply (tokens). 0 = do not send the field; the server default decides.
+  // Note the distinction from context_window_k: that is the model's total capacity, used locally only for the compression threshold.
   max_tokens?: number;
-  // 上限用哪个请求字段名，仅 format="openai" 有意义：
-  // ""=max_tokens(默认) | "max_completion_tokens"(OpenAI 推理模型只认它)
+  // Which request field name carries the cap; only meaningful for format="openai":
+  // ""=max_tokens (default) | "max_completion_tokens" (OpenAI reasoning models only accept it)
   max_tokens_field?: string;
-  // 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
-  // ""=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
+  // Custom session header name: when non-empty every request carries this HTTP header, value = the current session/intent session id.
+  // "" = not sent. For gateways that do prompt caching/sticky routing on a session-id header.
   session_header_key?: string;
-  // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
+  // Custom User-Agent: when non-empty, every outbound LLM request overrides its User-Agent header with this value. "" = do not override (keep the default UA).
+  user_agent?: string;
+  // This profile's retry overrides (connect / empty response / same-provider safety window). Empty / all zeros = follow the global policy.
   retry?: LLMRetryOverride;
 }
 
-// ---- LLM 重试策略 ----
-// 一层重试的两个旋钮。两者都是「0 = 未配置」：
-//   attempts    0=用默认次数 | -1=关闭该层重试 | >0=重试次数
-//   interval_ms 0=用默认的指数退避 | >0=改用这个固定毫秒间隔
+// ---- LLM retry policy ----
+// Two knobs per retry layer. Both use "0 = not configured":
+//   attempts    0 = default count | -1 = disable this layer's retries | >0 = retry count
+//   interval_ms 0 = default exponential backoff | >0 = use this fixed millisecond interval
 export interface LLMRetryRule {
   attempts: number;
   interval_ms: number;
 }
 
-// 单个 LLM 配置能覆盖的三层（都是「跟着端点走」的重试）。
+// The three layers a single LLM profile can override (all "endpoint-bound" retries).
 export interface LLMRetryOverride {
-  connect: LLMRetryRule; // 建连重试：连接重置/超时/429/5xx，流开始前
-  empty: LLMRetryRule; // 空响应重试：完成但没有任何内容（仅 openai 格式）
-  stream: LLMRetryRule; // 同 provider 安全窗口重试：未交付输出前的断流重放
+  connect: LLMRetryRule; // connect retries: connection reset/timeout/429/5xx, before the stream starts
+  empty: LLMRetryRule; // empty-response retries: completed but with no content (openai format only)
+  stream: LLMRetryRule; // same-provider safety-window retries: replay of a dropped stream before output is delivered
 }
 
-// 全局策略 = 上面三层的默认值 + 两层只有全局的：
-//   breaker 轮询熔断（attempts=连续几次瞬时失败熔断，interval_ms=固定冷却时长）
-//   intent  意图重跑（worker 以 model_error 收场后整条意图重跑）
+// Global policy = defaults for the three layers above + two global-only layers:
+//   breaker pool breaker (attempts = consecutive transient failures before tripping, interval_ms = fixed cooldown)
+//   intent  intent rerun (the whole intent reruns after a worker ends with model_error)
 export interface LLMRetryPolicy extends LLMRetryOverride {
   breaker: LLMRetryRule;
   intent: LLMRetryRule;
 }
 
-// ---- LLM 轮询（故障转移）----
-// 一个配置在轮询链中的位置与健康状态。state:
-//   ok       正常
-//   degraded 有连续失败但未达熔断阈值
-//   tripped  已熔断，冷却期内被跳过（cooldown_secs 为剩余秒数）
+// ---- LLM pooling (failover) ----
+// A profile's position and health in the pool chain. state:
+//   ok       healthy
+//   degraded consecutive failures but below the breaker threshold
+//   tripped  breaker open, skipped during the cooldown (cooldown_secs = seconds left)
 export interface LLMPoolMember {
   profile_id: string;
   name: string;
   model: string;
   format: string;
   priority: number;
-  active: boolean; // 是否为当前激活配置（恒为链首）
-  excluded: boolean; // pool_exclude：不参与轮询
+  active: boolean; // whether this is the currently active profile (always chain head)
+  excluded: boolean; // pool_exclude: not part of the pool
   state: "ok" | "degraded" | "tripped";
   fails: number;
   trips: number;
@@ -1112,22 +1249,22 @@ export interface LLMPoolStatus {
 // ---- Agents ----
 export interface Agent {
   id: string;
-  key: string; // 内置为 goals/planner/mainagent/worker；自定义为用户自定 key
+  key: string; // built-ins are goals/planner/mainagent/worker; custom agents use user-defined keys
   name: string;
   description?: string;
   role: string;
   builtin: boolean;
   enabled: boolean;
-  llm_profile_id?: number | null; // 绑定的 LLM 配置；null/absent = 跟随任务/会话/全局
-  max_turns?: number; // 0 = 无限制
-  run_seconds?: number; // worker 单次运行墙钟上限(秒)；0 = 无限制
-  web_search?: boolean; // 是否启用网络搜索(受系统全局开关门控)
-  interactive_shell?: boolean; // 是否启用交互式 shell(持久 PTY 会话工具族)
-  // P3 触发后处理策略(仅自定义 agent 有意义)
-  trigger_run_mode?: "serial" | "parallel"; // 串行排队 / 每次触发各自并发一个会话
-  trigger_merge_mode?: "by_task" | "all" | "none"; // 仅 serial：同任务合并 / 全部合并 / 不合并
-  trigger_max_parallel?: number; // 仅 parallel：每 agent 并发上限；0=不限
-  // 绑定数量(仅列表接口返回)：可见 MCP / 可见 Skill / 绑定工具
+  llm_profile_id?: number | null; // bound LLM profile; null/absent = follow task/session/global
+  max_turns?: number; // 0 = unlimited
+  run_seconds?: number; // worker per-run wall-clock cap (seconds); 0 = unlimited
+  web_search?: boolean; // whether web search is enabled (gated by the global system switch)
+  interactive_shell?: boolean; // whether the interactive shell is enabled (persistent PTY session tool family)
+  // P3 post-trigger handling policy (only meaningful for custom agents)
+  trigger_run_mode?: "serial" | "parallel"; // queue serially / each trigger gets its own concurrent session
+  trigger_merge_mode?: "by_task" | "all" | "none"; // serial only: merge per task / merge all / no merge
+  trigger_max_parallel?: number; // parallel only: per-agent concurrency cap; 0 = unlimited
+  // Binding counts (returned only by the list endpoint): visible MCP / visible Skill / bound tools
   mcp_count?: number;
   skill_count?: number;
   tool_count?: number;
@@ -1153,13 +1290,13 @@ export interface AgentDetail {
   variables: PromptVar[];
   versions: PromptVersion[];
   visibility: { mcp: number[]; skill: string[] };
-  // 可绑定的 LLM 配置候选(供「默认模型」下拉)；当前绑定见 agent.llm_profile_id
+  // Bindable LLM profile candidates (for the "default model" dropdown); the current binding is agent.llm_profile_id
   llm_profiles?: { id: number; name: string; model: string; is_default: boolean }[];
-  wrapup_prompt?: string; // 已保存的收尾提示词(空=用内置默认)
-  wrapup_default?: string; // 内置默认收尾提示词(占位/恢复默认)
-  wrapup_max_turns?: number; // 已保存的收尾轮数(0=用内置默认)
-  wrapup_max_turns_default?: number; // 内置默认收尾轮数(供 "0=默认N" 提示)
-  // 任务级超时收尾词(仅 worker/planner，task_timeout_wrapup_supported=true 时才显示该分区)
+  wrapup_prompt?: string; // saved wrap-up prompt (empty = built-in default)
+  wrapup_default?: string; // built-in default wrap-up prompt (placeholder / restore default)
+  wrapup_max_turns?: number; // saved wrap-up turn count (0 = built-in default)
+  wrapup_max_turns_default?: number; // built-in default wrap-up turn count (for the "0 = default N" hint)
+  // Task-level timeout wrap-up prompt (worker/planner only; this section shows only when task_timeout_wrapup_supported=true)
   task_timeout_wrapup_supported?: boolean;
   task_timeout_wrapup_prompt?: string;
   task_timeout_wrapup_default?: string;
@@ -1178,6 +1315,10 @@ export interface MCPServer {
   url?: string;
   enabled: boolean;
   insecure?: boolean; // http: skip TLS cert verification (self-signed servers)
+  timeout_seconds?: number; // http/sse: per-request timeout in seconds (default 120)
+  last_connect_at?: string | null; // last connect attempt (ISO time)
+  last_connect_ok?: boolean | null; // outcome of the last connect attempt
+  last_connect_err?: string | null; // failure reason when last_connect_ok is false
   tools?: string[]; // mcp_tools_cache (names only, for the count)
 }
 
@@ -1196,23 +1337,23 @@ export interface SkillItem {
   compatibility?: string; // optional: environment requirements
   mcps?: string[]; // MCP server names this skill unlocks on load
   files: string[]; // files in the skill directory
-  // 调用统计（skill_usage 账本）。从未被调用过的 skill：calls=0、last_used 缺省。
+  // Call stats (the skill_usage ledger). A skill never called: calls=0, last_used absent.
   calls: number;
-  tasks: number; // 加载过它的任务数（chat 会话不计入）
-  usage_agents: string[]; // 加载过它的 agent key
+  tasks: number; // number of tasks that loaded it (chat sessions excluded)
+  usage_agents: string[]; // agent keys that loaded it
   last_used?: string;
 }
 
-// SkillCall 是一次 Skill() 调用（单个 skill 的最近调用列表）。
+// SkillCall is one Skill() invocation (recent-call list for a single skill).
 export interface SkillCall {
   ts: string;
   agent_key: string;
-  task_id: number; // 0 = 非任务场景（对话会话）
+  task_id: number; // 0 = non-task context (chat session)
   session_id: string;
   args_len: number;
 }
 
-// MissingSkill 是被点名但不存在的 skill —— "想用但没有"的缺口。
+// MissingSkill is a skill that was named but does not exist — the "wanted but missing" gap.
 export interface MissingSkill {
   skill: string;
   calls: number;
@@ -1220,7 +1361,7 @@ export interface MissingSkill {
   last_used?: string;
 }
 
-// ---- Tools (内置工具目录) ----
+// ---- Tools (built-in tool catalog) ----
 // key + handler live in Go; only these fields are page-editable. system tools lock
 // the key and the parameter *structure* (name/type/required) — the per-param
 // description/default and the agent binding are what move.
@@ -1232,10 +1373,10 @@ export interface Tool {
   schema: Record<string, any>; // full JSON-Schema (object with properties)
   agents: string[]; // bound agent keys
   enabled: boolean;
-  kind?: "builtin" | "shell" | "command" | "script" | "http"; // 自定义工具类型
+  kind?: "builtin" | "shell" | "command" | "script" | "http"; // custom tool kind
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  exec?: Record<string, any>; // 自定义工具执行规格(kind!=builtin)
-  deferred?: boolean; // schema 延迟(SearchExtraTools/ExecuteExtraTool)
+  exec?: Record<string, any>; // custom tool execution spec (kind!=builtin)
+  deferred?: boolean; // schema deferred (SearchExtraTools/ExecuteExtraTool)
   calls?: number; // persistent runtime invocation count (older APIs may omit it)
 }
 
@@ -1252,7 +1393,8 @@ export interface Stats {
 // ---- Intercept Rules ----
 export type InterceptAction = "allow" | "deny" | "ask";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
-export type InterceptMatchType = "string" | "regex";
+// argv: pattern is a JSON array of tokens, the prefix of a Bash command (program and subcommands; flags are not constrained).
+export type InterceptMatchType = "string" | "regex" | "argv";
 
 export interface InterceptRule {
   id: number;
@@ -1271,7 +1413,7 @@ export interface InterceptRule {
   updated_at: string;
 }
 
-// ---- Asset Intercept Rules（资产拦截：全局黑名单） ----
+// ---- Asset Intercept Rules (asset interception: global blocklist) ----
 export type AssetInterceptKind =
   | "exact_domain"
   | "exact_ip"
@@ -1281,10 +1423,10 @@ export type AssetInterceptKind =
   | "fuzzy_url"
   | "cidr";
 
-// action 仅用于任务级规则：block=拦截(禁止测试) allow=允许(白名单)。
+// action is only for task-level rules: block = intercept (forbid testing), allow = permit (allowlist).
 export type AssetInterceptAction = "block" | "allow";
 
-// 任务级资产拦截/允许规则的录入项（创建任务、任务详情编辑使用）。
+// Input row for task-level asset interception/allow rules (used when creating a task and editing task details).
 export interface AssetInterceptRuleInput {
   action: AssetInterceptAction;
   kind: AssetInterceptKind;
@@ -1293,10 +1435,29 @@ export interface AssetInterceptRuleInput {
   enabled: boolean;
 }
 
+// Task credentials (#3): per-task test accounts. An empty password on a user-declared
+// entry means "agent generates": the agent registers that account and records it back.
+export type TaskCredentialInput = {
+  domain: string;
+  username: string;
+  password: string;
+  note?: string;
+};
+
+export type TaskCredential = TaskCredentialInput & {
+  id: number;
+  task_id: number;
+  source: "user" | "agent";
+  note: string;
+  created_at: string;
+  updated_at: string;
+};
+
+
 export interface AssetInterceptRule {
   id: number;
   enabled: boolean;
-  action?: AssetInterceptAction; // 全局规则不带此字段（恒为拦截）；任务级规则区分 block/allow
+  action?: AssetInterceptAction; // global rules omit this field (always intercept); task-level rules distinguish block/allow
   kind: AssetInterceptKind;
   pattern: string;
   note: string;
@@ -1307,6 +1468,9 @@ export interface AssetInterceptRule {
 
 export interface InterceptPending {
   decision_source?: "rule" | "model" | "unknown" | "";
+  // Actor that settled the request, exactly as stored: "" while pending and on
+  // rows decided before the column existed (shown as "Legacy").
+  decided_by?: "human" | "rule" | "model" | "system" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1316,23 +1480,38 @@ export interface InterceptPending {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tool_input: Record<string, any>;
   status: "pending" | "allowed" | "denied" | "timeout";
-  reason: string; // 规则 message 或模型判定理由(模型判定带 [模型] 前缀)
+  reason: string; // the rule's message or the model's verdict reason (model verdicts carry a [model] prefix)
   decided_at?: string;
   created_at: string;
+  // Deterministic risk score, computed by the server when a pending row is read.
+  risk?: InterceptRisk;
 }
 
-// JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
+export interface InterceptRisk {
+  score: number; // 0..100
+  level: "low" | "medium" | "high";
+  reasons: string[];
+}
+
+export interface InterceptBatchDecideResult {
+  decided: number;
+  failed: number;
+  results: { id: number; ok: boolean; error?: string }[];
+}
+
+// JudgeConfig: global config for model fallback approval (the model decides only when no interception rule matches).
 export interface JudgeConfig {
   enabled: boolean;
-  profile_id: number; // 0 = 跟随激活/默认配置
-  prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
-  timeout_seconds: number; // 模型调用超时
-  fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
-  ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
-  ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+  mode?: "closed" | "freeform"; // closed (default): fixed questions, code decides; freeform: the prompt decides
+  profile_id: number; // 0 = follow the active/default profile
+  prompt: string; // verdict prompt; on GET the backend backfills the full built-in template when unset
+  timeout_seconds: number; // model call timeout
+  fail_action: "allow" | "ask" | "deny"; // fallback when the model errors/times out/is unparseable
+  ask_timeout_seconds: number; // approval wait timeout after the model says ask and it goes to a human
+  ask_timeout_action: "allow" | "deny"; // default action after the approval timeout
 }
 
-// JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。
+// JudgeUsage: cumulative token usage of model fallback approval (the judge channel) + daily series for the last N days.
 export interface JudgeDayUsage {
   date: string; // YYYY-MM-DD (UTC)
   calls: number;
@@ -1351,6 +1530,7 @@ export interface JudgeUsage {
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
   decision_source?: "rule" | "model" | "unknown";
+  decided_by?: "human" | "rule" | "model" | "system";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
@@ -1360,7 +1540,7 @@ export interface InterceptApprovalRow extends InterceptPending {
   rule_name: string; // "" if rule was deleted
 }
 
-// ── 资产同步 (ScopeSentry 数据源) ──────────────────────────────────────────────
+// ── Asset sync (ScopeSentry data source) ──────────────────────────────────────────────
 export interface SSProject {
   id: string; // MongoDB ObjectID — used as filter.project
   name: string;
@@ -1401,7 +1581,7 @@ export interface CommandRecord {
   created_at: string;
 }
 
-// 单个工具的调用统计（/commands/stats）；errors 为其中失败的次数。
+// Call stats for one tool (/commands/stats); errors is the failed subset.
 export interface ToolStat {
   tool: string;
   total: number;
@@ -1429,9 +1609,9 @@ export interface LLMRecordItem {
 export interface LLMRecordDetail extends LLMRecordItem {
   request_body: string;
   response_body: string;
-  // provider 实际收发的 HTTP 原文：请求为 buildBody() 发出的完整 body（含工具
-  // schema），响应为原始 SSE 帧。上面的 request_body/response_body 是归一化视图，
-  // 丢弃了工具 schema 与 tool_use 块。旧记录为空。
+  // Raw HTTP actually exchanged with the provider: the request is the full body sent by
+  // buildBody() (incl. tool schemas), the response is raw SSE frames. The
+  // request_body/response_body above are the normalized view, dropping tool schemas and tool_use blocks. Empty for old records.
   raw_request?: string;
   raw_response?: string;
 }
@@ -1501,6 +1681,7 @@ export interface InterceptAudit {
   rule_name?: string;
   config_digest?: string;
   profile_id?: number;
+  judge_answers?: { id: string; answer: "yes" | "no" | "unknown"; evidence: string }[];
   execution_status: "not_started" | "not_executed" | "awaiting_result" | "succeeded" | "failed" | "unknown";
   output?: string;
   output_truncated?: boolean;
@@ -1508,6 +1689,7 @@ export interface InterceptAudit {
 }
 export interface InterceptDetail extends InterceptApprovalRow {
   audit: InterceptAudit | null;
+  always_allow_prefix?: string; // pending Bash request: the argv prefix "always allow" would allow
 }
 
 export type TrafficEvidenceRole = "baseline" | "proof" | "verification" | "supporting";
@@ -1530,6 +1712,8 @@ export interface TrafficEvidenceSnapshot {
   resp_hash: string;
   req_len: number;
   resp_len: number;
+  rewritten?: boolean;
+  rewrite_rule_ids?: number[];
 }
 export interface FindingTrafficBinding {
   id: string;
@@ -1561,47 +1745,6 @@ export interface FindingTrafficDetail {
   response: EvidenceBodyPreview;
 }
 
-/** GET /api/update/check —— 当前版本与 GitHub 最新正式版的比较结果。 */
-export interface UpdateCheck {
-  /** 当前运行的版本；开发构建为 "dev" 或 git describe 的带后缀形式。 */
-  current: string;
-  /** 运行形态。docker 下换装只作用于容器可写层，重建容器会退回镜像版本。 */
-  mode: "docker" | "binary";
-  os: string;
-  arch: string;
-  repo: string;
-  /** 是否存在可回滚的上一版本（artex.old）。 */
-  has_backup: boolean;
-  /** 本次启动时自更新自举的结论（换装失败 / 已回滚等），无事发生时为空。 */
-  boot_notice?: string;
-  rolled_back?: boolean;
-  /** 查询 GitHub 失败时给出原因，此时下面的字段都不会有。 */
-  error?: string;
-  latest?: string;
-  notes?: string;
-  html_url?: string;
-  published_at?: string;
-  /** 当前平台对应的发布包名，以及该 Release 是否真的带了它。 */
-  asset?: string;
-  asset_available?: boolean;
-  size?: number;
-  has_update?: boolean;
-  /** 双方版本号是否可比较；开发构建为 false，此时禁用一键更新。 */
-  comparable?: boolean;
-  /** comparable 为 false 时的说明。 */
-  reason?: string;
-}
-
-/** /api/update/stream 推送的一条更新进度。 */
-export interface UpdateProgress {
-  phase: "idle" | "downloading" | "verifying" | "extracting" | "staged" | "failed";
-  /** 仅下载阶段有意义（0-100）；其余阶段为 -1。 */
-  percent: number;
-  message: string;
-  version?: string;
-  error?: string;
-}
-
 // Original execution selected from an approval, never submitted to the reviewer.
 export interface InterceptExecution {
   conversation_id: number | null;
@@ -1609,4 +1752,118 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- capture-proxy constrained Go tampering hooks (P4.2) ----
+export type TamperHookPhase = "request" | "response";
+
+export interface TamperHookHeaderMatcher {
+  name: string;
+  value_regex?: string;
+}
+
+export interface TamperHookMatchers {
+  methods?: string[];
+  host?: string;
+  url_regex?: string;
+  headers?: TamperHookHeaderMatcher[];
+  body_regex?: string;
+  status?: string[];
+  resp_headers?: TamperHookHeaderMatcher[];
+  resp_body_regex?: string;
+}
+
+export interface TamperHookLastError {
+  class: string;
+  at: string;
+  count: number;
+}
+
+export interface TamperHook {
+  id: number;
+  name: string;
+  enabled: boolean;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  source_sha256: string;
+  version: number;
+  note: string;
+  created_at: string;
+  updated_at: string;
+  load_error?: string;
+  last_error?: TamperHookLastError | null;
+}
+
+export interface TamperHooksListResp {
+  hooks: TamperHook[];
+  enabled_by_env: boolean;
+}
+
+export interface TamperHookVersion {
+  id: number;
+  hook_id: number;
+  version: number;
+  name: string;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  source_sha256: string;
+  note: string;
+  created_at: string;
+}
+
+export interface TamperHookInput {
+  name: string;
+  enabled?: boolean;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  note?: string;
+}
+
+export interface TamperDryRunIO {
+  request: {
+    method: string;
+    url: string;
+    headers: Record<string, string[]>;
+    body: string;
+  };
+  response: {
+    status: number;
+    headers: Record<string, string[]>;
+    body: string;
+  };
+}
+
+export interface TamperDryRunRequest extends TamperDryRunIO {
+  hook_id?: number;
+  name?: string;
+  phase?: TamperHookPhase;
+  matchers?: TamperHookMatchers;
+  source?: string;
+}
+
+export interface TamperTraceLine {
+  Phase: string;
+  SourceKind: string;
+  RuleID: number;
+  HookID: number;
+  HookVersion: number;
+  RuleSnapshot: string;
+  Action: string;
+  Field: string;
+  Outcome: string;
+  Reason: string;
+  BeforeHash: string;
+  AfterHash: string;
+  After: string | null;
+}
+
+export interface TamperDryRunResult extends TamperDryRunIO {
+  changed: boolean;
+  lines: TamperTraceLine[] | null;
 }

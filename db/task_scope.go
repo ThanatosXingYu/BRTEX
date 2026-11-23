@@ -4,14 +4,19 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-// TaskScope is one row of a task's test scope — the coverage denominator and the
-// per-task authorization edge. Rows come either from insertAssets (source='auto',
-// conservative, one per explicitly-inserted asset) or from the add_task_scope tool
-// (source='agent', for company / domain / network / ICP / keyword scope).
+// TaskScope is one row of a task's test scope — coverage scope, not enforced: it is
+// the coverage denominator and the filter for asset queries, and nothing blocks a
+// tool call outside it. Rows come from insertAssets / intent asset_ids (source='auto',
+// conservative, one per explicitly-inserted asset), from the add_task_scope tool
+// (source='agent': the goal targets the decomposer registers, or planner widening),
+// or from the operator (source='manual'). An auto row counts toward coverage only
+// under a declared domain or IP root (a non-auto root_domain/subdomain/ip/cidr row),
+// see declaredScopeFilter.
 type TaskScope struct {
 	ID        int64  `json:"id"`
 	TaskID    int64  `json:"task_id"`
@@ -25,6 +30,7 @@ type TaskScope struct {
 	Value       string `json:"value,omitempty"`
 	Source      string `json:"source"`
 	Reason      string `json:"reason,omitempty"`
+	Expanded    bool   `json:"expanded,omitempty"`
 }
 
 // stripHostPort drops a trailing :port from a host:port / ip:port / [ipv6]:port
@@ -77,17 +83,17 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 		src = "auto"
 	}
 	query := `
-INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
-VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
+INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason, expanded)
+VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''),$9)
 ON CONFLICT DO NOTHING`
 	var (
 		result sql.Result
 		err    error
 	)
 	if s.tx != nil {
-		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason, ts.Expanded)
 	} else {
-		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason, ts.Expanded)
 	}
 	if err != nil {
 		return false, err
@@ -103,8 +109,10 @@ func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
 
 // AddAutoScope records the conservative task scope implied by ONE explicitly-inserted
 // asset item (source='auto'). MUST be called only from insertAssets' top-level loop —
-// never from a db-layer side effect (linkHostAssets), so派生资产不会盲目扩大范围。
+// never from a db-layer side effect (linkHostAssets), so derived assets do not blindly expand the scope.
 // Rule: scope granularity follows the asset's own type. taskID<=0 → no-op.
+// The asset comes from target-derived content, so the row counts toward coverage and
+// list_untested_assets only under a declared domain or IP root (declaredScopeFilter).
 func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip string) error {
 	if taskID <= 0 {
 		return nil
@@ -149,16 +157,16 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 	}
 	ts := TaskScope{TaskID: taskID, Kind: kind, Source: source, Reason: reason}
 	if taskID <= 0 {
-		return ts, fmt.Errorf("需要 task_id")
+		return ts, fmt.Errorf("task_id is required")
 	}
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return ts, fmt.Errorf("value 不能为空")
+		return ts, fmt.Errorf("value must not be empty")
 	}
 	switch kind {
 	case "company":
 		if s.company == nil {
-			return ts, fmt.Errorf("company store 未启用")
+			return ts, fmt.Errorf("company store is not enabled")
 		}
 		var comp *Company
 		var err error
@@ -171,7 +179,7 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 			return ts, err
 		}
 		if comp == nil {
-			return ts, fmt.Errorf("company 不存在: %s（先用 list_companies 确认，或建好企业）", value)
+			return ts, fmt.Errorf("company does not exist: %s (confirm with list_companies first, or create the company)", value)
 		}
 		ts.CompanyID = &comp.ID
 	case "root_domain":
@@ -181,13 +189,13 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 			root = d
 		}
 		if root == "" {
-			return ts, fmt.Errorf("无效根域: %s", value)
+			return ts, fmt.Errorf("invalid root domain: %s", value)
 		}
 		ts.Domain = root
 	case "subdomain":
 		d := DomainKey(stripHostPort(value))
 		if d == "" {
-			return ts, fmt.Errorf("无效子域: %s", value)
+			return ts, fmt.Errorf("invalid subdomain: %s", value)
 		}
 		ts.Domain = d
 	case "ip", "cidr":
@@ -199,10 +207,10 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 			ts.Kind = "cidr"
 		}
 		if v == "" {
-			return ts, fmt.Errorf("无效 ip/cidr: %s", value)
+			return ts, fmt.Errorf("invalid ip/cidr: %s", value)
 		}
 		if _, _, err := net.ParseCIDR(v); err != nil {
-			return ts, fmt.Errorf("无效 ip/cidr: %s", value)
+			return ts, fmt.Errorf("invalid ip/cidr: %s", value)
 		}
 		ts.Net = v
 	case "icp", "keyword":
@@ -212,12 +220,94 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 		}
 		ts.Value = parsed.Value
 	default:
-		return ts, fmt.Errorf("不支持的 kind: %s（company/root_domain/subdomain/ip/cidr/icp/keyword）", kind)
+		return ts, fmt.Errorf("unsupported kind: %s (company/root_domain/subdomain/ip/cidr/icp/keyword)", kind)
+	}
+	if source == "agent" {
+		expanded, err := s.isScopeExpansion(taskID, ts)
+		if err != nil {
+			// The declared scope could not be read, so coverage is unknown:
+			// record the addition as an expansion rather than as in-scope.
+			expanded = true
+		}
+		ts.Expanded = expanded
 	}
 	if err := s.upsertTaskScope(ts); err != nil {
 		return ts, err
 	}
 	return ts, nil
+}
+
+// isScopeExpansion reports whether adding candidate widens an already-declared
+// task scope. When the task has no declared scope yet (initial goal registration)
+// it returns false. When covered by an existing declared root_domain, company,
+// cidr/ip, or exact entry it returns false; otherwise true.
+func (s *AssetStore) isScopeExpansion(taskID int64, candidate TaskScope) (bool, error) {
+	existing, err := s.ListTaskScope(taskID)
+	if err != nil {
+		return false, err
+	}
+	var declared []TaskScope
+	for _, r := range existing {
+		if r.Source != "auto" {
+			declared = append(declared, r)
+		}
+	}
+	if len(declared) == 0 {
+		return false, nil
+	}
+	for _, r := range declared {
+		if scopeRowCovers(r, candidate) {
+			return false, nil
+		}
+	}
+	// Also check if candidate's domain is owned by an already-declared company scope.
+	if candidate.Domain != "" && s.company != nil {
+		for _, r := range declared {
+			if r.Kind == "company" && r.CompanyID != nil && *r.CompanyID > 0 {
+				var matched int
+				err := s.db.QueryRow(
+					`SELECT 1 FROM company_scope WHERE company_id=$1 AND kind IN ('root_domain','subdomain') AND ($2 = value OR $2 LIKE '%.' || value) LIMIT 1`,
+					*r.CompanyID, candidate.Domain,
+				).Scan(&matched)
+				if err == nil && matched == 1 {
+					return false, nil
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func scopeRowCovers(existing, cand TaskScope) bool {
+	switch cand.Kind {
+	case "root_domain", "subdomain":
+		if existing.Domain == "" || cand.Domain == "" {
+			return false
+		}
+		if existing.Kind == "root_domain" {
+			return cand.Domain == existing.Domain || strings.HasSuffix(cand.Domain, "."+existing.Domain)
+		}
+		if existing.Kind == "subdomain" {
+			return cand.Domain == existing.Domain
+		}
+	case "ip", "cidr":
+		if existing.Net == "" || cand.Net == "" {
+			return false
+		}
+		_, eNet, eErr := net.ParseCIDR(existing.Net)
+		cIP, cNet, cErr := net.ParseCIDR(cand.Net)
+		if eErr != nil || cErr != nil {
+			return false
+		}
+		eOnes, eBits := eNet.Mask.Size()
+		cOnes, cBits := cNet.Mask.Size()
+		return eBits == cBits && eOnes <= cOnes && eNet.Contains(cIP)
+	case "company":
+		return existing.Kind == "company" && existing.CompanyID != nil && cand.CompanyID != nil && *existing.CompanyID == *cand.CompanyID
+	case "icp", "keyword":
+		return existing.Kind == cand.Kind && strings.EqualFold(existing.Value, cand.Value)
+	}
+	return false
 }
 
 // DeleteTaskScope removes a single scope row by id, scoped to the given task.
@@ -235,7 +325,7 @@ func (s *AssetStore) DeleteTaskScope(taskID, scopeID int64) (bool, error) {
 func (s *AssetStore) ListTaskScope(taskID int64) ([]TaskScope, error) {
 	rows, err := s.db.Query(`
 SELECT ts.id, ts.kind, COALESCE(ts.company_id,0), COALESCE(c.name,''), COALESCE(ts.domain,''),
-       COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
+       COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,''), COALESCE(ts.expanded,false)
 FROM task_scope ts
 LEFT JOIN companies c ON c.id=ts.company_id
 WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
@@ -247,7 +337,7 @@ WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
 	for rows.Next() {
 		var t TaskScope
 		var cid int64
-		if err := rows.Scan(&t.ID, &t.Kind, &cid, &t.CompanyName, &t.Domain, &t.Net, &t.Value, &t.Source, &t.Reason); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &cid, &t.CompanyName, &t.Domain, &t.Net, &t.Value, &t.Source, &t.Reason, &t.Expanded); err != nil {
 			return nil, err
 		}
 		t.TaskID = taskID
@@ -274,30 +364,55 @@ type CoverageByType struct {
 }
 
 // Coverage is a task's rough asset test coverage — a reference figure for the agent,
-// NOT a precise metric. Denominator = assets matching any active task_scope row;
-// Tested = those anchored to at least one fact node in the exploration.
+// NOT a precise metric. Denominator = assets matching a declared task_scope row or an
+// auto row under a declared domain or IP root (declaredScopeFilter); Tested = those anchored to at
+// least one fact node in the exploration.
 type Coverage struct {
-	Enabled     bool             `json:"enabled"`     // 资产覆盖度功能是否开启；false 时其余字段为零值
-	ScopeRows   int              `json:"scope_rows"`  // 0 → 范围未锚定
-	Denominator int              `json:"denominator"` // 范围内资产数
-	Tested      int              `json:"tested"`      // 已测(约)
-	Pct         *float64         `json:"pct"`         // 覆盖度；分母 0 时 null
-	ByType      []CoverageByType `json:"by_type"`     // 按资产类型的 总数/已测
+	Enabled     bool             `json:"enabled"`     // whether the asset coverage feature is on; when false the other fields are zero
+	ScopeRows   int              `json:"scope_rows"`  // 0 → scope not anchored
+	Denominator int              `json:"denominator"` // number of assets in scope
+	Tested      int              `json:"tested"`      // tested (approximate)
+	Pct         *float64         `json:"pct"`         // coverage; null when the denominator is 0
+	ByType      []CoverageByType `json:"by_type"`     // total/tested per asset type
+	// Coverage ledger (entries, gaps, unexamined, findings_by_class, completeness),
+	// flattened into the same document; nil when the feature is off.
+	*CoverageLedger
 }
 
 // CoverageEnabled reports whether a task has the asset-coverage feature turned on
-// (tasks.coverage_enabled). Missing row / error → true (fail open to the default),
-// so unknown/legacy tasks keep the historical behavior. taskID<=0 → true.
-func (s *AssetStore) CoverageEnabled(taskID int64) bool {
+// (tasks.coverage_enabled). A missing row stays enabled, which is the historical
+// default for unknown and legacy tasks. taskID<=0 stays enabled. A query error is
+// returned with enabled=true so a database blip does not turn the feature off.
+func (s *AssetStore) CoverageEnabled(taskID int64) (bool, error) {
 	if taskID <= 0 {
-		return true
+		return true, nil
 	}
 	var enabled bool
-	if err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled,true) FROM tasks WHERE id=$1`, taskID).Scan(&enabled); err != nil {
-		return true
+	err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled,true) FROM tasks WHERE id=$1`, taskID).Scan(&enabled)
+	if err == sql.ErrNoRows {
+		return true, nil
 	}
-	return enabled
+	if err != nil {
+		return true, err
+	}
+	return enabled, nil
 }
+
+// declaredScopeFilter keeps a task_scope row ts in the coverage match only when it is
+// declared (source<>'auto': goal targets registered through add_task_scope, or manual
+// scope) or when it is an auto row under a domain or IP root the same task declared:
+// the same or a deeper domain of a declared root_domain/subdomain, or a net inside a
+// declared ip/cidr. A declared company, icp or keyword row is not a root here. Auto
+// rows come from target-derived content (insert_assets, intent asset_ids), so
+// anything else stays out of the coverage denominator and list_untested_assets.
+const declaredScopeFilter = `(ts.source <> 'auto' OR EXISTS (
+    SELECT 1 FROM task_scope d
+    WHERE d.task_id = ts.task_id AND d.source <> 'auto' AND (
+         (d.kind IN ('root_domain','subdomain') AND ts.domain IS NOT NULL
+          AND (ts.domain = d.domain OR right(ts.domain, length(d.domain)+1) = '.' || d.domain))
+      OR (d.kind IN ('ip','cidr') AND ts.net IS NOT NULL AND ts.net <<= d.net)
+    )
+  ))`
 
 // task_scope→assets match predicate, reused by the count / by-type / untested queries. $1=taskID.
 const covTargetCTE = `
@@ -314,7 +429,7 @@ target AS (
          lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
          OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
        ))
-  )
+  ) AND ` + declaredScopeFilter + `
 ),
 tested AS (
   SELECT DISTINCT ea.asset_id
@@ -508,16 +623,44 @@ ORDER BY a.id`, taskID)
 			}
 		}
 	}
+	// One query for every missing root instead of one per root.
+	roots := make([]string, 0, len(missingRoots))
 	for root := range missingRoots {
-		var id, companyID int64
-		err := s.db.QueryRow(`SELECT id, COALESCE(company_id,0) FROM assets
-WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	type rootRow struct{ id, companyID int64 }
+	rootRows := map[string]rootRow{}
+	if len(roots) > 0 {
+		rrows, err := s.db.Query(`SELECT domain, id, COALESCE(company_id,0) FROM assets
+WHERE type='root_domain' AND domain=ANY($1::text[]) ORDER BY id`, roots)
+		if err != nil {
+			return nil, err
+		}
+		for rrows.Next() {
+			var domain string
+			var r rootRow
+			if err := rrows.Scan(&domain, &r.id, &r.companyID); err != nil {
+				rrows.Close()
+				return nil, err
+			}
+			if _, ok := rootRows[domain]; !ok {
+				rootRows[domain] = r
+			}
+		}
+		err = rrows.Err()
+		rrows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, root := range roots {
 		var node CoverageGraphNode
-		if err == nil && id > 0 {
-			node = CoverageGraphNode{Key: assetKey(id), Kind: "root_domain", AssetID: id,
-				CompanyID: companyID, Domain: root, Label: root}
-			if companyID > 0 {
-				companyIDs[companyID] = true
+		if r, ok := rootRows[root]; ok && r.id > 0 {
+			node = CoverageGraphNode{Key: assetKey(r.id), Kind: "root_domain", AssetID: r.id,
+				CompanyID: r.companyID, Domain: root, Label: root}
+			if r.companyID > 0 {
+				companyIDs[r.companyID] = true
 			}
 		} else {
 			node = CoverageGraphNode{Key: "r:" + root, Kind: "root_domain", Domain: root, Label: root}
@@ -526,18 +669,34 @@ WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
 		rootByDomain[root] = node.Key
 	}
 
-	// Company nodes for every referenced company id — always gray context.
+	// Company nodes for every referenced company id — always gray context. One
+	// query for all of them; an id with no company row gets no node.
+	ids := make([]int64, 0, len(companyIDs))
 	for id := range companyIDs {
-		key := companyKey(id)
-		if _, ok := byKey[key]; ok {
-			continue
+		if _, ok := byKey[companyKey(id)]; !ok {
+			ids = append(ids, id)
 		}
-		var name string
-		if err := s.db.QueryRow(`SELECT name FROM companies WHERE id=$1`, id).Scan(&name); err != nil {
-			continue
+	}
+	if len(ids) > 0 {
+		crows, err := s.db.Query(`SELECT id, name FROM companies WHERE id=ANY($1::bigint[]) ORDER BY id`, ids)
+		if err != nil {
+			return nil, err
 		}
-		add(CoverageGraphNode{Key: key, Kind: "company", CompanyID: id,
-			Label: name, AssetID: 0})
+		for crows.Next() {
+			var id int64
+			var name string
+			if err := crows.Scan(&id, &name); err != nil {
+				crows.Close()
+				return nil, err
+			}
+			add(CoverageGraphNode{Key: companyKey(id), Kind: "company", CompanyID: id,
+				Label: name, AssetID: 0})
+		}
+		err = crows.Err()
+		crows.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Derived containment edges (only when the parent node exists).

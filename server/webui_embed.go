@@ -21,6 +21,12 @@ var webuiDist embed.FS
 // webuiHandler serves the embedded SPA. Public (no JWT) — auth is enforced
 // client-side and on /api. Serves the exported per-route index.html files and
 // falls back to index.html so client-side routing still resolves unknown paths.
+//
+// Responses carry an ETag and, for the content-hashed Next chunks, immutable
+// caching; compressible bodies are gzipped when the client accepts it. See
+// webui_assets.go for why (embed.FS has no mtime, so the previous
+// http.ServeFileFS path emitted no validator at all and re-sent ~1.5 MB of
+// assets on every load).
 func (s *Server) webuiHandler() http.Handler {
 	root, err := fs.Sub(webuiDist, "webui/dist")
 	if err != nil {
@@ -34,27 +40,14 @@ func (s *Server) webuiHandler() http.Handler {
 		// 1) exact file (assets: _next/*, favicon.ico, ...)
 		// 2) route dir → <p>/index.html (trailingSlash export)
 		// 3) <p>.html
-		// 4) SPA 兜底 → index.html（交给客户端路由）
+		// 4) SPA fallback → index.html (hand it to client-side routing)
 		for _, cand := range []string{p, p + "/index.html", p + ".html"} {
-			if serveFileIfExists(w, r, root, cand) {
+			if serveWebAsset(w, r, root, cand, webuiImmutable(cand)) {
 				return
 			}
 		}
-		http.ServeFileFS(w, r, root, "index.html")
+		if !serveWebAsset(w, r, root, "index.html", false) {
+			http.NotFound(w, r)
+		}
 	})
-}
-
-// serveFileIfExists serves name from fsys when it exists as a regular file.
-func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name string) bool {
-	f, err := fsys.Open(name)
-	if err != nil {
-		return false
-	}
-	st, statErr := f.Stat()
-	_ = f.Close()
-	if statErr != nil || st.IsDir() {
-		return false
-	}
-	http.ServeFileFS(w, r, fsys, name)
-	return true
 }

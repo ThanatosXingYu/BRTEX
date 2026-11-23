@@ -2,15 +2,18 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -24,11 +27,11 @@ func jsonResult(v any) (actool.Result, error) {
 	return actool.Text(string(b)), nil
 }
 
-// 本文件实现 P2「跨任务编排工具集」(docs/跑分编排 §2 P2)。这些是 host 工具——需要
-// 访问 Manager(任意任务的 Store)、Engine(暂停)、以及建任务流程,所以住在 server 层。
-// 读类工具把「现有 per-task 工具」重定向到目标任务的 store 上跑(建一个临时 ToolSet
-// 并 Call 其对应工具),从而复用完全相同的逻辑;控制类(spawn/pause)直接调 Manager/Engine。
-// 它们像流量工具一样 seed 进 tools 表、按 agent 绑定(只绑给编排 agent 才可见)。
+// This file implements the P2 "cross-task orchestration tool set" (docs/benchmark-orchestration §2 P2). These are host tools — they need
+// access to the Manager (any task's Store), the Engine (pause), and the task-creation flow, so they live in the server layer.
+// Read tools redirect "the existing per-task tools" to run against the target task's store (build a temporary ToolSet
+// and Call its corresponding tool), reusing exactly the same logic; control tools (spawn/pause) call Manager/Engine directly.
+// Like the traffic tools, they are seeded into the tools table and bound per agent (visible only to agents they are bound to).
 
 // hostTools is the runtime host-tool provider fed to ToolAugment: traffic tools
 // (gated by capture) + cross-task orchestration tools + user-defined custom tools.
@@ -40,10 +43,10 @@ func jsonResult(v any) (actool.Result, error) {
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
-	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.platformTools()...) // platform operation tools (create/edit skills/tools/MCP, for Auto)
 	custom, err := s.customTools()
 	if err != nil {
-		log.Printf("[custom-tool] 加载失败: %v", err)
+		log.Printf("[custom-tool] load failed: %v", err)
 		return tools, nil
 	}
 	tools = append(tools, custom...)
@@ -152,11 +155,11 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 	}
 	_ = json.Unmarshal(in, &head)
 	if strings.TrimSpace(head.TaskID) == "" {
-		return actool.Errorf("task_id 为必填"), nil
+		return actool.Errorf("task_id is required"), nil
 	}
 	t, ok := s.m.Task(head.TaskID)
 	if !ok {
-		return actool.Errorf("task 不存在: " + head.TaskID), nil
+		return actool.Errorf("task not found: " + head.TaskID), nil
 	}
 	var m map[string]json.RawMessage
 	_ = json.Unmarshal(in, &m)
@@ -166,8 +169,8 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 	if s.m.Assets() != nil {
 		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
 	}
-	tsx.SetNotify(t.Notify)         // 通用唤醒（无专用回调的写操作走它；读工具为 no-op）
-	tsx.SetNotifyHint(t.NotifyHint) // add_hint → 记一条「人新增了 N 条战略提示：…」触发并唤醒 planner
+	tsx.SetNotify(t.Notify)         // generic wake-up (write ops without a dedicated callback go through it; no-op for read tools)
+	tsx.SetNotifyHint(t.NotifyHint) // add_hint → records an "orchestrator added N strategic hints: ..." entry and wakes the planner
 	return pick(tsx).Call(ctx, inner, nil)
 }
 
@@ -175,7 +178,7 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 
 func (s *Server) toolListTasks() actool.CoreTool {
 	return roTool("list_tasks",
-		"列出所有任务(id/描述/目标/状态/运行时长/父任务/LLM 配置)，编排 agent 用它掌握全局、看哪些任务卡太久、各自用哪个 LLM。运行时长：运行中=创建→现在，终态=创建→最后活动(秒)。llm_profile：任务 planner/worker 用的配置名，(激活配置)=跟随全局激活。",
+		"List all tasks (id/description/goal/status/run duration/parent task/LLM profile). The orchestration agent uses it to keep the big picture, see which tasks have been stuck too long, and which LLM each task uses. Run duration: running = created→now, terminal = created→last activity (seconds). llm_profile: the profile name used by the task's planner/worker; (active profile) = follows the global active one.",
 		objSchema(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			lastAct, _ := s.m.PG().LastActivityAll()
@@ -205,11 +208,11 @@ func (s *Server) toolListTasks() actool.CoreTool {
 				}
 				llmState := t.llmStateSnapshot()
 				if llmState.ProfileID == nil {
-					row["llm_profile"] = "(激活配置)"
+					row["llm_profile"] = "(active profile)"
 				} else if n, ok := profName[*llmState.ProfileID]; ok {
 					row["llm_profile"] = n
 				} else {
-					row["llm_profile"] = fmt.Sprintf("#%d(已删除)", *llmState.ProfileID)
+					row["llm_profile"] = fmt.Sprintf("#%d(deleted)", *llmState.ProfileID)
 				}
 				out = append(out, row)
 			}
@@ -221,7 +224,7 @@ func (s *Server) toolListTasks() actool.CoreTool {
 // orchestration agent can pick one for spawn_task's llm_profile. Never leaks keys.
 func (s *Server) toolListLLMProfiles() actool.CoreTool {
 	return roTool("list_llm_profiles",
-		"列出可用的 LLM 配置(profile)：id、名称、模型、格式、是否为当前激活配置。用 id 给 spawn_task 的 llm_profile_id 参数指定子任务专属 LLM（如侦察用便宜模型、利用用强模型）。不含 API Key。",
+		"List the available LLM profiles: id, name, model, format, and whether one is the currently active profile. Use the id for spawn_task's llm_profile_id parameter to give a subtask its own LLM (e.g. a cheap model for recon, a strong model for exploitation). Never includes API keys.",
 		objSchema(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			profs, err := s.m.pg.ListProfiles()
@@ -240,18 +243,18 @@ func (s *Server) toolListLLMProfiles() actool.CoreTool {
 
 func (s *Server) toolSpawnTask() actool.CoreTool {
 	return wrTool("spawn_task",
-		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。",
+		"Create a subtask and start its exploration engine; returns task_id. Use it to spin one piece of work (e.g. a challenge/a goal) off into an independent task. parent_ref is optional: set the parent task id of the current orchestration to link parent and child.",
 		objSchema(map[string]any{
-			"description":            strParam("任务描述(简短标题)"),
-			"goal":                   strParam("任务目标(要达成什么)"),
-			"parent_ref":             strParam("可选：父任务 id(做父子关联)"),
-			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("可选：只读继承的来源任务 id 列表(最多 %d 个)。子任务可只读引用这些任务已探明的资产/结论作为起点；与 parent_ref 的纯父子指针不同，这是内容继承。", db.MaxTaskSourceCount)},
-			"llm_profile_id":         map[string]any{"type": "integer", "description": "可选：指定本子任务 planner/worker 用的 LLM 配置 id(见 list_llm_profiles)；留空则继承父任务、再回退全局激活配置"},
-			"timeout_seconds":        map[string]any{"type": "integer", "description": "可选：任务级超时(秒)。到点后触发优雅收尾并进入 timeout 终态；留空或 0 = 不限时"},
-			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "可选：planner 心跳触发间隔(秒)。距上轮规划结束/任务开始满该值且期间无触发 → 触发一轮规划(兜底死锁 + 唤醒去监督飞行中的 worker)。留空或 0 = 默认 600(10min)；"},
-			"seed_first_intent":      map[string]any{"type": "boolean", "description": "可选：对于简单任务可开启，创建时直接下发一条种子意图(内容=描述+目标)让 worker 免等首轮 planner 直接开跑测试；默认 false(走标准先规划再执行)。"},
+			"description":            strParam("task description (short title)"),
+			"goal":                   strParam("task goal (what to achieve)"),
+			"parent_ref":             strParam("optional: parent task id (for parent-child linking)"),
+			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("optional: ids of source tasks to inherit read-only (at most %d). The subtask may read the assets/conclusions those tasks already explored as its starting point; unlike parent_ref's plain parent-child pointer, this is content inheritance.", db.MaxTaskSourceCount)},
+			"llm_profile_id":         map[string]any{"type": "integer", "description": "optional: the LLM profile id this subtask's planner/worker uses (see list_llm_profiles); empty inherits the parent task, then falls back to the global active profile"},
+			"timeout_seconds":        map[string]any{"type": "integer", "description": "optional: task-level timeout (seconds). When it fires, a graceful wrap-up runs and the task enters the timeout terminal state; empty or 0 = no time limit"},
+			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "optional: planner heartbeat interval (seconds). When this much time has passed since the last planning round ended/the task started with no trigger in between → run one planning round (deadlock backstop + wakes the planner to supervise in-flight workers). Empty or 0 = default 600 (10min);"},
+			"seed_first_intent":      map[string]any{"type": "boolean", "description": "optional: enable for simple tasks to issue one seed intent at creation (content = description + goal) so a worker can start testing right away without waiting for the first planner round; default false (the standard plan-then-execute flow)."},
 		}, "description", "goal"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Description          string          `json:"description"`
 				Goal                 string          `json:"goal"`
@@ -264,27 +267,27 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Description) == "" {
-				a.Description = "未命名任务"
+				a.Description = "Unnamed task"
 			}
 			if strings.TrimSpace(a.Goal) == "" {
-				return actool.Errorf("goal 为必填"), nil
+				return actool.Errorf("goal is required"), nil
 			}
 			if a.TimeoutSeconds < 0 {
 				a.TimeoutSeconds = 0
 			}
-			// 只读继承来源任务：数量上限 + 每个 id 有效/去重/存在，校验规则与 HTTP 建任务一致。
+			// Read-only source-task inheritance: count cap + each id valid/deduped/existing, the same validation rules as HTTP task creation.
 			if len(a.SourceTaskIDs) > db.MaxTaskSourceCount {
-				return actool.Errorf(fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount)), nil
+				return actool.Errorf(fmt.Sprintf("at most %d source tasks may be selected", db.MaxTaskSourceCount)), nil
 			}
 			sourceIDs := make([]int64, 0, len(a.SourceTaskIDs))
 			seenSources := map[int64]bool{}
 			for _, raw := range a.SourceTaskIDs {
 				id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 				if err != nil || id <= 0 || seenSources[id] {
-					return actool.Errorf("关联任务 id 无效或重复"), nil
+					return actool.Errorf("invalid or duplicate source task id"), nil
 				}
 				if _, ok := s.m.Task(strconv.FormatInt(id, 10)); !ok {
-					return actool.Errorf(fmt.Sprintf("关联任务 #%d 不存在", id)), nil
+					return actool.Errorf(fmt.Sprintf("source task #%d not found", id)), nil
 				}
 				seenSources[id] = true
 				sourceIDs = append(sourceIDs, id)
@@ -293,7 +296,7 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			var pin *int64
 			if id := parseProfileID(a.LLMProfileID); id > 0 {
 				if _, ok := s.loadProfileConfig(id); !ok {
-					return actool.Errorf(fmt.Sprintf("LLM 配置 #%d 不存在或未设置 API Key", id)), nil
+					return actool.Errorf(fmt.Sprintf("LLM profile #%d not found or not usable (no API key for the key-requiring formats)", id)), nil
 				}
 				pin = &id
 			} else if a.ParentRef != "" {
@@ -305,11 +308,32 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
+			// Target gate: a child spawned from a gated scope is gated too, and keeps
+			// the block rules of the calling task. Read from the caller's scope, never
+			// from parent_ref (optional and written by the model). Pins and allow rules
+			// are never copied. Gate-off caller or no scope: created as before.
+			var gate *bool
+			var blockRules []db.TaskInterceptRuleInput
+			if scope, ok := intercept.TargetScopeFromContext(ctx); ok && scope.Enabled != nil && scope.Enabled() {
+				on := true
+				gate = &on
+				if callerID, err := strconv.ParseInt(scope.TaskID, 10, 64); err == nil && callerID > 0 {
+					block, _, err := s.m.Assets().TaskInterceptRulesSplit(callerID)
+					if err != nil {
+						return actool.Errorf("read the block rules of the calling task: " + err.Error()), nil
+					}
+					for _, r := range block {
+						blockRules = append(blockRules, db.TaskInterceptRuleInput{Enabled: r.Enabled, Action: r.Action, Kind: r.Kind, Pattern: r.Pattern, Note: r.Note})
+					}
+				}
+			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
+				InterceptRules:       blockRules,
+				TargetGate:           gate,
 			})
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -320,17 +344,17 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 					_ = s.m.PG().SetParentRef(id, a.ParentRef)
 				}
 			}
-			// 共享的建后流程,与 HTTP 建任务(server.go createTask)复用同一段 launchTask:
-			// seed + 后台可见地做目标分解(第0轮/LLM步骤/逐条goal) + engine.Run。
-			// seed_first_intent 默认 false(标准先规划再执行);简单任务可开启直接下发一 work 测试。
+			// Shared post-create flow: HTTP task creation (server.go createTask) reuses this same launchTask:
+			// seed + a visibly-in-background goal decomposition (round 0 / LLM steps / per-goal) + engine.Run.
+			// seed_first_intent defaults to false (the standard plan-then-execute flow); simple tasks may enable it to issue one work test directly.
 			s.launchTask(t, a.Description+" "+a.Goal, a.SeedFirstIntent)
 			return actool.Text(fmt.Sprintf("task created: %s", t.ID)), nil
 		})
 }
 
 func (s *Server) toolPauseTask() actool.CoreTool {
-	return wrTool("pause_task", "暂停指定任务(停止其 planner/worker 循环)。",
-		objSchema(map[string]any{"task_id": strParam("要暂停的任务 id")}, "task_id"),
+	return wrTool("pause_task", "Pause the given task (stops its planner/worker loops).",
+		objSchema(map[string]any{"task_id": strParam("the id of the task to pause")}, "task_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				TaskID string `json:"task_id"`
@@ -338,7 +362,7 @@ func (s *Server) toolPauseTask() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			t, ok := s.m.Task(a.TaskID)
 			if !ok {
-				return actool.Errorf("task 不存在: " + a.TaskID), nil
+				return actool.Errorf("task not found: " + a.TaskID), nil
 			}
 			if _, err := s.applyTaskControlWithCause(t, "pause", agent.AbortPausedByOrchestrator); err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -348,30 +372,30 @@ func (s *Server) toolPauseTask() actool.CoreTool {
 }
 
 func (s *Server) toolGetTaskGraph() actool.CoreTool {
-	return roTool("get_task_graph", "读指定任务的探索图总览(同 graph_overview：资产计数/frontier/发现/覆盖等)，用 task_id 指定任务。",
-		objSchema(map[string]any{"task_id": strParam("任务 id")}, "task_id"),
+	return roTool("get_task_graph", "Read the exploration-graph overview of the given task (same as graph_overview: asset counts / frontier / findings / coverage etc.), selecting the task via task_id.",
+		objSchema(map[string]any{"task_id": strParam("task id")}, "task_id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).GraphOverviewTool)
 		})
 }
 
 func (s *Server) toolListTaskFindings() actool.CoreTool {
-	return roTool("list_task_findings", "读指定任务的确认漏洞(含 flag/PoC；每条带 id/task_id/intent_id/vulnclass/severity/摘要/状态)，用 task_id 指定任务。",
-		objSchema(map[string]any{"task_id": strParam("任务 id")}, "task_id"),
+	return roTool("list_task_findings", "Read the confirmed vulnerabilities of the given task (with flags/PoCs; each carries id/task_id/intent_id/vulnclass/severity/summary/status), selecting the task via task_id.",
+		objSchema(map[string]any{"task_id": strParam("task id")}, "task_id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).ListFindingsTool)
 		})
 }
 
 func (s *Server) toolAddHint() actool.CoreTool {
-	return wrTool("add_task_hint", "给指定任务注入战略提示(该任务的 planner 下轮生成意图时会读到)。\n"+
-		"★优先批量：多条提示放进 hints 数组一次提交（返回 ids 数组，与 hints 等长同序，失败项 id=0）；单条则省略 hints 直接给顶层 text。",
+	return wrTool("add_task_hint", "Inject a strategic hint into the given task (that task's planner will read it when generating intents next round).\n"+
+		"★Batch first: submit several hints at once in the hints array (returns an ids array, same length and order as hints, failed entries id=0); for a single hint, omit hints and pass the top-level text directly.",
 		objSchema(map[string]any{
-			"task_id":      strParam("任务 id"),
-			"hints":        map[string]any{"type": "array", "description": "【优先用这个】提示数组，每个元素字段同顶层（text/asset_ids/traffic_refs）。", "items": objSchema(map[string]any{"text": strParam("提示内容"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": agent.HintTrafficSchema()})},
-			"text":         strParam("[单条] 提示内容"),
+			"task_id":      strParam("task id"),
+			"hints":        map[string]any{"type": "array", "description": "[Prefer this] Array of hints; each element has the same fields as the top level (text/asset_ids/traffic_refs).", "items": objSchema(map[string]any{"text": strParam("hint text"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": agent.HintTrafficSchema()})},
+			"text":         strParam("[single] hint text"),
 			"traffic_refs": agent.HintTrafficSchema(),
-			"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "锚定的资产 id（可选，0/1/多个；该任务内的资产 id）"},
+			"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "anchored asset ids (optional, 0/1/many; asset ids within that task)"},
 		}, "task_id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).AddHintTool)
@@ -380,11 +404,11 @@ func (s *Server) toolAddHint() actool.CoreTool {
 
 func (s *Server) toolGetWorkerTrace() actool.CoreTool {
 	return roTool("get_task_worker_trace",
-		"看指定任务里某个 work(意图)的执行过程：get_task_worker_trace(task_id, intent_id) 看步骤摘要；再带 step_ids=[...] 取那几步完整内容(一次最多 5 个,多传只返回前 5 个)。",
+		"View how one work (intent) in the given task ran: get_task_worker_trace(task_id, intent_id) shows step summaries; then pass step_ids=[...] to fetch the full content of those steps (at most 5 per call; passing more returns only the first 5).",
 		objSchema(map[string]any{
-			"task_id":   strParam("任务 id"),
-			"intent_id": map[string]any{"type": "integer", "description": "意图 id(该任务里的 work)"},
-			"step_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：要取完整内容的步骤 id(一次最多 5 个,多传只返回前 5 个,其余在 omitted_step_ids 里列出)"},
+			"task_id":   strParam("task id"),
+			"intent_id": map[string]any{"type": "integer", "description": "intent id (the work within that task)"},
+			"step_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "optional: step ids to fetch full content for (at most 5 per call; passing more returns only the first 5, the rest are listed in omitted_step_ids)"},
 		}, "task_id", "intent_id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).GetWorkerTraceTool)
@@ -392,16 +416,16 @@ func (s *Server) toolGetWorkerTrace() actool.CoreTool {
 }
 
 func (s *Server) toolListWorkerTraces() actool.CoreTool {
-	return roTool("list_task_worker_traces", "列出指定任务里跑过哪些 work(意图) + 各自步数，用于发现哪些 work 值得翻看(再用 get_task_worker_trace)。",
-		objSchema(map[string]any{"task_id": strParam("任务 id")}, "task_id"),
+	return roTool("list_task_worker_traces", "List which works (intents) have run in the given task + each one's step count, to find which works are worth reviewing (then use get_task_worker_trace).",
+		objSchema(map[string]any{"task_id": strParam("task id")}, "task_id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).ListWorkerTracesTool)
 		})
 }
 
 func (s *Server) toolSearchWorkerTraces() actool.CoreTool {
-	return roTool("search_task_worker_traces", "在指定任务里按关键字搜索所有 work 的执行过程(返回命中步骤摘要 + intent_id)。",
-		objSchema(map[string]any{"task_id": strParam("任务 id"), "q": strParam("搜索关键字")}, "task_id", "q"),
+	return roTool("search_task_worker_traces", "Search the execution traces of all works in the given task by keyword (returns matching step summaries + intent_id).",
+		objSchema(map[string]any{"task_id": strParam("task id"), "q": strParam("search keyword")}, "task_id", "q"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).SearchWorkerTracesTool)
 		})
@@ -409,10 +433,10 @@ func (s *Server) toolSearchWorkerTraces() actool.CoreTool {
 
 func (s *Server) toolGetTaskNodeDetail() actool.CoreTool {
 	return roTool("get_task_node_detail",
-		"读指定任务里某个探索图节点的完整内容(发现/事实/意图/目标：摘要 + 详情/证据/PoC)。id 为探索节点 id(如 report_finding 返回、或 list_task_findings 里的 id)。写漏洞报告前用它取该漏洞的完整证据。",
+		"Read the full content of one exploration-graph node in the given task (finding/fact/intent/goal: summary + details/evidence/PoC). id is the exploration node id (e.g. as returned by report_finding, or the id in list_task_findings). Use it to fetch a vulnerability's full evidence before writing its report.",
 		objSchema(map[string]any{
-			"task_id": strParam("任务 id"),
-			"id":      map[string]any{"type": "integer", "description": "探索图节点 id(非资产 id)"},
+			"task_id": strParam("task id"),
+			"id":      map[string]any{"type": "integer", "description": "exploration-graph node id (not an asset id)"},
 		}, "task_id", "id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			return s.delegateToTask(ctx, in, (*agent.ToolSet).NodeDetailTool)
@@ -425,31 +449,62 @@ func (s *Server) toolGetTaskNodeDetail() actool.CoreTool {
 // task-agnostic, so this host tool needs no task_id / exploration store.
 func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 	return wrTool("update_finding_report",
-		"为已登记的漏洞写入/更新【详细报告】(Markdown 全文,整段覆盖旧内容)。finding_id 传 report_finding 返回的那个 id(\"finding recorded: <id>\" 里的数字)。报告建议包含:漏洞概述、影响与危害、复现步骤、证据/PoC、修复建议。",
+		"Write/update the [detailed report] of a registered vulnerability (full Markdown text, replaces the old content wholesale). Pass as finding_id the id report_finding returned (the number in \"finding recorded: <id>\"). A report should cover: vulnerability overview, impact and harm, reproduction steps, evidence/PoC, and fix recommendations.",
 		objSchema(map[string]any{
-			"finding_id":       map[string]any{"type": "integer", "description": "目标漏洞 id(report_finding 返回的 id)"},
-			"report":           strParam("详细报告全文,Markdown 格式"),
-			"evidence_version": map[string]any{"type": "integer", "description": "get_finding_traffic 返回的证据 version；用于防止报告覆盖新的证据变更"},
+			"finding_id":       map[string]any{"type": "integer", "description": "target vulnerability id (the id returned by report_finding)"},
+			"report":           strParam("full report text, Markdown format"),
+			"evidence_version": map[string]any{"type": "integer", "description": "evidence version returned by get_finding_traffic; prevents the report from overwriting newer evidence changes"},
+			"poe_level":        map[string]any{"type": "integer", "description": "proof-of-exploitation level 0-4: 1 error/timing/response variation, 2 structural manipulation, 3 actual data extracted, 4 critical impact. L3 is the minimum for verified. Omit or 0 when not proven."},
+			"evidence_quotes":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "exact lines copied from a bound proof/verification response body (get_finding_traffic). Never from memory; the server checks each one verbatim after whitespace normalization."},
 		}, "finding_id", "report"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				EvidenceVersion *int64          `json:"evidence_version"`
 				FindingID       json.RawMessage `json:"finding_id"`
 				Report          string          `json:"report"`
+				PoELevel        *int            `json:"poe_level"`
+				EvidenceQuotes  []string        `json:"evidence_quotes"`
 			}
 			_ = json.Unmarshal(in, &a)
-			nodeID := parseProfileID(a.FindingID) // 复用「数字或数字字符串」解析
+			nodeID := parseProfileID(a.FindingID) // reuses the "number or numeric string" parser
 			if nodeID <= 0 {
-				return actool.Errorf("finding_id 无效"), nil
+				return actool.Errorf("invalid finding_id"), nil
+			}
+			poe := 0
+			if a.PoELevel != nil {
+				poe = *a.PoELevel
+			}
+			if poe < 0 || poe > 4 {
+				return actool.Errorf(fmt.Sprintf("invalid poe_level %d (want 0-4)", poe)), nil
+			}
+			notFound := actool.Errorf(fmt.Sprintf("no vulnerability record found for finding_id=%d (register it with report_finding first)", nodeID))
+			findingID, err := s.m.pg.FindingIDByNodeID(nodeID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return notFound, nil
+			}
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			n, err := s.m.pg.SetFindingReportVersionByNodeID(ctx, nodeID, a.Report, a.EvidenceVersion)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if n == 0 {
-				return actool.Errorf(fmt.Sprintf("未找到 finding_id=%d 对应的漏洞记录(先用 report_finding 登记)", nodeID)), nil
+				return notFound, nil
 			}
-			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
+			// The report is saved above; verification only decides the status. A
+			// downgrade is recorded and reported, never used to drop the report.
+			status, note := s.assessFindingVerification(ctx, findingID, poe, a.EvidenceQuotes)
+			if err := s.m.pg.SetFindingVerification(findingID, status, poe, note); err != nil {
+				return actool.Errorf("report saved, but verification not recorded: " + err.Error()), nil
+			}
+			msg := fmt.Sprintf("finding %d report updated (%d chars)\nverification: %s", nodeID, len(a.Report), status)
+			if status == db.VerificationVerified {
+				msg += fmt.Sprintf(" (POE L%d)", poe)
+			} else {
+				msg += " - " + note + "\nwarning: the report is saved but the finding is not verified. To reach verified, declare poe_level 3 or 4 and pass exact quotes copied from a bound proof/verification response body."
+			}
+			return actool.Text(msg), nil
 		})
 }
 
@@ -471,8 +526,8 @@ func (s *Server) deriveTaskStatus(t *Task) string {
 // are bindable per-agent (default: bound to nobody — opt-in for orchestration
 // agents). First-insert only, like the traffic seeds.
 func (s *Server) seedOrchestrationTools() {
-	// task-op + platform tools default-bind to the built-in Auto agent (它天生用来
-	// 操作平台)。SeedTool 首插入生效;老库已 seed 的行由 seedAutoDefaultBindings 补绑。
+	// task-op + platform tools default-bind to the built-in Auto agent (it exists to
+	// operate the platform). SeedTool takes effect on first insert; rows already seeded in old DBs get the binding backfilled by seedAutoDefaultBindings.
 	autoAgents, _ := json.Marshal([]string{"auto"})
 	for _, t := range s.orchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
@@ -484,33 +539,125 @@ func (s *Server) seedOrchestrationTools() {
 	}
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
-		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
+		bindings := autoAgents
+		if t.Name() == "mcp_status" {
+			// health visibility is for the executors too, not just the platform agent
+			bindings = json.RawMessage(`["auto","worker","pentest"]`)
+		}
+		if t.Name() == "ask_operator" {
+			// operator input requests are an executor concern (captcha/OTP walls)
+			bindings = json.RawMessage(`["worker","pentest"]`)
+		}
+		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, bindings)
 	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerDefaultBindings()
 	s.seedPlannerListAssetsBinding()
 	s.seedCompanyScopeRebind()
-	s.seedWorkerReadToolsUnbind() // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
-	s.seedWorkerReadbackRebind()  // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
+	s.seedWorkerReadToolsUnbind()  // list_facts/list_companies/list_worker_traces unbound from worker's defaults (one-time)
+	s.seedWorkerReadbackRebind()   // repairs an old migration's wrong removal: re-binds search_all_worker_traces/get_worker_trace/node_detail back onto worker (one-time)
+	s.seedTaskCredentialBindings() // save/list_task_credential onto worker + pentest (one-time, #3)
+	s.healListTaskCredentialsSchema()
 	s.seedAutoReportFindingBinding()
 	s.unbindGoalMetDefault()
-	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
-	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
-	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
-	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
-	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
-	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
-	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
+	s.reseedGoalsPrompt()             // goals prompt gains the "extract operation constraints" step → old DBs append a new default version (one-time)
+	s.reseedMainAgentPrompt()         // mainagent prompt gains "after goals are met, ask via add_intent whether to register a goal" (one-time)
+	s.reseedPlannerPrompt()           // planner prompt: rewrites the "zero intents" justification rules + adds quantitative acceptance checks (one-time)
+	s.reseedWorkerPrompt()            // worker prompt: adds the evidence bar for negative conclusions (one-time)
+	s.seedReporterAgent()             // seeds the "report writer" agent + tool bindings + finding trigger (one-time)
+	s.upgradeReporterTriggerMessage() // backfill migration for old DBs: makes the reporter send evidence_version back (one-time)
+	s.seedFindingTrafficTools()       // adds optional evidence params and read-only evidence tools, preserving user config
 	s.seedFindingWorkflowTools()
-	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
-	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
-	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
+	s.seedFindingVerificationSchema() // S1: poe_level / evidence_quotes on update_finding_report, added once per DB
+	s.seedFindingEvidenceSchema()     // optional counterevidence / confidence_rationale on report_finding, added once per DB
+	s.seedFactInputSchema()           // restore record_fact single/batch contracts
+	s.seedFactSourceSchema()          // source enum on record_fact, added once per DB
+	s.refreshRecordFactContract()     // record_fact publishes the facts-only contract (one-time)
+	s.seedTaskScopeDescription()      // add_task_scope: "coverage scope, not enforced" replaces the authorization-boundary text
+	// Note: pentest's default tool bindings need no migration — BuiltinToolSeeds already seeds
+	// list_assets/insert_assets/report_finding/list_findings/list_companies together with
+	// pentest at fresh initialization (no old DBs exist in this project, so no migration).
+}
+
+// seedFactSourceSchema adds the source property (closed enum) to the record_fact
+// schema of existing databases (SeedTool is first-insert only, and ToolResolve
+// serves the stored schema, so without this the model would never see the enum).
+// Idempotent: the property is added only when the stored schema lacks it, and user
+// edits are preserved.
+func (s *Server) seedFactSourceSchema() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "record_fact" {
+			continue
+		}
+		raw, err := json.Marshal(seed.Schema)
+		if err != nil {
+			log.Printf("[facts] record_fact schema: %v", err)
+			return
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return
+		}
+		var properties map[string]json.RawMessage
+		if err := json.Unmarshal(obj["properties"], &properties); err != nil {
+			return
+		}
+		// The source enum lives on the facts[] items (facts-only contract); the
+		// top level has no fact fields any more.
+		var facts map[string]json.RawMessage
+		var items map[string]json.RawMessage
+		var itemProps map[string]json.RawMessage
+		if err := json.Unmarshal(properties["facts"], &facts); err != nil {
+			return
+		}
+		if err := json.Unmarshal(facts["items"], &items); err != nil {
+			return
+		}
+		if err := json.Unmarshal(items["properties"], &itemProps); err != nil || len(itemProps["source"]) == 0 {
+			return
+		}
+		_, err = s.m.pg.Exec(`UPDATE tools SET schema=jsonb_set(schema,ARRAY['properties','facts','items','properties','source'],$1::jsonb,true),updated_at=now()
+WHERE key='record_fact' AND system AND (schema->'properties'->'facts'->'items') ? 'properties'
+  AND NOT(COALESCE(schema->'properties'->'facts'->'items'->'properties','{}'::jsonb) ? 'source')`, string(itemProps["source"]))
+		if err != nil {
+			log.Printf("[facts] upgrade record_fact.source: %v", err)
+		}
+		return
+	}
+}
+
+// oldTaskScopeDescription is the add_task_scope description as seeded up to commit
+// 0dc8bdf, which called task_scope the task's authorization boundary. Kept verbatim:
+// seedTaskScopeDescription replaces only a row that still holds exactly this text.
+const oldTaskScopeDescription = "Add test scope to [this task] — this is the task's authorization boundary, and also the denominator of asset test coverage.\n" +
+	"Supported kinds: company (all assets under the company) / root_domain (a whole root domain, including all subdomains) / subdomain (a single precise subdomain) / ip / cidr / icp / keyword.\n" +
+	"Note: hosts a worker touches one by one are [automatically] added to the scope by the system (precise subdomains); this tool is for [deliberate widening] — pulling in a whole root domain / whole company, or adding a specific subdomain/IP.\n" +
+	"value: for company pass the company name or id (the company must already exist); for root_domain/subdomain pass a domain; for ip/cidr pass an IP or range; for icp/keyword pass an ICP number or company keyword.\n" +
+	"Always give reason explaining the basis (auditable). Use the entries array for multiple entries."
+
+// seedTaskScopeDescription brings the add_task_scope description of existing
+// databases to the code text (SeedTool is first-insert only, and ToolResolve serves
+// the stored description, so without this the model would keep reading
+// "authorization boundary"). Idempotent: only a system row still holding the old
+// seeded text is replaced; an absent row or an operator-edited text is left alone.
+func (s *Server) seedTaskScopeDescription() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "add_task_scope" {
+			continue
+		}
+		_, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now()
+WHERE key='add_task_scope' AND system AND description=$2`, seed.Desc, oldTaskScopeDescription)
+		if err != nil {
+			log.Printf("[tools] upgrade add_task_scope description: %v", err)
+		}
+		return
+	}
 }
 
 // refreshBuiltinToolSchemas propagates code schema/description changes on the
 // orchestration + platform tools into already-seeded rows ONCE per version flag —
-// SeedTool is first-insert-only, so a new param (e.g. spawn_task 的 llm_profile) never
+// SeedTool is first-insert-only, so a new param (e.g. spawn_task's llm_profile) never
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
@@ -525,13 +672,13 @@ func (s *Server) refreshBuiltinToolSchemas() {
 			log.Printf("[tools] refresh %s schema failed: %v", t.Name(), err)
 		}
 	}
-	// 同时把部分内置 agent 工具刷成代码默认：
-	//   - goal_met：旧库 seed 的描述带“结束本轮规划”的误导，会让 planner 把它当成
-	//     “结束空轮”的手段、刚开跑就误判整个任务完成。
-	//   - insert_assets：新增 related 入参(标记资产是否与当前任务相关、决定是否入覆盖度)，
-	//     SeedTool 首插入only，旧库已 seed 的 schema 否则收不到这个新参数。
-	//   - list_facts：改为分页，新增 limit/before/q 入参；旧库已 seed 的空 schema 否则
-	//     在工具管理页显示「无参数」，模型也拿不到这几个参数说明。
+	// Also refresh some built-in agent tools to the code defaults:
+	//   - goal_met: the description seeded in old DBs carries the misleading "end this planning round", making the planner treat it as
+	//     a way to "end an empty round" and wrongly declare the whole task done right after start.
+	//   - insert_assets: new related param (marks whether the asset relates to the current task and decides whether it counts toward coverage),
+	//     SeedTool is first-insert-only, so schemas already seeded in old DBs would otherwise miss this new param.
+	//   - list_facts: now paginated with new limit/before/q params; the empty schema already seeded in old DBs would otherwise
+	//     show "no parameters" on the tools page, and the model would never see those param descriptions.
 	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true}
 	for _, sd := range agent.BuiltinToolSeeds() {
 		if !refreshBuiltin[sd.Key] {
@@ -543,7 +690,7 @@ func (s *Server) refreshBuiltinToolSchemas() {
 		}
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
-	log.Printf("[tools] 已刷新 orchestration/platform 工具 schema 到代码默认(一次性)")
+	log.Printf("[tools] refreshed orchestration/platform tool schemas to code defaults (one-time)")
 }
 
 // unbindGoalMetDefault removes goal_met's default "planner" binding ONCE (guarded by
@@ -557,216 +704,216 @@ func (s *Server) unbindGoalMetDefault() {
 		return
 	}
 	if err := s.m.pg.RemoveAgentFromTool("planner", "goal_met"); err != nil {
-		log.Printf("[tools] goal_met 解绑 planner 失败: %v", err)
+		log.Printf("[tools] failed to unbind goal_met from planner: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 }
 
-// reseedGoalsPrompt 把 goals 目标拆解器的提示词刷成【当前代码默认】——因为默认正文新增了
-// 「先抽操作约束(set_constraints)再拆目标」这一步,而 SeedPromptIfEmpty 首插入only,旧库
-// 已有的 version 1 收不到这步。这里用版本管理【追加一个新版本】并切过去(ResetPromptToDefault),
-// 旧的版本仍保留在历史里,用户若自定义过可从版本记录找回。settings flag 守卫 → 只做一次;
-// 以后默认再变就 bump 这个 flag。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。
+// reseedGoalsPrompt refreshes the goals decomposer's prompt to [the current code default] — the default body gained the step
+// "extract operation constraints (set_constraints) before decomposing goals", and SeedPromptIfEmpty is first-insert-only, so old DBs
+// with an existing version 1 never got it. Here we use version management to [append a new version] and switch to it (ResetPromptToDefault),
+// old versions stay in history, and users who customized can recover from the version record. settings flag guard → done only once;
+// bump this flag whenever the default changes again. Fresh DBs need nothing (SeedPromptIfEmpty already seeds the latest default).
 func (s *Server) reseedGoalsPrompt() {
 	const flag = "goals_prompt_constraint_step_v1"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt only once regardless of outcome
 	a, err := s.m.pg.GetAgentByKey("goals")
 	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+		return // fresh DB without agent rows yet: seedPrompts seeds the latest default directly, this migration is unnecessary
 	}
 	tmpl := agent.BuiltinPromptSeeds()["goals"]
 	if tmpl == "" {
 		return
 	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
+	// Fresh DB: seedPrompts already seeded the latest default → the current version equals the code default, no duplicate version needed.
 	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
 		return
 	}
 	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] goals 提示词重刷为新默认失败: %v", err)
+		log.Printf("[prompts] failed to refresh goals prompt to the new default: %v", err)
 		return
 	}
-	log.Printf("[prompts] goals 提示词已追加新默认版本(加入抽操作约束步,一次性)")
+	log.Printf("[prompts] goals prompt: appended a new default version (adds the extract-constraints step, one-time)")
 }
 
-// reseedMainAgentPrompt 把 mainagent 提示词刷成【当前代码默认】——默认正文新增了「目标全部
-// 达成后 add_intent 直投意图时,反问人是否登记为正式目标」这段引导,而 SeedPromptIfEmpty 首插入
-// only,旧库已有版本收不到。用版本管理【追加一个新版本】并切过去(ResetPromptToDefault),旧版本仍
-// 保留在历史里,用户若自定义过可从版本记录找回。settings flag 守卫 → 只做一次。全新库无需处理
-// (SeedPromptIfEmpty 已 seed 最新默认)。与 reseedGoalsPrompt 完全同构。
+// reseedMainAgentPrompt refreshes the mainagent prompt to [the current code default] — the default body gained the guidance "after all goals are
+// met, when injecting an intent directly via add_intent, ask the human whether to register it as a formal goal", and SeedPromptIfEmpty is first-insert
+// only, so versions already in old DBs never got it. Version management [appends a new version] and switches to it (ResetPromptToDefault); old versions stay
+// in history, and users who customized can recover from the version record. settings flag guard → done only once. Fresh DBs need nothing
+// (SeedPromptIfEmpty already seeds the latest default). Structurally identical to reseedGoalsPrompt.
 func (s *Server) reseedMainAgentPrompt() {
 	const flag = "mainagent_prompt_goalless_intent_v1"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt only once regardless of outcome
 	a, err := s.m.pg.GetAgentByKey("mainagent")
 	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+		return // fresh DB without agent rows yet: seedPrompts seeds the latest default directly, this migration is unnecessary
 	}
 	tmpl := agent.BuiltinPromptSeeds()["mainagent"]
 	if tmpl == "" {
 		return
 	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
+	// Fresh DB: seedPrompts already seeded the latest default → the current version equals the code default, no duplicate version needed.
 	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
 		return
 	}
 	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] mainagent 提示词重刷为新默认失败: %v", err)
+		log.Printf("[prompts] failed to refresh mainagent prompt to the new default: %v", err)
 		return
 	}
-	log.Printf("[prompts] mainagent 提示词已追加新默认版本(加入目标达成后反问建目标,一次性)")
+	log.Printf("[prompts] mainagent prompt: appended a new default version (adds the ask-about-registering-a-goal-after-met step, one-time)")
 }
 
-// reseedPlannerPrompt 把 planner 提示词刷成【当前代码默认】——默认正文做了精简重构,并把「克制」降级为
-// 仅去重、新增「深度优先于覆盖度」「硬底线:目标未达成且无在跑意图必须产出」、给否定结论复核加上界。
-// 每次默认有实质变更就 bump 下面的 flag(当前 v2)让存量旧库再刷一次。SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理
-// 【追加一个新版本】并切过去(ResetPromptToDefault),旧版本仍保留在历史里,用户若自定义过可从版本记录
-// 找回。settings flag 守卫 → 只做一次。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。与
-// reseedGoalsPrompt 完全同构。
+// reseedPlannerPrompt refreshes the planner prompt to [the current code default] — the default body was slimmed down and "restraint" demoted to
+// dedup-only, adding "depth over coverage" and the "hard floor: with unmet goals and no running intents, output is mandatory", and bounding the re-check of negative conclusions.
+// Bump the flag below (currently v2) whenever the default changes materially so existing old DBs refresh once more. SeedPromptIfEmpty is first-insert-only; versions already in old DBs never got it, so version management
+// [appends a new version] and switches to it (ResetPromptToDefault); old versions stay in history, and users who customized can recover from the version record.
+// settings flag guard → done only once. Fresh DBs need nothing (SeedPromptIfEmpty already seeds the latest default). Structurally identical to
+// reseedGoalsPrompt.
 func (s *Server) reseedPlannerPrompt() {
 	const flag = "planner_prompt_compact_realistic_v2"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt only once regardless of outcome
 	a, err := s.m.pg.GetAgentByKey("planner")
 	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+		return // fresh DB without agent rows yet: seedPrompts seeds the latest default directly, this migration is unnecessary
 	}
 	tmpl := agent.BuiltinPromptSeeds()["planner"]
 	if tmpl == "" {
 		return
 	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
+	// Fresh DB: seedPrompts already seeded the latest default → the current version equals the code default, no duplicate version needed.
 	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
 		return
 	}
 	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] planner 提示词重刷为新默认失败: %v", err)
+		log.Printf("[prompts] failed to refresh planner prompt to the new default: %v", err)
 		return
 	}
-	log.Printf("[prompts] planner 提示词已追加新默认版本(精简重构+克制降级去重+深度优先+否定复核上界,一次性)")
+	log.Printf("[prompts] planner prompt: appended a new default version (slimmed rework + restraint demoted to dedup + depth-first + bounded negative re-checks, one-time)")
 }
 
-// reseedWorkerPrompt 把 worker 提示词刷成【当前代码默认】——默认正文 record_fact 段删掉了「否定类结论
-// 写观察+试探性读法」整句、并把 confidence(observed/inferred)与「是否穷尽本意图手段」解耦(这些易误导规划者),
-// 同时把 facts 数组分条收紧为「彼此完全独立、无法归并」的极少数例外。bump flag 至 v3 让存量旧库再刷一次。
-// SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理【追加一个新版本】并切过去,旧版本仍保留在历史里可找回。
-// settings flag 守卫 → 只做一次。全新库无需处理。与 reseedGoalsPrompt 完全同构。
+// reseedWorkerPrompt refreshes the worker prompt to [the current code default] — the record_fact section of the default body dropped the whole "for negative conclusions,
+// write observations + tentative readings" sentence and decoupled confidence (observed/inferred) from "whether this intent's options are exhausted" (these easily mislead the planner),
+// and tightened per-item facts arrays to the rare exception of "fully independent of each other, impossible to merge". Bumped the flag to v3 so existing old DBs refresh once more.
+// SeedPromptIfEmpty is first-insert-only; versions already in old DBs never got it, so version management [appends a new version] and switches to it; old versions stay in history and can be recovered.
+// settings flag guard → done only once. Fresh DBs need nothing. Structurally identical to reseedGoalsPrompt.
 func (s *Server) reseedWorkerPrompt() {
 	const flag = "worker_prompt_compact_v4"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt only once regardless of outcome
 	a, err := s.m.pg.GetAgentByKey("worker")
 	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+		return // fresh DB without agent rows yet: seedPrompts seeds the latest default directly, this migration is unnecessary
 	}
 	tmpl := agent.BuiltinPromptSeeds()["worker"]
 	if tmpl == "" {
 		return
 	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
+	// Fresh DB: seedPrompts already seeded the latest default → the current version equals the code default, no duplicate version needed.
 	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
 		return
 	}
 	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] worker 提示词重刷为新默认失败: %v", err)
+		log.Printf("[prompts] failed to refresh worker prompt to the new default: %v", err)
 		return
 	}
-	log.Printf("[prompts] worker 提示词已追加新默认版本(查上下文段收敛为 list_assets/list_findings,去掉 list_facts/node_detail/asset_neighbors,一次性)")
+	log.Printf("[prompts] worker prompt: appended a new default version (context-lookup section narrowed to list_assets/list_findings, dropping list_facts/node_detail/asset_neighbors, one-time)")
 }
 
-// reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。
-// 该工具是只读的、「不依赖捕获开关」,自动绑定关不关都能读到人工绑定的证据。若这里
-// 写成「启用自动绑定才读」,默认关闭配置下 reporter 就不会传 evidence_version,
-// SetFindingReportVersionByNodeID 便按 legacy 语义写 -1,漏洞详情与 Markdown 导出
-// 从此常驻「证据已变更，报告待更新」,而 UI 上没有任何入口能把它清掉。
-const reporterToolCallMessage = "上面刚有一个漏洞被 report_finding 登记。请读取返回 JSON 的 finding_id（独立漏洞记录 ID）与 finding_node_id（探索节点 ID），" +
-	"先用 get_finding_traffic(finding_id) 读取当前证据清单及其 version（空清单是正常情况，照常写报告）；" +
-	"若运行指引启用自动绑定，在读取前先核实并关联本次漏洞的流量。节点详情使用 finding_node_id。" +
-	"最后调用 update_finding_report(finding_id=finding_node_id, report, evidence_version=实际读取版本) 保存，" +
-	"evidence_version 必须传，否则报告会被永久标记为待更新。不要混用两种编号。"
+// reporterToolCallMessage must unconditionally require reading get_finding_traffic once before writing the report.
+// That tool is read-only and "does not depend on the capture switch": manually bound evidence is readable whether auto-binding is on or off. If this said
+// "read only when auto-binding is enabled", with the default-off config the reporter would not pass evidence_version,
+// SetFindingReportVersionByNodeID would then write -1 with legacy semantics, and the vulnerability details and Markdown export
+// would be stuck on "evidence changed, report needs updating" forever, with no UI entry able to clear it.
+const reporterToolCallMessage = "A vulnerability was just registered via report_finding. Read finding_id (the standalone vulnerability record ID) and finding_node_id (the exploration node ID) from the returned JSON, " +
+	"then read the current evidence list and its version with get_finding_traffic(finding_id) first (an empty list is normal — write the report as usual); " +
+	"if your run instructions enable auto-binding, verify and associate this vulnerability's traffic before reading. Use finding_node_id for node details." +
+	"Finally call update_finding_report(finding_id=finding_node_id, report, evidence_version=the version actually read) to save; " +
+	"evidence_version must be passed, or the report will be permanently marked as needing an update. Do not mix up the two kinds of id."
 
-// 旧版触发消息(0.3.8 及更早)。只有仍与它逐字相同的记录才会被迁移覆盖，用户改过的保持原样。
-const reporterToolCallMessageV1 = "上面刚有一个漏洞被 report_finding 登记。请从触发上下文里取出 finding_id" +
-	"（工具返回 \"finding recorded: <id>\" 里的数字）与任务 id，按你的职责撰写该漏洞的详细报告，" +
-	"最后调用 update_finding_report(finding_id, report) 保存。"
+// Legacy trigger message (0.3.8 and earlier). Only records still matching it verbatim are migrated/overwritten; user-modified ones stay as-is.
+const reporterToolCallMessageV1 = "A vulnerability was just registered via report_finding. Take finding_id out of the trigger context" +
+	" (the number in the tool's returned \"finding recorded: <id>\") and the task id, write that vulnerability's detailed report per your duties," +
+	" and finally call update_finding_report(finding_id, report) to save it."
 
-// upgradeReporterTriggerMessage 把老库里仍是默认文案的 reporter 触发消息刷成新版本。
-// seedReporterAgent 受 reporter_agent_seed_v1 守卫且只在新建 agent 时写触发器，所以
-// 升级上来的库拿不到新文案 —— 工具 schema 由 seedFindingTrafficTools 补齐了
-// evidence_version，但没有任何东西告诉 reporter 去用它。一次性，且只覆盖未被改动的文案。
+// upgradeReporterTriggerMessage refreshes reporter trigger messages that still carry the default copy in old DBs to the new version.
+// seedReporterAgent is guarded by reporter_agent_seed_v1 and only writes the trigger when creating the agent, so
+// upgraded DBs never got the new copy — seedFindingTrafficTools backfilled the tool schema with
+// evidence_version, but nothing told the reporter to use it. One-time, and it only overwrites unmodified copy.
 func (s *Server) upgradeReporterTriggerMessage() {
 	const flag = "reporter_trigger_evidence_version_v1"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 只尝试一次
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt once
 	triggers, err := s.m.pg.ListTriggersFor("reporter")
 	if err != nil {
-		log.Printf("[reporter] 读取触发器失败: %v", err)
+		log.Printf("[reporter] failed to read triggers: %v", err)
 		return
 	}
 	for _, t := range triggers {
 		if !t.OnToolCall || t.ToolCallMessage != reporterToolCallMessageV1 {
-			continue // 用户改过或不是 finding 触发器，不动。
+			continue // user-modified or not a finding trigger — leave it alone.
 		}
 		t.ToolCallMessage = reporterToolCallMessage
 		if err := s.m.pg.UpdateTrigger(t); err != nil {
-			log.Printf("[reporter] 升级触发消息失败: %v", err)
+			log.Printf("[reporter] failed to upgrade trigger message: %v", err)
 			return
 		}
-		log.Printf("[reporter] 触发消息已升级为读取并回传 evidence_version")
+		log.Printf("[reporter] trigger message upgraded to read and return evidence_version")
 	}
 }
 
-// seedReporterAgent 预置一个「报告撰写」自定义 agent(builtin=false，可在 UI 编辑/删除)：
-// 绑定 update_finding_report + 任务查询工具，并挂一个「report_finding 被调用即触发」的
-// 触发器 —— 每登记一个漏洞就唤起它写详细报告。一次性(settings flag 守卫)：用户删掉后不再重建。
-// 依赖：orchestration 工具已在本函数上方 SeedTool 入库，故绑定得上。
+// seedReporterAgent presets a "report writer" custom agent (builtin=false, editable/deletable in the UI):
+// it binds update_finding_report + the task-query tools and carries a trigger that fires "whenever report_finding is called"
+// — every registered vulnerability wakes it to write the detailed report. One-time (settings flag guard): once the user deletes it, it is never recreated.
+// Dependency: the orchestration tools were seeded via SeedTool just above this function, so the binding can attach.
 func (s *Server) seedReporterAgent() {
 	const flag = "reporter_agent_seed_v1"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // attempt only once regardless of outcome
 
 	if exist, _ := s.m.pg.GetAgentByKey("reporter"); exist != nil {
-		return // key 已被占用(用户手建过)——不覆盖
+		return // key already taken (user created it) — do not overwrite
 	}
-	a, err := s.m.pg.CreateAgent("reporter", "报告撰写",
-		"漏洞详细报告撰写：发现漏洞时自动触发，查取证据与执行过程后写 Markdown 报告并回写。")
+	a, err := s.m.pg.CreateAgent("reporter", "Report writer",
+		"Detailed vulnerability report writing: triggers automatically when a vulnerability is found, fetches evidence and execution traces, then writes a Markdown report and writes it back.")
 	if err != nil {
-		log.Printf("[reporter] 创建 agent 失败: %v", err)
+		log.Printf("[reporter] failed to create agent: %v", err)
 		return
 	}
 	if err := s.m.pg.SeedPromptIfEmpty(a.ID, agent.ReporterDefaultPrompt); err != nil {
-		log.Printf("[reporter] seed prompt 失败: %v", err)
+		log.Printf("[reporter] seed prompt failed: %v", err)
 	}
-	// 触发运行策略：parallel + none —— 一漏洞一报告、多个 finding 并发各写各的。
-	// merge 必须为 none：否则(默认 all)一波 finding 会被合并成一次运行，并行就没意义。
-	// maxParallel=5：同时最多 5 个报告会话，避免瞬时太多 LLM 调用。
+	// Trigger run policy: parallel + none — one report per vulnerability, several findings concurrently each writing its own.
+	// merge must be none: otherwise (default all) a wave of findings merges into one run and parallelism is pointless.
+	// maxParallel=5: at most 5 report sessions at once, avoiding a burst of too many LLM calls.
 	if err := s.m.pg.SetAgentTriggerBehavior("reporter", "parallel", "none", 5); err != nil {
-		log.Printf("[reporter] 设置触发运行策略失败: %v", err)
+		log.Printf("[reporter] failed to set trigger run policy: %v", err)
 	}
-	// 绑定它需要的工具：写报告 + 读证据/执行过程/态势。
+	// Bind the tools it needs: report writing + reading evidence/execution traces/situation.
 	if err := s.m.pg.AddAgentToToolBinding("reporter", []string{
 		"update_finding_report", "get_task_node_detail", "list_task_findings",
 		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
 		"get_task_graph",
 	}); err != nil {
-		log.Printf("[reporter] 绑定工具失败: %v", err)
+		log.Printf("[reporter] failed to bind tools: %v", err)
 	}
-	// 触发器：report_finding 被调用即触发（工具返回 "finding recorded: <id>" 带上 finding_id，
-	// 任务 id 也在触发消息里）。
+	// Trigger: fires whenever report_finding is called (the tool returns "finding recorded: <id>" carrying the finding_id,
+	// and the task id is also in the trigger message).
 	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
 		AgentKey:        "reporter",
 		Enabled:         true,
@@ -774,9 +921,9 @@ func (s *Server) seedReporterAgent() {
 		ToolNames:       []string{"report_finding"},
 		ToolCallMessage: reporterToolCallMessage,
 	}); err != nil {
-		log.Printf("[reporter] 创建触发器失败: %v", err)
+		log.Printf("[reporter] failed to create trigger: %v", err)
 	}
-	log.Printf("[reporter] 已预置「报告撰写」agent + finding 触发器")
+	log.Printf("[reporter] seeded the 'report writer' agent + finding trigger")
 }
 
 // seedAutoReportFindingBinding adds "auto" to report_finding's binding ONCE so
@@ -787,7 +934,7 @@ func (s *Server) seedAutoReportFindingBinding() {
 		return
 	}
 	if err := s.m.pg.AddAgentToToolBinding("auto", []string{"report_finding"}); err != nil {
-		log.Printf("[auto] report_finding 默认绑定失败: %v", err)
+		log.Printf("[auto] report_finding default binding failed: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
@@ -803,7 +950,7 @@ func (s *Server) seedPlannerDefaultBindings() {
 		return
 	}
 	if err := s.m.pg.AddAgentToToolBinding("planner", []string{"report_finding"}); err != nil {
-		log.Printf("[planner] report_finding 默认绑定失败: %v", err)
+		log.Printf("[planner] report_finding default binding failed: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
@@ -820,7 +967,7 @@ func (s *Server) seedPlannerListAssetsBinding() {
 		return
 	}
 	if err := s.m.pg.AddAgentToToolBinding("planner", []string{"list_assets"}); err != nil {
-		log.Printf("[planner] list_assets 默认绑定失败: %v", err)
+		log.Printf("[planner] list_assets default binding failed: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
@@ -833,16 +980,16 @@ func (s *Server) seedPlannerListAssetsBinding() {
 // PlannerTools() and lack worker via WorkerTools(); this only backfills old rows.
 // One-shot + flag-guarded so a user who later re-binds worker isn't overridden.
 func (s *Server) seedCompanyScopeRebind() {
-	const flag = "company_scope_rebind_v1" // worker→planner 默认绑定切换
+	const flag = "company_scope_rebind_v1" // worker→planner default-binding switch
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
 	if err := s.m.pg.AddAgentToToolBinding("planner", []string{"add_company_scope"}); err != nil {
-		log.Printf("[planner] add_company_scope 默认绑定失败: %v", err)
+		log.Printf("[planner] add_company_scope default binding failed: %v", err)
 		return
 	}
 	if err := s.m.pg.RemoveAgentFromTool("worker", "add_company_scope"); err != nil {
-		log.Printf("[worker] add_company_scope 解绑失败: %v", err)
+		log.Printf("[worker] failed to unbind add_company_scope: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
@@ -869,8 +1016,8 @@ func (s *Server) seedWorkerReadToolsUnbind() {
 		"list_facts", "list_companies", "list_worker_traces",
 	} {
 		if err := s.m.pg.RemoveAgentFromTool("worker", k); err != nil {
-			log.Printf("[worker] %s 从 worker 解绑失败: %v", k, err)
-			return // 出错则不落 flag，下次启动重试
+			log.Printf("[worker] failed to unbind %s from worker: %v", k, err)
+			return // on error the flag is not set; retried on next startup
 		}
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
@@ -882,16 +1029,47 @@ func (s *Server) seedWorkerReadToolsUnbind() {
 // they had been added to WorkerTools(), so any DB that ran that migration lost them.
 // Fresh DBs already have them via WorkerTools() and this is a harmless no-op there.
 // One-shot + flag-guarded so a user who later deliberately unbinds them isn't overridden.
+// seedTaskCredentialBindings binds the task-credential tools onto worker and
+// pentest ONCE (guarded by a settings flag), so existing DBs seeded before #3
+// still get them — fresh DBs already have them via WorkerTools()/the pentest
+// catalog seed. A user who deliberately unbinds them is not overridden.
+func (s *Server) seedTaskCredentialBindings() {
+	const flag = "task_credential_bindings_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	for _, agentKey := range []string{"worker", "pentest"} {
+		if err := s.m.pg.AddAgentToToolBinding(agentKey, []string{"save_task_credential", "list_task_credentials"}); err != nil {
+			log.Printf("[%s] task-credential default binding failed: %v", agentKey, err)
+			return // flag not set; retried on next startup
+		}
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// healListTaskCredentialsSchema repairs the list_task_credentials row seeded by
+// older builds, whose schema carried "required": [""] — strict providers reject
+// it, which fails every worker run. SeedTool is first-insert-only, so the code fix
+// alone never reaches an already-seeded row. Only that exact malformed value on
+// that one key matches, and only the "required" key is dropped: the rest of the
+// schema, the description, bindings and enabled flag are untouched. A healed row
+// no longer matches, so this needs no settings flag and is a no-op afterwards.
+func (s *Server) healListTaskCredentialsSchema() {
+	if _, err := s.m.pg.Exec(`UPDATE tools SET schema = schema - 'required', updated_at=now() WHERE key='list_task_credentials' AND schema->'required' = '[""]'::jsonb`); err != nil {
+		log.Printf("[tools] heal list_task_credentials schema failed: %v", err)
+	}
+}
+
 func (s *Server) seedWorkerReadbackRebind() {
-	const flag = "worker_readback_rebind_v2" // v2: 追加 node_detail
+	const flag = "worker_readback_rebind_v2" // v2: adds node_detail
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
 	if err := s.m.pg.AddAgentToToolBinding("worker", []string{
 		"search_all_worker_traces", "get_worker_trace", "node_detail",
 	}); err != nil {
-		log.Printf("[worker] 回看/详情工具补绑失败: %v", err)
-		return // 出错则不落 flag，下次启动重试
+		log.Printf("[worker] failed to re-bind look-back/detail tools: %v", err)
+		return // on error the flag is not set; retried on next startup
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 }
@@ -901,7 +1079,7 @@ func (s *Server) seedWorkerReadbackRebind() {
 // before Auto existed still give Auto its default toolset — without re-adding it
 // after a user deliberately unbinds.
 func (s *Server) seedAutoDefaultBindings() {
-	const flag = "auto_default_bindings_v3" // v3: 替换旧资产工具名，加入 insert_assets/add_company_scope
+	const flag = "auto_default_bindings_v3" // v3: replaces old asset tool names, adds insert_assets/add_company_scope
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -910,10 +1088,10 @@ func (s *Server) seedAutoDefaultBindings() {
 		keys = append(keys, t.Name())
 	}
 	keys = append(keys, platformToolKeys...)
-	// 资产工具：Auto 操作平台常要看/登记资产、管理公司范围。
+	// Asset tools: Auto operating the platform often views/registers assets and manages company scopes.
 	keys = append(keys, "insert_assets", "add_company_scope", "list_assets")
 	if err := s.m.pg.AddAgentToToolBinding("auto", keys); err != nil {
-		log.Printf("[auto] 默认绑定失败: %v", err)
+		log.Printf("[auto] default binding failed: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")

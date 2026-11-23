@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -17,6 +18,92 @@ import (
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
 // findings it produced) — without pulling full payloads. parentsOf/yieldsOf are
 // built from the exploration edges in graph_overview.
+// normalizeDirection fingerprints an intent summary for stagnation detection:
+// case-folded, all digits collapsed to '#', whitespace collapsed. Two intents
+// aimed at the same thing with different IDs/counts/URLs fingerprint the same.
+func normalizeDirection(summary string) string {
+	var b strings.Builder
+	digit := false
+	for _, r := range strings.ToLower(strings.Join(strings.Fields(summary), " ")) {
+		if r >= '0' && r <= '9' {
+			if !digit {
+				b.WriteByte('#')
+			}
+			digit = true
+			continue
+		}
+		digit = false
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// detectStagnation (ouroboros take, #99) flags directions whose normalized
+// summary repeats stagnationMinRepeats times among finished intents while no
+// finding has been produced since the FIRST attempt at that direction: the
+// planner is grinding the same shape of work without yield. Pure function over
+// (finished intents, findings) so it is unit-testable without a store.
+const stagnationMinRepeats = 3
+
+func detectStagnation(done, findings []*db.Node) []map[string]any {
+	type dir struct {
+		firstID int64
+		repeats int
+		summary string
+	}
+	dirs := map[string]*dir{}
+	order := []string{}
+	for _, n := range done {
+		var payload map[string]any
+		_ = json.Unmarshal(n.Payload, &payload)
+		summ, _ := payload["summary"].(string)
+		if strings.TrimSpace(summ) == "" {
+			continue
+		}
+		fp := normalizeDirection(summ)
+		if fp == "" {
+			continue
+		}
+		d, ok := dirs[fp]
+		if !ok {
+			d = &dir{firstID: n.ID, summary: summ}
+			dirs[fp] = d
+			order = append(order, fp)
+		}
+		if n.ID < d.firstID {
+			d.firstID = n.ID
+			d.summary = summ
+		}
+		d.repeats++
+	}
+	var out []map[string]any
+	for _, fp := range order {
+		d := dirs[fp]
+		if d.repeats < stagnationMinRepeats {
+			continue
+		}
+		produced := false
+		for _, f := range findings {
+			if f.ID > d.firstID {
+				produced = true
+				break
+			}
+		}
+		if produced {
+			continue
+		}
+		out = append(out, map[string]any{
+			"direction": d.summary,
+			"repeats":   d.repeats,
+			"since":     d.firstID,
+		})
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return out
+}
+
 func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
@@ -38,10 +125,10 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 			m["asset_ids"] = []any{tg}
 		}
 		if ps := parentsOf[n.ID]; len(ps) > 0 {
-			m["parents"] = ps // 上游：本意图派生自哪些节点（多个事实可共同产生一个意图）
+			m["parents"] = ps // upstream: which nodes this intent derived from (multiple facts can jointly produce one intent)
 		}
 		if ys := yieldsOf[n.ID]; len(ys) > 0 {
-			m["yields"] = ys // 下游：本意图产生了哪些事实/发现
+			m["yields"] = ys // downstream: which facts/findings this intent produced
 		}
 		out = append(out, m)
 	}
@@ -52,17 +139,26 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
-	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
-	cs              *db.CompanyStore // company store (optional)
-	ts              *db.ExplorationStore
-	worker          string
-	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	// trafficProofChecker verifies that a bound snapshot's source_traffic_id
+	// exists in the live capture store during prove_goal. Planner.Plan wires it
+	// from the finding recorder; nil or any error fails closed.
+	trafficProofChecker func(ctx context.Context, trafficID string) (bool, error)
+	as                  *db.AssetStore   // asset store (optional; nil = asset tools not available)
+	cs                  *db.CompanyStore // company store (optional)
+	ts                  *db.ExplorationStore
+	factTraffic         FactTrafficLookup // proxy capture store for fact classification; nil = activity-only
+	worker              string
+	taskID              int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
 	// auto-scope hook (insertAssets) is skipped, and add_task_scope/list_untested_assets
 	// are filtered out of the agent's tool list. The scope field stays regardless.
 	coverageDisabled bool
+	// workBase is the data directory the run directories live in, the base of the
+	// file tools (defaultTools). ingest_bbot opens its file through the run's working
+	// directory below it; empty = the tool refuses every path.
+	workBase string
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
@@ -94,19 +190,21 @@ type ToolSet struct {
 	// can't, because the planner's terminal gate swallows wakes. Wired ONLY for the
 	// main agent (human steering); nil for the goals decomposer and workers.
 	resumeTask func()
-	// notifyGoal, if set, wakes the planner AND records ONE "人新增了 N 个目标：…" trigger
-	// for a whole set_goals call (batch-aware — one call, one trigger, not one per goal)
-	// so the next round spells out the added goals (instead of the planner having to
-	// spot new open goals in the overview). Wired ONLY for the main agent; nil for the
-	// goals decomposer (round-0 has no running planner to inform) and workers → those
-	// fall back to the bare notify.
+	// notifyGoal, if set, wakes the planner AND records ONE "human added N goals: …"
+	// trigger for a whole set_goals call (batch-aware — one call, one trigger, not
+	// one per goal) so the next round spells out the added goals (instead of the
+	// planner having to spot new open goals in the overview). Wired ONLY for the main
+	// agent; nil for the goals decomposer (round-0 has no running planner to inform)
+	// and workers → those fall back to the bare notify.
 	notifyGoal func(texts []string)
-	// notifyHint, if set, wakes the planner AND records ONE "人新增了 N 条战略提示：…"
-	// trigger for a whole add_hint call (batch-aware — one call, one trigger) so the next
-	// round is told the round was fired by a new hint and spells the hint out, instead of
-	// the planner having to spot it folded into the graph overview. Wired for the main
-	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
-	notifyHint func(texts []string)
+	// notifyHint, if set, wakes the planner AND records ONE "<origin> added N strategic
+	// hints: …" trigger for a whole add_hint call (batch-aware — one call, one
+	// trigger) so the next round is told the round was fired by a new hint and spells
+	// the hint out, instead of the planner having to spot it folded into the graph
+	// overview. origin is the ToolSet's worker (human, orchestrator, or an agent name).
+	// Wired for the main agent + cross-task orchestration; nil elsewhere → falls back
+	// to the bare notify.
+	notifyHint func(origin string, texts []string)
 }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
@@ -116,7 +214,7 @@ func (t *ToolSet) SetNotifyGoal(fn func([]string)) { t.notifyGoal = fn }
 // SetNotifyHint wires the hint-add trigger callback (see ToolSet.notifyHint). Set by
 // the main-agent chat and cross-task orchestration, so a runtime-added hint fires a
 // planner round announced by name instead of a bare wake.
-func (t *ToolSet) SetNotifyHint(fn func([]string)) { t.notifyHint = fn }
+func (t *ToolSet) SetNotifyHint(fn func(string, []string)) { t.notifyHint = fn }
 
 // SetResumeTask wires the task-revive callback (see ToolSet.resumeTask). Set only by
 // the main-agent chat, so runtime-added goals can pull a finished task back to running.
@@ -133,7 +231,7 @@ func (t *ToolSet) SetNotifyFinding(fn func(int64, string)) { t.notifyFinding = f
 // enrich). Kept as an interface here to avoid coupling agent → enrich.
 type EnrichTrigger interface {
 	ResolveDomain(id int64, host string)
-	ProbeSite(id int64, url string)
+	ProbeSite(ctx context.Context, id int64, url string)
 }
 
 // WriteCounts breaks down what a worker persisted this run, by node kind, so the
@@ -150,9 +248,9 @@ type WriteCounts struct {
 // "explored but persisted nothing" signal (Total == 0).
 func (w WriteCounts) Total() int { return w.Facts + w.Assets + w.Findings }
 
-// String renders the per-kind breakdown for logs, e.g. "事实1 资产25 漏洞0".
+// String renders the per-kind breakdown for logs, e.g. "facts=1 assets=25 findings=0".
 func (w WriteCounts) String() string {
-	return fmt.Sprintf("事实%d 资产%d 漏洞%d", w.Facts, w.Assets, w.Findings)
+	return fmt.Sprintf("facts=%d assets=%d findings=%d", w.Facts, w.Assets, w.Findings)
 }
 
 // Writes reports what this run wrote back, split by node kind (so the engine can
@@ -163,6 +261,11 @@ func (t *ToolSet) Writes() WriteCounts { return t.writes }
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 	return &ToolSet{ts: ts, worker: worker}
 }
+
+// SetFactTraffic wires the proxy capture store used to relabel facts whose
+// evidence came back from the target (#124 row 1, step 3). Callers pass the
+// process traffic store; nil leaves classification activity-only.
+func (t *ToolSet) SetFactTraffic(l FactTrafficLookup) { t.factTraffic = l }
 
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
@@ -184,9 +287,9 @@ func (t *ToolSet) CoverageDisabled() bool { return t.coverageDisabled }
 // they neither pollute the prompt nor let the model build a disabled denominator.
 // add_task_scope is deliberately NOT here: task_scope is the task's range boundary
 // (the filter basis for asset queries), not merely a coverage denominator, so the
-// agents that own范围定义 keep it either way — in lockstep with insertAssets'
-// auto-scope hook, which also runs regardless of the switch.
-var coverageOnlyTools = map[string]bool{"list_untested_assets": true}
+// agents that own scope definition keep it either way — in lockstep with
+// insertAssets' auto-scope hook, which also runs regardless of the switch.
+var coverageOnlyTools = map[string]bool{"list_untested_assets": true, "record_coverage": true}
 
 // DropCoverageTools returns tools with the coverage-only ones removed when this
 // task has the feature disabled; otherwise it returns tools unchanged.
@@ -224,6 +327,10 @@ func (t *ToolSet) SetEnrich(e EnrichTrigger) { t.enrich = e }
 // intent node; planner/main: the begin root). Assets created/referenced while
 // ownerNode is set are anchored to it as lineage (not visibility).
 func (t *ToolSet) SetOwnerNode(id int64) { t.ownerNode = id }
+
+// SetWorkBase sets the data directory the run directories live in (see
+// ToolSet.workBase): the same base the run's file tools are confined under.
+func (t *ToolSet) SetWorkBase(base string) { t.workBase = base }
 
 // anchorOwner records a lineage edge from this run's owner node to an asset
 // (no-op if unset). Provenance only — the asset graph is global and shared, so
@@ -264,8 +371,16 @@ func pidList(raw []json.RawMessage) []int64 {
 
 func obj(props map[string]any, required ...string) map[string]any {
 	m := map[string]any{"type": "object", "properties": props}
-	if len(required) > 0 {
-		m["required"] = required
+	// Blank names are dropped, and "required" is omitted when nothing is left:
+	// strict providers reject "required": [""] and fail every run carrying the tool.
+	req := make([]string, 0, len(required))
+	for _, r := range required {
+		if strings.TrimSpace(r) != "" {
+			req = append(req, r)
+		}
+	}
+	if len(req) > 0 {
+		m["required"] = req
 	}
 	return m
 }
@@ -290,8 +405,21 @@ func readTool(name, desc string, schema map[string]any, run func(context.Context
 }
 
 func writeTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return buildWriteTool(name, desc, schema, false, run)
+}
+
+// writeRawTool is writeTool for a handler that validates its own input: the
+// harness skips its schema check (Spec.RawInput), so the published schema can
+// be stricter (required properties) than the legacy shapes the handler still
+// accepts, and refusals carry the handler's own message instead of the
+// SDK's generic one.
+func writeRawTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return buildWriteTool(name, desc, schema, true, run)
+}
+
+func buildWriteTool(name, desc string, schema map[string]any, raw bool, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
 	return actool.Build(actool.Spec{
-		Name: name, Description: desc, Schema: schema,
+		Name: name, Description: desc, Schema: schema, RawInput: raw,
 		Permissions: func(context.Context, json.RawMessage, acperm.Context) acperm.Decision { return acperm.Allowed() },
 		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			return run(ctx, in)
@@ -303,16 +431,22 @@ func writeTool(name, desc string, schema map[string]any, run func(context.Contex
 // task-bound ExplorationStore. Two ToolSets carry a nil store: the catalog's
 // seed-only shell (never called) and the server-level one behind buildDomainReg,
 // which the tools table can bind to ANY agent — including ones that never run
-// inside a task (auto/pentest/reporter/自定义 agent/旁路提问). Refusing there
-// keeps a mis-bound tool a bad tool call; without the guard it was a nil deref,
-// and tool handlers run on the harness's own goroutine, so the panic is out of
-// reach of every recover() in the server and kills the whole process.
+// inside a task (auto/pentest/reporter/custom agents/side questions). Refusing
+// there keeps a mis-bound tool a bad tool call; without the guard it was a nil
+// deref, and tool handlers run on the harness's own goroutine, so the panic is out
+// of reach of every recover() in the server and kills the whole process.
 func (t *ToolSet) readExpTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
 	return readTool(name, desc, schema, t.needExploration(name, run))
 }
 
 func (t *ToolSet) writeExpTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
 	return writeTool(name, desc, schema, t.needExploration(name, run))
+}
+
+// writeExpToolRaw is writeExpTool with the harness schema check skipped (see
+// writeRawTool); the handler validates the input itself.
+func (t *ToolSet) writeExpToolRaw(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return writeRawTool(name, desc, schema, t.needExploration(name, run))
 }
 
 // needExploration wraps a handler so it only runs with an exploration store.
@@ -322,7 +456,7 @@ func (t *ToolSet) writeExpTool(name, desc string, schema map[string]any, run fun
 func (t *ToolSet) needExploration(name string, run func(context.Context, json.RawMessage) (actool.Result, error)) func(context.Context, json.RawMessage) (actool.Result, error) {
 	return func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		if t.ts == nil {
-			return actool.Errorf(name + " 需要任务上下文（探索图）：当前 agent 不在某个任务内运行，取不到任务的探索图，该工具不可用。请在任务内使用它，或改用带 task_id 的跨任务读取工具（get_task_node_detail / list_task_findings / get_task_graph 等）。"), nil
+			return actool.Errorf(name + " requires a task context (exploration graph): the current agent is not running inside a task, so the task's exploration graph is unavailable and this tool cannot be used. Use it inside a task, or switch to a cross-task read tool that takes a task_id (get_task_node_detail / list_task_findings / get_task_graph etc.)."), nil
 		}
 		return run(ctx, in)
 	}
@@ -340,7 +474,7 @@ func jsonResult(v any) (actool.Result, error) {
 
 func (t *ToolSet) graphOverview() actool.CoreTool {
 	return t.readExpTool("graph_overview",
-		"(探索链路图)探索态势蒸馏摘要：资产计数、无接口的站点、frontier、发现、hints(人类/主 agent 的战略提示，生成意图时须纳入)。规划时先调它。",
+		"(Exploration graph) distilled situational summary: asset counts, sites without endpoints, frontier, findings, hints (strategic hints from the human/main agent — must be incorporated when generating intents). Call it first when planning.",
 		obj(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			return jsonResult(t.graphOverviewData())
@@ -362,14 +496,17 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
 	}
 	out["goals"] = gsum
-	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
-	// planner reads them every round when generating intents (否则只写不读).
+	// hints: strategic hints attached to the graph by the human/main agent via
+	// add_hint; folded in so the planner reads them every round when generating
+	// intents (otherwise they'd be write-only).
 	hints, _ := t.ts.ListByKind(db.KindHint, 50)
 	hsum := make([]map[string]any, 0, len(hints))
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+		// origin lets the user-message renderers keep the operator's own hints
+		// outside the data envelope (#124, F3).
+		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"], "origin": h.Origin}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
@@ -409,7 +546,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	}
 	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
 	const openIntentsCap = 30
-	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
+	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC — the top N by priority; the real total is in frontier_open
 	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
 	all, _ := t.ts.ListByKind(db.KindIntent, 300)
 	var running, recentDone []*db.Node
@@ -421,17 +558,19 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			if hidden(n.ID) {
 				continue // in a cold_digest and still cold — shown via cold_digests (§6.2)
 			}
-			recentDone = append(recentDone, n) // 最新在前（all 按 id 降序）；折叠的已剔除，输出时截最新 N
+			recentDone = append(recentDone, n) // newest first (all is id-DESC); folded ones are dropped, output truncated to the latest N
 		}
 	}
 	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
-	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
-	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
-	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
+	// done_intents_total: the total number of finished intents (done/blocked/exhausted),
+	// named in parallel with recent_done_intents — the latter is just its newest windowed
+	// view. Side by side the two keys are self-describing: "you're seeing N of total", so
+	// the planner doesn't mistake "not shown" for "never dispatched" when deduping, with
+	// no extra explanation needed in the prompt.
 	if dt, err := t.ts.CountFinishedIntents(); err == nil {
 		out["done_intents_total"] = dt
 	}
-	// frontier_open：开放意图真实总数（open_intents 只是其中优先级最高的前 N 条截断视图）。
+	// frontier_open: the real total of open intents (open_intents is just the top-N-by-priority truncated view).
 	if fo, err := t.ts.CountOpenIntents(); err == nil {
 		out["frontier_open"] = fo
 	} else {
@@ -443,12 +582,28 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// via node_detail(id).
 	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
 	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
-	out["findings_total"] = len(vulnNodes)             // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
-	out["facts"] = len(factNodes)                      // 探索事实/结论数（含否定结论）
-	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
-	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
-	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。
-	// evidence/assets/vulnclass/severity/state 等仍可用 list_findings / node_detail(id) 取。
+	// findings_total is what goal judgment reads. A false_positive, duplicate,
+	// or ignored triage label is not an open finding, so it does not count.
+	// finding_list still shows those rows, with status, so the planner can see them.
+	out["findings_total"] = countActionableFindings(vulnNodes)
+	out["facts"] = len(factNodes) // number of exploration facts/conclusions (including negative conclusions)
+	// Stagnation surfacing (#99): repeated finished directions with no findings
+	// since their first attempt. Self-describing payload — the instruction ships
+	// with the data so no prompt-template change is needed on deployed installs.
+	if stale := detectStagnation(recentDone, vulnNodes); len(stale) > 0 {
+		out["stagnation_warning"] = map[string]any{
+			"directions":  stale,
+			"instruction": "these directions were dispatched repeatedly with zero findings produced since their first attempt — do NOT re-dispatch the same approach again; open a materially different direction, or judge the goal on the existing evidence instead of grinding",
+		}
+	}
+	// findings are the task's highest-value output → the overview carries the latest
+	// window (≤10 entries; vulnNodes is id-DESC, i.e. newest first) so the planner sees
+	// the recently confirmed findings at a glance each round when judging goals; use
+	// list_findings for the full/older set. Each entry keeps {id, summary,
+	// status?, from_intent?}: status is the triage label mirrored onto the
+	// node, and from_intent is the intent that produced this finding.
+	// evidence/assets/vulnclass/severity/state etc. remain available via
+	// list_findings / node_detail(id).
 	const findingListCap = 10
 	findingList := make([]map[string]any, 0, findingListCap)
 	for _, n := range vulnNodes {
@@ -458,15 +613,20 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
 		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
+		if st, ok := fp["status"].(string); ok && strings.TrimSpace(st) != "" {
+			m["status"] = st
+		}
 		if from := factFrom[n.ID]; from > 0 {
-			m["from_intent"] = from // 本漏洞由哪个意图产生
+			m["from_intent"] = from // which intent produced this finding
 		}
 		findingList = append(findingList, m)
 	}
 	out["finding_list"] = findingList
-	// recent_facts：非折叠事实里最新的一窗（≤N，factNodes 按 id 降序即最新在前）。已折进
-	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
-	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
+	// recent_facts: the latest window (≤N) of non-folded facts (factNodes is id-DESC,
+	// i.e. newest first). Ones folded into a digest and still cold (hidden) go through
+	// cold_digests and aren't repeated here. Each entry {id, summary, origin?, source?,
+	// from_intent?, confidence?}; details like evidence via node_detail(id). Older ones
+	// via list_facts.
 	const recentFactsCap = 20
 	recentFacts := make([]map[string]any, 0, recentFactsCap)
 	for _, n := range factNodes {
@@ -474,14 +634,15 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			break
 		}
 		if hidden(n.ID) {
-			continue // 已折进 digest 且仍冷 —— 见 cold_digests
+			continue // folded into a digest and still cold — see cold_digests
 		}
-		m := compactNode(n)
+		m := compactFact(n) // summary capped at factSummaryMax (#124, F3)
 		if from := factFrom[n.ID]; from > 0 {
-			m["from_intent"] = from // 本事实由哪个意图产生
+			m["from_intent"] = from // which intent produced this fact
 		}
-		// confidence 带进概览：让规划者一眼看出哪条结论只是 inferred（尤其否定结论
-		// 别当铁案）；evidence 较长，留给 node_detail(id)。
+		// confidence rides in the overview: lets the planner see at a glance which
+		// conclusion is only inferred (especially negative conclusions — don't treat
+		// them as ironclad); evidence is long, left to node_detail(id).
 		var fp map[string]any
 		if json.Unmarshal(n.Payload, &fp) == nil {
 			if c, ok := fp["confidence"].(string); ok && c != "" {
@@ -491,20 +652,22 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentFacts = append(recentFacts, m)
 	}
 	out["recent_facts"] = recentFacts
-	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
-	// 更早的看 done_intents_total 计数 + node_detail(id)。
+	// recent_done_intents: the latest window (≤N) of non-folded finished intents
+	// (recentDone is already id-DESC). For older ones see the done_intents_total count
+	// + node_detail(id).
 	const recentDoneCap = 12
 	if len(recentDone) > recentDoneCap {
 		recentDone = recentDone[:recentDoneCap]
 	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
-	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
-	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
+	// cold-digest §6.1: the folded cold region's digest bodies, newest-member first,
+	// capped at N; truncated older digests are given as bare ids (still expandable via
+	// expand_digest) so the cold region's only exit doesn't grow without bound.
 	const coldDigestsCap = 15
 	if cds, more := coldDigestsRecent(t.ts, coldDigestsCap); len(cds) > 0 {
-		out["cold_digests"] = cds // [{id, body, member_count}] —— 直接读 body (§6.1)
+		out["cold_digests"] = cds // [{id, body, member_count}] — read body directly (§6.1)
 		if len(more) > 0 {
-			out["cold_digests_more"] = more // 被截断的更旧 digest 的 id；用 expand_digest(id) 展开
+			out["cold_digests_more"] = more // ids of truncated older digests; expand with expand_digest(id)
 		}
 	}
 	// the original task (root) so the planner always has it, not just the
@@ -516,11 +679,14 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// summaries in a separate field so their intents never enter this task's
 	// frontier or get mistaken for locally claimable work.
 	out["related_tasks"] = t.relatedTaskOverviews()
-	// coverage：粗略的资产测试覆盖度参考——范围(task_scope)内的资产里，被 fact 碰过的
-	// 占比 + by_type(按类型的 总数/已测)。要看未测的具体资产由 agent 按需调 list_untested_assets 自行判断。仅任务上下文有。
-	// 资产覆盖度功能关闭时(coverageDisabled)：只保留 host_count(目标主机数的感知信息)，
-	// 丢弃 denominator/tested/pct/by_type/note 等覆盖度度量，避免污染上下文、也不诱导
-	// 已隐藏的 add_task_scope/list_untested_assets。
+	// coverage: a rough reference for asset test coverage — among the assets inside
+	// the scope (task_scope), the share touched by facts + by_type (total/tested per
+	// type). To see the concrete untested assets, the agent calls list_untested_assets
+	// on demand and judges itself. Only available in a task context.
+	// When the asset-coverage feature is off (coverageDisabled): keep only host_count
+	// (awareness of the target host count) and drop the coverage metrics
+	// denominator/tested/pct/by_type/note — avoids polluting the context and doesn't
+	// invite the hidden add_task_scope/list_untested_assets.
 	if t.as != nil && t.ts != nil && t.taskID > 0 {
 		{
 			m := map[string]any{}
@@ -529,24 +695,34 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 					m["denominator"] = cov.Denominator
 					m["tested"] = cov.Tested
 					m["by_type"] = cov.ByType
-					m["note"] = "coverage资产测试覆盖度（包括接口等各种相关资产），粗略估计、仅供参考：包含当前任务与直接关联任务的 scope、事实锚点；关联 scope 只读。容器型资产/大量枚举会让它偏低，勿据此认为已测完；可用 add_task_scope 增补本任务范围、list_untested_assets 看未测资产【通常不调用list_untested_assets，按照任务推进即可】；"
+					m["note"] = "coverage = asset test coverage (including endpoints and all kinds of related assets), a rough estimate for reference only: includes the current task's and directly related tasks' scopes and fact anchors; related scopes are read-only. Container-type assets/mass enumeration skew it low — don't take it as fully tested; use add_task_scope to extend this task's scope, list_untested_assets to see untested assets [usually no need to call list_untested_assets; just proceed with the task];"
 					if cov.Denominator == 0 {
 						m["pct"] = nil
-						m["status"] = "范围未锚定"
+						m["status"] = "scope not anchored"
 					} else {
 						m["pct"] = cov.Pct
 					}
 				}
 			}
 			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
-				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
-				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
+				// Only the host count is given; the host list is no longer flattened into
+				// graph_overview (in large-scope tasks that's a lot of repeated strings every
+				// round, of limited value to planning decisions); query concrete hosts via
+				// list_assets on demand.
 				m["host_count"] = len(hosts)
 			}
 			if len(m) > 0 {
 				out["coverage"] = m
 			}
 		}
+	}
+	// Task credentials (#3): test accounts for this target — user-declared (e.g. a
+	// program alias) plus accounts recorded by earlier runs. Surfaced every round so
+	// authenticated testing reuses them instead of re-registering, and so accounts
+	// this run registers get saved back (see save_task_credential).
+	if creds := t.taskCredentialOverview(); creds != nil {
+		out["task_credentials"] = creds
+		out["task_credentials_note"] = "test accounts for this task; use the matching entry for authenticated testing instead of registering a new account; entries with an empty password mean you must register that account first (strong unique password) and record it via save_task_credential; ALWAYS record accounts you register via save_task_credential"
 	}
 	return out
 }
@@ -811,7 +987,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 			}
 			item["cold_digests"] = cds
 			if len(more) > 0 {
-				item["cold_digests_more"] = more // 被截断的更旧 digest 的 id；expand_digest(id) 展开
+				item["cold_digests_more"] = more // ids of truncated older digests; expand with expand_digest(id)
 			}
 		}
 		if statsErr == nil {
@@ -870,18 +1046,36 @@ func inheritedIntentSummaryState(state string) bool {
 }
 
 // compactNode distills any exploration node to id + summary + state, dropping the
-// big detail/evidence (fetch that on demand via node_detail).
+// big detail/evidence (fetch that on demand via node_detail). It also carries the
+// provenance (#124, F4): origin is the writer recorded by the server (worker-N,
+// planner, human, orchestrator), source is the declared source of a fact.
 func compactNode(n *db.Node) map[string]any {
 	var p map[string]any
 	_ = json.Unmarshal(n.Payload, &p)
 	m := map[string]any{"id": n.ID, "state": n.State, "summary": p["summary"]}
+	if n.Origin != "" {
+		m["origin"] = n.Origin
+	}
+	if s, ok := p["source"].(string); ok && s != "" {
+		m["source"] = s
+	}
+	if prov, ok := p["provenance"].(string); ok && prov != "" {
+		m["provenance"] = prov
+		if id, ok := p["provenance_activity_id"]; ok && id != nil {
+			m["provenance_activity_id"] = id
+		}
+		if tid, ok := p["provenance_traffic_id"].(string); ok && tid != "" {
+			m["provenance_traffic_id"] = tid
+		}
+	}
 	if n.Inherited {
 		inheritedMap(m, n.SourceTaskID)
 	}
 	return m
 }
 
-// compactFinding is compactNode plus the vuln-specific vulnclass/severity.
+// compactFinding is compactNode plus the vuln-specific vulnclass/severity and
+// the triage status mirrored onto the node payload by SetFindingStatus.
 func compactFinding(n *db.Node) map[string]any {
 	var p map[string]any
 	_ = json.Unmarshal(n.Payload, &p)
@@ -895,18 +1089,45 @@ func compactFinding(n *db.Node) map[string]any {
 	if sv, ok := p["severity"]; ok && sv != nil && sv != "" {
 		m["severity"] = sv
 	}
+	if st, ok := p["status"]; ok && st != nil && st != "" {
+		m["status"] = st
+	}
 	return m
 }
 
+func findingPayloadStatus(n *db.Node) string {
+	var p map[string]any
+	_ = json.Unmarshal(n.Payload, &p)
+	st, _ := p["status"].(string)
+	return strings.ToLower(strings.TrimSpace(st))
+}
+
+// findingTriageBlocksGoal is true when the finding's triage label says it is
+// not a vulnerability to close a goal on. Delegates to db.FindingStatusInvalidatesGoal
+// so prove_goal and DB goal-reopen logic share one list and cannot drift (#269).
+func findingTriageBlocksGoal(status string) bool {
+	return db.FindingStatusInvalidatesGoal(status)
+}
+
+func countActionableFindings(nodes []*db.Node) int {
+	n := 0
+	for _, node := range nodes {
+		if !findingTriageBlocksGoal(findingPayloadStatus(node)) {
+			n++
+		}
+	}
+	return n
+}
+
 func (t *ToolSet) listFindings() actool.CoreTool {
-	return t.readExpTool("list_findings", "列本任务及直接关联任务的【确认漏洞】(紧凑：id+task_id+intent_id+vulnclass+severity+摘要+状态)。关联任务条目带 source_task_id/inherited=true 且只读。这里只含漏洞；普通探索事实用 list_facts，详情用 node_detail(id)。",
+	return t.readExpTool("list_findings", "List the [confirmed findings] of this task and directly related tasks (compact: id+task_id+intent_id+vulnclass+severity+summary+state+status). Related-task entries carry source_task_id/inherited=true and are read-only. Only findings here; for ordinary exploration facts use list_facts, for details node_detail(id).",
 		obj(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			f, _ := t.ts.ListByKindWithSources(db.KindFinding, 500)
 			if err := t.ts.PopulateFindingTrafficIDs(f); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			intentOf, _ := t.ts.FindingIntentsWithSources() // finding id -> 产生它的 intent id
+			intentOf, _ := t.ts.FindingIntentsWithSources() // finding id -> the intent id that produced it
 			taskID := t.taskID
 			if taskID <= 0 {
 				taskID, _ = t.ts.TaskID()
@@ -937,11 +1158,11 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 const factsPageSize = 20
 
 func (t *ToolSet) listFacts() actool.CoreTool {
-	return t.readExpTool("list_facts", "分页列本任务及直接关联任务的【探索事实/结论】，最新在前(紧凑：id+摘要+状态，摘要过长会截断，全文用 node_detail(id))。参数均可选：limit(默认 20，上限 100)、before(游标，传上一页返回的 next_before 取更旧的一页；省略/0=最新一页)、q(按摘要关键词过滤)。返回 {facts, total, has_more, next_before}：total 是过滤后的总数，has_more=true 时用 next_before 继续翻页。关联任务条目带 source_task_id/inherited=true 且只读。漏洞看 list_findings。",
+	return t.readExpTool("list_facts", "Page through the [exploration facts/conclusions] of this task and directly related tasks, newest first (compact: id+summary+state+origin+source; origin is the writer, source the declared source of the content; overlong summaries are truncated — full text via node_detail(id)). All parameters optional: limit (default 20, max 100), before (cursor; pass the previous page's next_before for an older page; omit/0 = the newest page), q (filter by summary keyword). Returns {facts, total, has_more, next_before}: total is the filtered count; when has_more=true, keep paging with next_before. Related-task entries carry source_task_id/inherited=true and are read-only. For findings see list_findings.",
 		obj(map[string]any{
-			"limit":  intp("返回条数，默认 20，上限 100"),
-			"before": intp("分页游标：只返回 id 小于该值的更旧事实；省略或 0 = 最新一页"),
-			"q":      str("按事实摘要关键词过滤（不区分大小写）；省略 = 不过滤"),
+			"limit":  intp("number of entries to return, default 20, max 100"),
+			"before": intp("pagination cursor: return only older facts with id below this value; omit or 0 = the newest page"),
+			"q":      str("filter facts by summary keyword (case-insensitive); omit = no filter"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -967,19 +1188,21 @@ func (t *ToolSet) listFacts() actool.CoreTool {
 			}
 			res := map[string]any{"facts": out, "total": total, "has_more": hasMore}
 			if hasMore && len(f) > 0 {
-				res["next_before"] = f[len(f)-1].ID // 传回它取下一页(更旧的)
+				res["next_before"] = f[len(f)-1].ID // pass it back to get the next (older) page
 			}
 			return jsonResult(res)
 		})
 }
 
-// factSummaryMax caps a fact summary in list_facts output. Facts carry one-line
-// conclusions, but nothing enforces brevity; a runaway summary must not bloat a
-// whole page. Full text stays available via node_detail(id).
+// factSummaryMax caps a fact summary in list_facts output and in the overview's
+// recent_facts (#124, F3). Facts carry one-line conclusions, but nothing enforces
+// brevity; a runaway summary must not bloat a whole page, nor carry a long
+// payload into every planner and worker message. Full text stays available via
+// node_detail(id).
 const factSummaryMax = 160
 
-// compactFact is compactNode with the summary rune-capped for list_facts, so a
-// page of facts stays bounded regardless of how long any single summary grew.
+// compactFact is compactNode with the summary rune-capped for list_facts and
+// recent_facts, so they stay bounded regardless of how long any summary grew.
 func compactFact(n *db.Node) map[string]any {
 	m := compactNode(n)
 	if s, ok := m["summary"].(string); ok && len([]rune(s)) > factSummaryMax {
@@ -990,8 +1213,8 @@ func compactFact(n *db.Node) map[string]any {
 }
 
 func (t *ToolSet) nodeDetail() actool.CoreTool {
-	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容。继承节点带 source_task_id/inherited=true 且只读。仅限 list_facts/list_findings/graph_overview 返回的探索节点 id；资产请用 list_assets/asset_neighbors。",
-		obj(map[string]any{"id": idp("探索图节点 id(非资产 id)")}, "id"),
+	return t.readExpTool("node_detail", "Fetch the full content of an [exploration graph node] by id from this task or a directly related task. Inherited nodes carry source_task_id/inherited=true and are read-only. Only for exploration node ids returned by list_facts/list_findings/graph_overview; for assets use list_assets/asset_neighbors.",
+		obj(map[string]any{"id": idp("exploration graph node id (not an asset id)")}, "id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				ID json.RawMessage `json:"id"`
@@ -999,14 +1222,14 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.ID)
 			if id <= 0 {
-				return actool.Errorf("id 必填"), nil
+				return actool.Errorf("id is required"), nil
 			}
 			n, err := t.ts.GetNodeWithSources(id)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if n == nil {
-				return actool.Errorf(fmt.Sprintf("未找到探索节点 %d。若你想查的是资产，请用 list_assets / asset_neighbors（资产与探索节点是不同的 id 空间，资产 id 不能传给 node_detail）。", id)), nil
+				return actool.Errorf(fmt.Sprintf("exploration node %d not found. If you meant an asset, use list_assets / asset_neighbors (assets and exploration nodes are different id spaces; an asset id cannot be passed to node_detail).", id)), nil
 			}
 			if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -1017,7 +1240,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // --- planner write tools ---
 
-// intentItem 是 add_intent 批量/单条的一条探索方向。
+// intentItem is one exploration direction of an add_intent batch/single call.
 type intentItem struct {
 	Summary   string            `json:"summary"`
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
@@ -1025,23 +1248,25 @@ type intentItem struct {
 	Priority  int               `json:"priority"`
 }
 
-// addOneIntent 创建一条意图节点并连上游血缘，返回 id。
-// 约束：意图只能锚在已确认知识上——每个 parent_id 必须是已存在的 fact/finding
-// 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
-// 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
+// addOneIntent creates one intent node, links its upstream lineage, and returns the id.
+// Constraint: an intent may anchor only on confirmed knowledge — every parent_id must
+// be an existing fact/finding node (cannot attach to other intents/goals/hints). Leave
+// parent_ids empty for a top-level brand-new direction; it falls back to the origin
+// fact. This enforces at the creation path that "every intent links to a fact node and
+// is finding-driven rather than planned out of thin air".
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
-		return 0, fmt.Errorf("summary 不能为空")
+		return 0, fmt.Errorf("summary must not be empty")
 	}
-	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
+	// Validate anchors first (before creating the node, so a bad anchor leaves no orphan intent).
 	parents := pidList(it.ParentIDs)
 	for _, pidv := range parents {
 		n, err := t.ts.GetNodeWithSources(pidv)
 		if err != nil || n == nil {
-			return 0, fmt.Errorf("parent_id %d 不存在于本任务或直接关联任务：parent_ids 必须是已存在的【事实(fact)/发现(finding)】节点 id；顶层全新方向请留空 parent_ids", pidv)
+			return 0, fmt.Errorf("parent_id %d does not exist in this task or directly related tasks: parent_ids must be ids of existing [fact/finding] nodes; leave parent_ids empty for a top-level brand-new direction", pidv)
 		}
 		if n.Kind != db.KindFact && n.Kind != db.KindFinding {
-			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
+			return 0, fmt.Errorf("parent_id %d is a %q node and cannot anchor an intent: intents can only anchor on confirmed [fact/finding] nodes, not on intents/goals/hints; leave parent_ids empty for a top-level brand-new direction", pidv, n.Kind)
 		}
 	}
 	priority := it.Priority
@@ -1049,15 +1274,16 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		priority = 5
 	}
 	anchors := pidList(it.AssetIDs)
-	// 资产拦截：意图绑定的资产若命中系统资产拦截规则，则禁止下发该意图。
+	// Asset interception: if the assets bound to an intent hit the system's asset
+	// interception rules, the intent is forbidden from being dispatched.
 	if t.as != nil && len(anchors) > 0 {
 		hits, err := t.as.CheckAssetsIntercept(t.taskID, anchors)
 		if err != nil {
-			return 0, fmt.Errorf("资产拦截校验失败：%w", err)
+			return 0, fmt.Errorf("asset interception check failed: %w", err)
 		}
 		if len(hits) > 0 {
 			var b strings.Builder
-			fmt.Fprintf(&b, "意图「%s」绑定的资产未通过测试范围校验，请停止对相关资产进行测试：", it.Summary)
+			fmt.Fprintf(&b, "the assets bound to intent \"%s\" failed the test-scope check; stop testing the related assets:", it.Summary)
 			for _, h := range hits {
 				fmt.Fprintf(&b, "\n - %s", h.Describe())
 			}
@@ -1089,19 +1315,19 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 }
 
 func (t *ToolSet) addIntent() actool.CoreTool {
-	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
-		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
+	return t.writeExpTool("add_intent", "Generate [exploration directions] into the frontier and link them into the exploration graph. An intent is an open exploration direction, not a fixed type — describe freely in one summary sentence what to explore/verify/exploit.\n"+
+		"★Batch preferred: put multiple new directions filtered in one round into the intents array in a single submission (saves round trips vs. one call per item). Returns an ids array, same length and order as intents (failed items get id=0, details in errors). For a single intent, omit intents and pass the top-level summary.",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"priority":   intp("优先级 0-10，默认5"),
+			"intents":    map[string]any{"type": "array", "description": "[Prefer this] array of exploration directions to add, processed in order. Each element has the same fields as the top-level ones below (summary/asset_ids/parent_ids/priority). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
+			"summary":    str("[single] one sentence describing this exploration direction: what to do + why. Just write the direction clearly; asset ids are not required."),
+			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "the [target asset ids] this direction tests/attacks (**pass whenever possible**, 0/1/many; these are asset ids from list_assets, not exploration node ids): which assets (sites/endpoints/parameters/hosts etc.) this direction targets. Whenever the direction revolves around concrete assets, be sure to pass them — it is the structured marker of 'which targets this exploration hits', used for coverage dedup and linking the intent into the asset lineage. Leave empty only for pure global recon with truly no concrete target assets."},
+			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "upstream anchor ids (optional, 0/1/many): which [confirmed fact/finding] nodes this direction is synthesized from. **Only existing fact/finding node ids may be passed — not intents/goals/hints** — an intent must anchor on confirmed knowledge, finding-driven rather than planned out of thin air. Pass several when multiple facts jointly produce one new intent; leave empty for a top-level brand-new recon direction (it is automatically attached to the task's origin fact)."},
+			"priority":   intp("priority 0-10, default 5"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Intents    []intentItem `json:"intents"`
-				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
+				intentItem              // single mode: top-level summary/asset_ids/parent_ids/priority
 			}
 			_ = json.Unmarshal(in, &a)
 			batch := len(a.Intents) > 0
@@ -1123,15 +1349,18 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 				createdAny = true
 			}
 
-			// 人经主 agent 直投意图 → 若任务已 done（无 open 目标的 goalless 分支），把它
-			// 拉回 running，worker 才能领这条意图执行。resumeTask 仅由主 agent 的 Chat 接入
-			// (SetResumeTask)；planner 的 ToolSet 为 nil，故 planner 自己调 add_intent 时此段
-			// no-op，不影响其正常产意图。意图节点已在上面建好(open)，复活时不会被误判抽干。
+			// A human drops an intent directly via the main agent → if the task is done
+			// (the goalless branch with no open goals), pull it back to running so a
+			// worker can claim this intent. resumeTask is wired only by the main agent's
+			// Chat (SetResumeTask); the planner's ToolSet has nil, so this section is a
+			// no-op when the planner itself calls add_intent and doesn't disturb its
+			// normal intent production. The intent node is already created above (open),
+			// so it won't be misjudged as drained on revival.
 			if createdAny && t.resumeTask != nil {
 				t.resumeTask()
 			}
 
-			if !batch { // 单条：保持原返回
+			if !batch { // single: keep the original return
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
@@ -1146,7 +1375,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 }
 
 func (t *ToolSet) listGoals() actool.CoreTool {
-	return t.readExpTool("list_goals", "列出本任务的目标节点及其状态（open/met），用于判断是否达成。",
+	return t.readExpTool("list_goals", "List this task's goal nodes and their states (open/met), for judging whether they are met.",
 		obj(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			g, _ := t.ts.ListByKind(db.KindGoal, 100)
@@ -1154,14 +1383,20 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 		})
 }
 
+// SetTrafficProofChecker wires a live capture-store verifier used by prove_goal
+// when checking a finding's bound traffic_ref. Returning an error fails closed.
+func (t *ToolSet) SetTrafficProofChecker(fn func(ctx context.Context, trafficID string) (bool, error)) {
+	t.trafficProofChecker = fn
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
-	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
+	return t.writeExpTool("prove_goal", "Call when you judge that a finding/fact proves a goal met: links the evidence node to the goal node and marks the goal met. A finding closes a goal ONLY when it has at least one server-verified bound traffic_ref whose host matches the finding's asset (recomputed from current bindings, so a later bind_finding_traffic counts); an unbound finding stays recorded and visible but cannot close a goal. Non-HTTP goals (TCP, DNS, cloud without packets) close via an observed fact whose source is tool_output (or operator_input), not target_response. A finding whose triage status is false_positive, duplicate, or ignored is refused. Any other evidence is refused and the goal stays open.",
 		obj(map[string]any{
-			"goal_id":     idp("目标节点 id"),
-			"evidence_id": idp("证明它的发现/事实节点 id"),
-			"reason":      str("为什么这个证据满足该目标"),
+			"goal_id":     idp("goal node id"),
+			"evidence_id": idp("id of the finding/fact node that proves it"),
+			"reason":      str("why this evidence satisfies the goal"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1170,20 +1405,69 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			goal, ev := pid(a.GoalID), pid(a.EvidenceID)
 			if goal == 0 || ev == 0 {
-				return actool.Errorf("goal_id 和 evidence_id 必填"), nil
+				return actool.Errorf("goal_id and evidence_id are required"), nil
 			}
 			goalNode, err := t.ts.GetNode(goal)
 			if err != nil || goalNode == nil || goalNode.Kind != db.KindGoal {
-				return actool.Errorf("goal_id 必须是本任务的目标节点（关联任务目标只读）"), nil
+				return actool.Errorf("goal_id must be a goal node of this task (related-task goals are read-only)"), nil
 			}
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
-				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+				return actool.Errorf("evidence_id must be a fact/finding node of this task or a directly related task"), nil
+			}
+			// A fact proves a goal only when it was seen directly (#124, F5): an inferred
+			// conclusion, or one without a confidence, is refused and the goal stays open.
+			// The confidence is declared by the agent that recorded the fact.
+			if evidenceNode.Kind == db.KindFact {
+				var fp map[string]any
+				_ = json.Unmarshal(evidenceNode.Payload, &fp)
+				// A fact the server could not tie to recorded work is not authority
+				// (#124 row 1): the declared source alone does not make it one. Legacy
+				// facts written before provenance existed carry no key and keep their
+				// old behaviour; every new fact carries one.
+				if prov, ok := fp["provenance"].(string); ok && prov == factProvenanceUnverified {
+					note, _ := fp["provenance_note"].(string)
+					if note == "" {
+						note = "its evidence is not tied to a recorded activity"
+					}
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d is unverified (%s). Goal %d stays open: prove it with a finding or with a fact whose evidence quotes this intent's recorded activity.", ev, note, goal)), nil
+				}
+				confidence, _ := fp["confidence"].(string)
+				if strings.ToLower(strings.TrimSpace(confidence)) != "observed" {
+					if confidence == "" {
+						confidence = "none"
+					}
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has confidence %q, and a fact proves a goal only when its confidence is \"observed\" (seen directly in tool output). Goal %d stays open: prove it with a finding backed by verified bound traffic or with an observed tool_output fact.", ev, confidence, goal)), nil
+				}
+				// A fact whose declared source is the target's own response is not
+				// authoritative (#124, F4): the target could have planted it.
+				if source, _ := fp["source"].(string); strings.ToLower(strings.TrimSpace(source)) == factSourceTargetResponse {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has source \"target_response\" (its content comes from the target, which could have planted it), and such a fact never proves a goal. Goal %d stays open: prove it with a finding backed by verified bound traffic or with an observed fact from another source.", ev, goal)), nil
+				}
+			}
+			if evidenceNode.Kind == db.KindFinding {
+				triage := findingPayloadStatus(evidenceNode)
+				if findingTriageBlocksGoal(triage) {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: finding %d has status %q, and a false_positive, duplicate, or ignored finding never proves a goal. Goal %d stays open: prove it with a confirmed finding or with an observed fact.", ev, triage, goal)), nil
+				}
+			}
+			// A finding closes a goal only when server-side verification confirms at least
+			// one bound traffic_ref matching the finding's asset host (#124, P4.3).
+			// Lookup errors fail closed; unbound findings remain saved and visible.
+			if evidenceNode.Kind == db.KindFinding {
+				check, err := t.ts.VerifyFindingProofForNode(ctx, evidenceNode.ID, t.trafficProofChecker)
+				if err != nil {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused (fail-closed): finding %d proof verification unavailable (%v). Goal %d stays open.", ev, err, goal)), nil
+				}
+				if !check.Proven {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: finding %d cannot close goal %d (%s). The finding remains recorded and visible; bind at least one verified traffic_ref matching the finding's asset via bind_finding_traffic, or for non-HTTP goals prove with an observed tool_output fact. Goal %d stays open.", ev, goal, check.Reason, goal)), nil
+				}
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
-			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
-			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
+			// Each time a goal is marked met, check whether [all goals] of this task are
+			// met; if so, automatically judge the task complete (set GoalMet) — no need to
+			// rely on the model explicitly calling goal_met.
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
 				allMet := true
 				for _, g := range goals {
@@ -1194,8 +1478,8 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 				}
 				if allMet {
 					t.GoalMet = true
-					t.Reason = fmt.Sprintf("所有 %d 个目标均已 met（最后由 goal %d 触发）", len(goals), goal)
-					return actool.Text(fmt.Sprintf("goal %d marked met；本任务所有目标均已达成，任务自动判定完成", goal)), nil
+					t.Reason = fmt.Sprintf("all %d goals are met (last triggered by goal %d)", len(goals), goal)
+					return actool.Text(fmt.Sprintf("goal %d marked met; all goals of this task are met — the task is automatically judged complete", goal)), nil
 				}
 			}
 			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
@@ -1203,11 +1487,26 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
-		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
+	return t.writeExpTool("goal_met", "[End the entire task immediately] — call only when you are sure [all of the task's goals are truly met and it is complete overall] (note: the task as a [whole]; having met just one goal / one flag / one finding [does not count] — in that case mark that goal with prove_goal). ⚠️ It is NOT for \"ending this planning round\": if there is no new intent to dispatch this round, or you're waiting on worker output, [just end the round — do NOT call this tool] (0 intents is a perfectly normal outcome). Prefer prove_goal to prove goals one by one; goal_met is only a means to skip per-goal proofs and complete the task globally.",
+		obj(map[string]any{"reason": str("grounds for completion (must be evidence that the goals are truly met, not a round-ending reason like 'no new directions this round')")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			// goal_met ends the task only when no goal node is open (#124, F5). A task
+			// without goal nodes keeps the old behavior.
+			goals, err := t.ts.ListByKind(db.KindGoal, 1000)
+			if err != nil {
+				return actool.Errorf("goal_met refused: the goals of this task could not be read (" + err.Error() + "); the task stays open"), nil
+			}
+			open := 0
+			for _, g := range goals {
+				if g.State != "met" {
+					open++
+				}
+			}
+			if open > 0 {
+				return actool.Errorf(fmt.Sprintf("goal_met refused: %d of %d goals of this task are still open; the task stays open. Prove each one with prove_goal(goal_id, evidence_id, reason): the task completes automatically when its last goal is marked met.", open, len(goals))), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil
@@ -1217,16 +1516,20 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
-		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
-		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence":         str("证据/PoC 文本"),
-		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
-		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
-			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
+	return writeTool("report_finding", "Record a confirmed finding, with evidence providing verifiable proof such as command output and logs. In a task context, pass the current intent_id. The returned finding_id is the standalone finding record ID; finding_node_id is the exploration node ID (the first line keeps that node number). A finding without bound traffic stays recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset host is bound (for non-HTTP goals, prove with an observed tool_output fact).", obj(map[string]any{
+		"vulnclass": str("vulnerability class"), "name": str("vulnerability name"), "severity": str("critical|high|medium|low"), "summary": str("finding summary"),
+		"intent_id": idp("the current task's intent id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "affected asset ids"},
+		"evidence":         str("evidence/PoC text"),
+		"evidence_hint_id": idp("optional: the hint node ID in this task corresponding to this finding; automatically carries its structured traffic_refs; cannot reference an inherited hint or another finding's hint"),
+		"traffic_refs": map[string]any{"type": "array", "description": "optional; for HTTP/HTTPS findings, first search and verify entry by entry that the requests/responses actually support the finding's conclusion, then fill in real IDs in reproduction order. For TCP and other non-HTTP findings, or when nothing was captured or no exact record is found, omit or pass [] — it does not block reporting; explain why in evidence and provide other verifiable evidence. Don't guess IDs, infer association by domain/time, or re-probe just to pad the packet count. Roles: baseline = normal control / proof = vulnerability proof / verification = supplementary verification / supporting = auxiliary evidence.",
+			"items": obj(map[string]any{"traffic_id": str("a real traffic ID returned by traffic_search"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("how this traffic supports the finding's conclusion")}, "traffic_id")},
+		"counterevidence":      str("optional: what you tested that did not work (variants, paths, or bypasses that were blocked or came back negative). Fill it when your confidence is not high; omitting it never blocks reporting."),
+		"confidence_rationale": str("optional: why the conclusion holds (which observation rules out the benign explanation). Fill it when your confidence is not high; omitting it never blocks reporting."),
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			Counterevidence                              string            `json:"counterevidence"`
+			ConfidenceRationale                          string            `json:"confidence_rationale"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1236,29 +1539,38 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			return actool.Errorf(err.Error()), nil
 		}
 		if t.ts == nil {
-			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
+			return actool.Errorf("report_finding requires a task context; from a platform conversation, hand the finding to the corresponding task via add_task_hint with the existing traffic_refs in the hint, and let the task agent register it. Already-registered findings can be bound later via bind_finding_traffic."), nil
 		}
 		// Auto-binding off: ignore the evidence params instead of rejecting the call.
 		// stripTrafficParameters already removes them from the advertised schema, but
 		// models routinely emit fields anyway — failing here would discard a confirmed
 		// finding over a stray parameter. The success path below reports evidence_status
-		// "not_bound" with the "已关闭，可在页面人工关联" note, which is what the caller needs.
+		// "not_bound" with the "off; link manually on the page" note, which is what the
+		// caller needs.
 		if !findingTrafficBindingEnabled() {
 			a.TrafficRefs, a.EvidenceHintID = nil, nil
 		}
-		if len(a.EvidenceHintID) > 0 && pid(a.EvidenceHintID) <= 0 {
-			return actool.Errorf("evidence_hint_id 必须为有效的提示节点 ID；无交接提示时省略"), nil
-		}
+		// A model routinely emits "evidence_hint_id": 0 meaning "absent" — the field
+		// is optional, so 0 must mean "no hint", not an error. A hint id that does
+		// not resolve to a local hint node (passing a fact node number is the common
+		// case) must not sink an otherwise complete finding either: when explicit
+		// traffic_refs are present they are sufficient on their own, so degrade to
+		// them and keep the finding. Only a call with neither usable hint nor usable
+		// refs fails.
 		refs, err := t.findingRefsFromHint(pid(a.EvidenceHintID), a.TrafficRefs)
 		if err != nil {
-			return actool.Errorf(err.Error()), nil
+			if degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs); derr == nil && len(degraded) > 0 {
+				refs = degraded
+			} else {
+				return actool.Errorf(err.Error()), nil
+			}
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Counterevidence: a.Counterevidence, ConfidenceRationale: a.ConfidenceRationale}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
 		} else if len(refs) > 0 {
-			return actool.Errorf("流量证据存储不可用；未登记漏洞"), nil
+			return actool.Errorf("traffic evidence store unavailable; the finding was NOT registered"), nil
 		} else {
 			recorded, err = t.ts.RecordFinding(ctx, input)
 		}
@@ -1287,9 +1599,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
-			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"
+			result.EvidenceNote = "Finding saved without bound traffic (recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset is bound). Bind verified HTTP traffic via bind_finding_traffic or the findings page; for non-HTTP goals, prove the goal with an observed tool_output fact. Do not create the finding again."
 			if !findingTrafficBindingEnabled() {
-				result.EvidenceNote = "漏洞已保存。Agent 自动绑定流量已关闭，可在页面人工关联流量。"
+				result.EvidenceNote = "Finding saved without bound traffic. Automatic agent traffic binding is off: this finding remains visible but cannot close a goal unless traffic is bound manually later (or a non-HTTP goal is proven with an observed tool_output fact)."
 			}
 		}
 		raw, _ := json.Marshal(result)
@@ -1302,31 +1614,151 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // This is the home for observations and — importantly — negative results
 // ("port closed", "param not injectable", "no login found"). Such conclusions
 // must NOT be stuffed into the asset graph via upsert_asset.
-// factItem 是 record_fact 批量/单条的一条事实。
+// factItem is one fact of a record_fact batch/single call.
 type factItem struct {
-	Summary    string            `json:"summary"`
-	Detail     string            `json:"detail"`
-	Evidence   string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID   json.RawMessage   `json:"intent_id"`
-	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	Summary        string            `json:"summary"`
+	Detail         string            `json:"detail"`
+	Evidence       string            `json:"evidence"`   // one line of key evidence (command + key output lines) supporting the conclusion, for later verification
+	Confidence     string            `json:"confidence"` // observed (seen directly) | inferred (inferred from phenomena)
+	Source         string            `json:"source"`     // where the content came from, one of factSources; empty = inference
+	IntentID       json.RawMessage   `json:"intent_id"`
+	AssetIDs       []json.RawMessage `json:"asset_ids"`
+	TestedAssetIDs []json.RawMessage `json:"tested_asset_ids"`
 }
 
-// recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
-// 批量时的默认意图（本条未给 intent_id 时用）。
+// Fact sources (#124, F4): where a fact's content came from, as declared by the
+// agent that recorded it. The writer itself is the node's origin column, set by
+// the server, never by this field.
+const (
+	factSourceTargetResponse  = "target_response"   // content the target itself returned (pages, headers, error bodies)
+	factSourceToolOutput      = "tool_output"       // a tool's own result about the target (port states, scanner verdicts)
+	factSourceThirdPartyIntel = "third_party_intel" // external sources: OSINT, CVE databases, public reports
+	factSourceOperatorInput   = "operator_input"    // given by the human operator
+	factSourceInference       = "inference"         // the agent's own reasoning; the default
+)
+
+var factSources = []string{factSourceTargetResponse, factSourceToolOutput, factSourceThirdPartyIntel, factSourceOperatorInput, factSourceInference}
+
+// Fact provenance (#124, row 1): the source above is declared by the agent, so
+// on its own it cannot distinguish an observation from a claim. The server ties
+// each fact to a recorded activity of its intent and stores the result beside
+// the payload; only a tie (or an explicit operator statement) is authoritative.
+const (
+	factProvenanceRecorded   = "recorded_activity" // evidence quoted from this intent's activity
+	factProvenanceCaptured   = "captured_traffic"  // the quoted bytes came back from the target through the proxy
+	factProvenanceOperator   = "operator_input"    // told to the agent by the human operator
+	factProvenanceUnverified = "unverified"        // no recorded activity carries the evidence
+)
+
+// factCaptureWindowBefore/After bound the proxy captures considered part of one
+// recorded activity. The activity row is written when the tool call returns, so
+// the matching response lands just before it; the margins absorb slow calls and
+// small clock differences between the two stores.
+const (
+	factCaptureWindowBefore = 10 * time.Minute
+	factCaptureWindowAfter  = 2 * time.Minute
+)
+
+// FactTrafficLookup is the proxy capture store seen from the fact layer. Kept as
+// an interface so the agent does not depend on the traffic package. nil = no
+// capture available, and facts keep the activity-only classification.
+type FactTrafficLookup interface {
+	ResponseContaining(lines []string, fromTS, toTS int64) (id string, ok bool, err error)
+}
+
+// factEvidenceMinRunes keeps trivial fragments (a bare tool name, "200 OK")
+// from tying a fact to unrelated activity. A real evidence line quotes the
+// output; a paraphrase matches nothing, which fails safe (unverified, not
+// authoritative).
+const factEvidenceMinRunes = 12
+
+// factEvidenceMaxLines bounds the lookup cost of one record_fact item.
+const factEvidenceMaxLines = 20
+
+// factEvidenceLines splits a fact's one-line evidence into the substantive lines
+// the server can look for verbatim in the intent's recorded activity.
+func factEvidenceLines(evidence string) []string {
+	out := make([]string, 0, 4)
+	seen := map[string]bool{}
+	for _, raw := range strings.Split(evidence, "\n") {
+		line := strings.TrimSpace(raw)
+		if len([]rune(line)) < factEvidenceMinRunes || seen[line] {
+			continue
+		}
+		seen[line] = true
+		out = append(out, line)
+		if len(out) == factEvidenceMaxLines {
+			break
+		}
+	}
+	return out
+}
+
+// factProvenance classifies one fact against the intent's recorded activity.
+// Beyond the activity tie it checks whether the quoted bytes were captured
+// coming back from the target through the proxy, in which case the target
+// authored them and the fact is classified target_response even when the model
+// wrote tool_output (#124 row 1, step 3). A database error keeps the fact
+// (writes must not fail on the check) but marks it unverified, so the
+// conservative outcome is the one that survives.
+func (t *ToolSet) factProvenance(source, evidence string, intent int64) (status string, activityID int64, trafficID string, note string) {
+	if source == factSourceOperatorInput {
+		return factProvenanceOperator, 0, "", ""
+	}
+	if intent <= 0 || t.ts == nil {
+		return factProvenanceUnverified, 0, "", "no intent was recorded, so no activity could corroborate the evidence"
+	}
+	lines := factEvidenceLines(evidence)
+	if len(lines) == 0 {
+		return factProvenanceUnverified, 0, "", "evidence is missing or too short to quote a recorded activity; a fact proves a goal only when its evidence is tied to one"
+	}
+	id, at, ok, err := t.ts.ActivityContainingEvidence(intent, lines)
+	if err != nil {
+		return factProvenanceUnverified, 0, "", "the recorded activity could not be read, so the evidence is unverified"
+	}
+	if !ok {
+		return factProvenanceUnverified, 0, "", "evidence does not quote any line of this intent's recorded activity; quote the output verbatim instead of paraphrasing it"
+	}
+	if t.factTraffic != nil && !at.IsZero() {
+		from, to := at.Add(-factCaptureWindowBefore).Unix(), at.Add(factCaptureWindowAfter).Unix()
+		// A capture miss or an unreadable capture store is not a write failure:
+		// the activity tie stands and the fact stays classified as tool output.
+		if tid, hit, _ := t.factTraffic.ResponseContaining(lines, from, to); hit && tid != "" {
+			return factProvenanceCaptured, id, tid, ""
+		}
+	}
+	return factProvenanceRecorded, id, "", ""
+}
+
+// normalizeFactSource returns the stored source for a record_fact input: empty
+// means inference, a value outside factSources is an error.
+func normalizeFactSource(s string) (string, error) {
+	norm := strings.ToLower(strings.TrimSpace(s))
+	if norm == "" {
+		return factSourceInference, nil
+	}
+	for _, v := range factSources {
+		if norm == v {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("source %q is not valid: use one of %s (omit it for inference)", s, strings.Join(factSources, ", "))
+}
+
+// recordOneFact writes one fact node and links it to the intent (intent→yields→fact).
+// defaultIntent is the default intent for batch mode (used when this item gives no
+// intent_id).
 func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
-		return 0, fmt.Errorf("summary 不能为空")
+		return 0, fmt.Errorf("summary must not be empty: every fact, including each batch item, requires its own one-sentence summary")
 	}
-	payload := map[string]any{"summary": it.Summary}
-	if it.Detail != "" {
-		payload["detail"] = it.Detail
+	source, err := normalizeFactSource(it.Source)
+	if err != nil {
+		return 0, err
 	}
-	if e := strings.TrimSpace(it.Evidence); e != "" {
-		payload["evidence"] = e
-	}
-	if c := strings.TrimSpace(it.Confidence); c != "" {
-		payload["confidence"] = c
+	anchors, err := it.factAssetAnchors()
+	if err != nil {
+		return 0, err
 	}
 	intent := pid(it.IntentID)
 	if intent <= 0 {
@@ -1335,11 +1767,49 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if intent > 0 {
 		node, err := t.ts.GetNode(intent)
 		if err != nil || node == nil || node.Kind != db.KindIntent {
-			return 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
+			return 0, fmt.Errorf("intent_id must be an intent of this task (related-task intents are read-only)")
 		}
 	}
+	// Tie the claim to recorded work before storing it (#124 row 1). A fact the
+	// server cannot corroborate loses the authority its declared source and
+	// confidence imply: it is stored as inference/inferred and marked unverified,
+	// so prove_goal refuses it even if the model labelled it observed.
+	confidence := strings.TrimSpace(it.Confidence)
+	prov, provActivity, provTraffic, provNote := t.factProvenance(source, it.Evidence, intent)
+	if prov == factProvenanceUnverified {
+		if source == factSourceTargetResponse || source == factSourceToolOutput {
+			source = factSourceInference
+		}
+		if strings.EqualFold(confidence, "observed") {
+			confidence = "inferred"
+		}
+	}
+	if prov == factProvenanceCaptured {
+		// The matched bytes came back from the target, whichever tool carried
+		// them: relabel from the capture rather than trusting the declaration.
+		source = factSourceTargetResponse
+	}
+	payload := map[string]any{"summary": it.Summary, "source": source, "provenance": prov}
+	if it.Detail != "" {
+		payload["detail"] = it.Detail
+	}
+	if e := strings.TrimSpace(it.Evidence); e != "" {
+		payload["evidence"] = e
+	}
+	if confidence != "" {
+		payload["confidence"] = confidence
+	}
+	if provActivity > 0 {
+		payload["provenance_activity_id"] = provActivity
+	}
+	if provTraffic != "" {
+		payload["provenance_traffic_id"] = provTraffic
+	}
+	if provNote != "" {
+		payload["provenance_note"] = provNote
+	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, anchors)
 	if err != nil {
 		return 0, err
 	}
@@ -1350,35 +1820,47 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	return id, nil
 }
 
+// runningIntent is the intent this ToolSet works for (the worker's claimed
+// intent, set by SetOwnerNode), or 0 when the owner node is not an intent
+// (planner: the task root) or unknown.
+func (t *ToolSet) runningIntent() int64 {
+	if t.ts == nil || t.ownerNode <= 0 {
+		return 0
+	}
+	node, err := t.ts.GetNode(t.ownerNode)
+	if err != nil || node == nil || node.Kind != db.KindIntent {
+		return 0
+	}
+	return node.ID
+}
+
 func (t *ToolSet) recordFact() actool.CoreTool {
-	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。用于记录探索结果——包括指纹/枚举等【正向结论】，和'端口关闭'/'参数不可注入'/'未发现登录入口'等【否定结论】。\n"+
-		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条，可以合并成一条事实的就尽量用一条事实表示：summary=对本次结论的总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条事实 {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
-		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
-		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
-		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
-		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
-		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
-		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
-		}),
+	return t.writeExpToolRaw("record_fact", "Write an exploration [fact/conclusion] into the exploration graph, linked to the intent that produced it (intent_id). Used to record exploration results — both [positive conclusions] like fingerprinting/enumeration, and [negative conclusions] like 'port closed'/'parameter not injectable'/'no login entry found'.\n"+
+		"⚠️Multiple observations from one exploration must be [consolidated into ONE fact], not split into many; whenever they can be merged into one fact, use one: summary = a one-sentence summary of this conclusion, detail = the related details (may contain multiple concrete items). Example: a fingerprinting intent → one fact {summary:'identified the tech stack and response characteristics of site X', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}, rather than one fact each for status code, fingerprint, and title. One intent usually produces exactly one fact; splitting too finely bloats the graph endlessly.\n"+
+		"★facts is the only parameter: facts:[{...}] with one item per [mutually distinct] conclusion, usually exactly one item. Returns an ids array, same length and order as facts. An item without intent_id is linked to the intent you are running.\n"+
+		"⚠️Write only conclusions you [actually saw] in tool output — don't extrapolate. evidence and confidence keep inaccurate conclusions from polluting the graph:\n"+
+		"  · evidence = [one line] of key evidence supporting this conclusion (the command + the one or two most proving output lines), **keep it brief** — details belong in detail; don't paste large output blocks here.\n"+
+		"  · confidence = observed (seen directly in output) | inferred (inferred from phenomena).\n"+
+		"  · source = where the content came from: target_response (content the target itself returned: page bodies, headers, error messages, banners, even when a tool fetched it) | tool_output (a tool's own result about the target: port states, scanner verdicts, status codes, timings) | third_party_intel (OSINT, CVE databases, public reports) | operator_input (given by the human operator) |       inference (your own reasoning; the default when omitted). Any other value is refused.\n"+
+		"  · **evidence is checked against this intent's recorded activity**: quote the output verbatim rather than paraphrasing it. A fact whose evidence matches no recorded activity is stored as provenance=unverified, its source is downgraded to inference, an observed confidence becomes inferred, and prove_goal refuses it. If the quoted bytes were also captured coming back from the target through the proxy, the server stores source=target_response (provenance=captured_traffic) regardless of the source you declared, because the target authored them.\n"+
+		"  · **Negative conclusions** (not injectable / port closed / no entry found, etc.) state only \"observation + tentative reading\" — state what you actually saw; whether to abandon the direction is for the planner to decide globally; always provide evidence, mark inferred when the means weren't exhausted or the evidence is weak (including probed only once, looks-like), and mark observed only when truly exhausted and directly seen."+
+		recordFactContractNote,
+		recordFactSchema(),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct {
-				Facts    []factItem `json:"facts"`
-				factItem            // 单条模式 + 批量默认 intent_id
+			a, batch, err := decodeRecordFactInput(in)
+			if err != nil {
+				return actool.Errorf("invalid record_fact input: " + err.Error() + "; no facts were written"), nil
 			}
-			_ = json.Unmarshal(in, &a)
-			batch := len(a.Facts) > 0
 			items := a.Facts
 			if !batch {
 				items = []factItem{a.factItem}
 			}
-			defaultIntent := pid(a.factItem.IntentID) // 顶层 intent_id = 批量默认
+			// Default intent of the items: a legacy top-level intent_id, else the
+			// intent this worker is running (the published schema has no top level).
+			defaultIntent := pid(a.factItem.IntentID)
+			if defaultIntent <= 0 {
+				defaultIntent = t.runningIntent()
+			}
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
@@ -1391,7 +1873,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 				ids[i] = id
 			}
 
-			if !batch { // 单条：保持原返回
+			if !batch { // single: keep the original return
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
@@ -1400,8 +1882,11 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			out := map[string]any{"ids": ids}
 			if len(errs) > 0 {
 				out["errors"] = errs
+				out["retry_instruction"] = "Retry only failed indices with complete facts, including summary. Successful indices were already saved; do not retry them."
 			}
-			return jsonResult(out)
+			result, err := jsonResult(out)
+			result.IsError = len(errs) > 0
+			return result, err
 		})
 }
 
@@ -1411,13 +1896,15 @@ type hintItem struct {
 	TrafficRefs []db.TrafficRef   `json:"traffic_refs"`
 }
 
-// addOneHint 挂一条 hint 节点(active/human)到探索图,可锚定资产,返回 id。
+// addOneHint attaches a hint node (active) to the exploration graph, optionally
+// anchored to assets; returns the id. Its origin is t.worker, the agent that wrote
+// it: "human" for the main-agent chat, "orchestrator" for cross-task orchestration.
 func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	if len(it.TrafficRefs) > 0 && !findingTrafficBindingEnabled() {
-		return 0, fmt.Errorf("Agent 自动绑定流量已关闭，未保存携带 traffic_refs 的提示；可在系统设置开启，或仅交接文字")
+		return 0, fmt.Errorf("automatic agent traffic binding is off; the hint carrying traffic_refs was not saved — enable it in system settings, or hand over text only")
 	}
 	if strings.TrimSpace(it.Text) == "" {
-		return 0, fmt.Errorf("text 不能为空")
+		return 0, fmt.Errorf("text must not be empty")
 	}
 	var anchors []int64
 	for _, raw := range it.AssetIDs {
@@ -1433,9 +1920,10 @@ func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	if len(refs) > 0 {
 		payload["traffic_refs"] = refs
 	}
-	// 唤醒 planner 不在此处逐条做——由 addHint 在整批写完后统一触发一次（带上提示文本），
-	// 避免一次 add_hint 多条提示逐条刷屏 planner 的触发行。
-	return t.ts.AddNode(db.KindHint, payload, 0, "active", "human", anchors)
+	// Waking the planner is not done here per item — addHint fires it once after the
+	// whole batch is written (carrying the hint texts), so one add_hint with multiple
+	// hints doesn't spam the planner's trigger lines one by one.
+	return t.ts.AddNode(db.KindHint, payload, 0, "active", t.worker, anchors)
 }
 
 type goalItem struct {
@@ -1443,13 +1931,15 @@ type goalItem struct {
 	VulnClass string `json:"vulnclass"`
 }
 
-// addOneGoal 挂一条 goal 节点(open)到探索图:连到任务根(origin fact,rel spawns)。
-// origin 取 t.worker(缺省 system):goals 拆解器写入的记 "goals"、主 agent 运行时记
-// "human"。唤醒 planner 由 setGoals 在整批写完后统一做(见下),这里只负责落库。
+// addOneGoal attaches a goal node (open) to the exploration graph: linked to the
+// task root (origin fact, rel spawns). origin comes from t.worker (default system):
+// the goals decomposer's writes record "goals", the main agent's runtime writes
+// record "human". Waking the planner is done once by setGoals after the whole batch
+// (see below); this only persists.
 func (t *ToolSet) addOneGoal(it goalItem) (int64, error) {
 	text := strings.TrimSpace(it.Text)
 	if text == "" {
-		return 0, fmt.Errorf("text 不能为空")
+		return 0, fmt.Errorf("text must not be empty")
 	}
 	payload := map[string]any{"text": text}
 	if vc := strings.TrimSpace(it.VulnClass); vc != "" {
@@ -1469,25 +1959,27 @@ func (t *ToolSet) addOneGoal(it goalItem) (int64, error) {
 	return id, nil
 }
 
-// setGoals 给【本任务】新增探索目标(goal 节点)。既是目标拆解器的提交工具,也是主
-// agent 运行时补目标的工具——同一个受管工具,可在 web 端改描述/schema、按 agent 绑定。
+// setGoals adds exploration goals (goal nodes) to [this task]. It is both the goal
+// decomposer's submission tool and the main agent's tool for adding goals at runtime
+// — the same managed tool, with description/schema editable in the web UI and
+// bindable per agent.
 func (t *ToolSet) setGoals() actool.CoreTool {
 	return writeTool("set_goals",
-		"给【本任务】新增探索目标(goal)。目标=最终可交付/可核验的结果,不是攻击步骤或侦察动作。\n"+
-			"★优先批量:多个目标放进 goals 数组一次提交,返回 ids 与之等长同序(失败项 id=0,详情见 errors)。单条则省略 goals 直接给顶层 text。\n"+
-			"vulnclass 可选:对应漏洞类(如 SQLi/IDOR),业务逻辑类目标留空。目标是否达成由系统判定标记 met,本工具只负责新增。",
+		"Add exploration goals (goals) to [this task]. A goal = a final deliverable/verifiable result, not an attack step or recon action.\n"+
+			"★Batch preferred: put multiple goals in the goals array in a single submission; the returned ids match it in length and order (failed items get id=0, details in errors). For a single goal, omit goals and pass the top-level text.\n"+
+			"vulnclass is optional: the corresponding vulnerability class (e.g. SQLi/IDOR); leave empty for business-logic goals. Whether a goal is met is judged and marked met by the system; this tool only adds.",
 		obj(map[string]any{
-			"goals":     map[string]any{"type": "array", "description": "【优先用这个】要新增的目标数组,按顺序处理。每个元素:text(必填,一个独立可验证的最终目标)+ vulnclass(可选)。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"text":      str("[单条] 一个独立可验证的最终目标"),
-			"vulnclass": str("[单条] 对应漏洞类(若明确),如 SQLi/IDOR;业务逻辑目标可留空"),
+			"goals":     map[string]any{"type": "array", "description": "[Prefer this] array of goals to add, processed in order. Each element: text (required, an independently verifiable final goal) + vulnclass (optional). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
+			"text":      str("[single] one independently verifiable final goal"),
+			"vulnclass": str("[single] the corresponding vulnerability class (if clear), e.g. SQLi/IDOR; may be empty for business-logic goals"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.ts == nil {
-				return actool.Errorf("set_goals 未启用: ExplorationStore 未初始化"), nil
+				return actool.Errorf("set_goals is not enabled: ExplorationStore is not initialized"), nil
 			}
 			var a struct {
 				Goals    []goalItem `json:"goals"`
-				goalItem            // 单条模式:顶层 text/vulnclass
+				goalItem            // single mode: top-level text/vulnclass
 			}
 			_ = json.Unmarshal(in, &a)
 			batch := len(a.Goals) > 0
@@ -1509,23 +2001,26 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 				addedTexts = append(addedTexts, strings.TrimSpace(it.Text))
 			}
 			if len(addedTexts) > 0 {
-				// 唤醒 planner(整批一次)。优先 notifyGoal:一次 set_goals 记一条「人新增了
-				// N 个目标:…」触发,不逐条刷屏;拆解器/worker 无此回调 → 退回纯 notify(拆解器
-				// round-0 连 notify 也没接,即无操作,因为此时 planner 尚未启动)。
+				// Wake the planner (once for the whole batch). Prefer notifyGoal: one
+				// set_goals records a single "human added N goals: …" trigger instead of
+				// spamming one per item; the decomposer/worker don't have this callback →
+				// fall back to plain notify (the decomposer's round-0 doesn't even have
+				// notify wired, i.e. a no-op, because the planner hasn't started yet).
 				switch {
 				case t.notifyGoal != nil:
 					t.notifyGoal(addedTexts)
 				case t.notify != nil:
 					t.notify()
 				}
-				// 主 agent 运行时新增目标 → 把已完成/暂停的任务拉回 running 继续跑(终态门会
-				// 吞掉普通 notify,必须显式复活)。仅 mainagent 接了此回调;拆解器/worker 为 nil。
+				// The main agent adds a goal at runtime → pull a completed/paused task back
+				// to running (the terminal gate swallows plain notifies; an explicit revive
+				// is required). Only mainagent has this callback wired; decomposer/worker are nil.
 				if t.resumeTask != nil {
 					t.resumeTask()
 				}
 			}
 
-			if !batch { // 单条:保持原返回
+			if !batch { // single: keep the original return
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
@@ -1544,44 +2039,48 @@ type constraintItem struct {
 	Type string `json:"type"` // allow | deny
 }
 
-// addOneConstraint 落一条操作约束到 task_constraints。origin 取 t.worker(缺省 system):
-// 拆解器写 "goals"、主 agent 写 "human"。
+// addOneConstraint persists one operation constraint into task_constraints. origin
+// comes from t.worker (default system): the decomposer writes "goals", the main
+// agent writes "human".
 func (t *ToolSet) addOneConstraint(it constraintItem) (int64, error) {
 	text := strings.TrimSpace(it.Text)
 	if text == "" {
-		return 0, fmt.Errorf("text 不能为空")
+		return 0, fmt.Errorf("text must not be empty")
 	}
 	kind := strings.TrimSpace(strings.ToLower(it.Type))
 	if kind == "" {
-		kind = "deny" // 默认按禁止处理:未标注类型时更保守
+		kind = "deny" // default to deny: more conservative when the type is unmarked
 	}
 	if kind != "allow" && kind != "deny" {
-		return 0, fmt.Errorf("type 必须是 allow 或 deny")
+		return 0, fmt.Errorf("type must be allow or deny")
 	}
 	return t.ts.AddConstraint(kind, text, t.worker)
 }
 
-// setConstraints 给【本任务】新增操作约束(allow=允许做什么 / deny=禁止做什么)。既是目标
-// 拆解器 round-0 抽约束的提交工具,也是主 agent 运行时补约束的工具——同一受管工具,可在 web
-// 端改描述/schema、按 agent 绑定。约束会被注入 planner/worker 的系统提示以约束探索边界。
+// setConstraints adds operation constraints to [this task] (allow = what's permitted
+// / deny = what's forbidden). It is both the goal decomposer's round-0
+// constraint-extraction submission tool and the main agent's tool for adding
+// constraints at runtime — the same managed tool, with description/schema editable
+// in the web UI and bindable per agent. Constraints are injected into the
+// planner/worker system prompts to bound exploration.
 func (t *ToolSet) setConstraints() actool.CoreTool {
 	return writeTool("set_constraints",
-		"给【本任务】新增操作约束,用来框定探索边界:type=allow(允许做的操作)或 deny(禁止做的操作)。\n"+
-			"约束=对『可以/不可以做哪些操作』的规定(如『仅测当前端口,不扫其他端口』『禁止对生产库做写操作』『只允许被动侦察』),不是目标、也不是攻击步骤。\n"+
-			"★优先批量:多条放进 constraints 数组一次提交,返回 ids 与之等长同序(失败项 id=0,详情见 errors)。单条则省略 constraints 直接给顶层 text/type。\n"+
-			"只登记任务目标/描述里【明确写出】的约束,不要臆造;拿不准类型时用 deny(更保守)。",
+		"Add operation constraints to [this task] to bound exploration: type=allow (operations permitted) or deny (operations forbidden).\n"+
+			"A constraint = a rule about 'which operations may/may not be performed' (e.g. 'test only the current port, don't scan others' / 'no write operations on the production database' / 'passive reconnaissance only') — not a goal, not an attack step.\n"+
+			"★Batch preferred: put multiple constraints in the constraints array in a single submission; the returned ids match it in length and order (failed items get id=0, details in errors). For a single constraint, omit constraints and pass the top-level text/type.\n"+
+			"Register only constraints [explicitly stated] in the task goal/description — don't invent any; when unsure about the type, use deny (more conservative).",
 		obj(map[string]any{
-			"constraints": map[string]any{"type": "array", "description": "【优先用这个】要新增的约束数组,按顺序处理。每个元素:text(必填,一条约束)+ type(allow|deny)。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"text":        str("[单条] 一条操作约束的内容"),
-			"type":        str("[单条] allow(允许)或 deny(禁止);缺省按 deny 处理"),
+			"constraints": map[string]any{"type": "array", "description": "[Prefer this] array of constraints to add, processed in order. Each element: text (required, one constraint) + type (allow|deny). The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
+			"text":        str("[single] the content of one operation constraint"),
+			"type":        str("[single] allow or deny; defaults to deny when omitted"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.ts == nil {
-				return actool.Errorf("set_constraints 未启用: ExplorationStore 未初始化"), nil
+				return actool.Errorf("set_constraints is not enabled: ExplorationStore is not initialized"), nil
 			}
 			var a struct {
 				Constraints    []constraintItem `json:"constraints"`
-				constraintItem                  // 单条模式:顶层 text/type
+				constraintItem                  // single mode: top-level text/type
 			}
 			_ = json.Unmarshal(in, &a)
 			batch := len(a.Constraints) > 0
@@ -1599,7 +2098,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 				}
 				ids[i] = id
 			}
-			if !batch { // 单条:保持简单返回
+			if !batch { // single: keep the simple return
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
@@ -1614,18 +2113,18 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 }
 
 func (t *ToolSet) addHint() actool.CoreTool {
-	return t.writeExpTool("add_hint", "把人类/主 agent 的战略提示挂到探索图，规划者下次生成意图时会读到它。\n"+
-		"★优先批量：多条提示放进 hints 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 hints 等长同序（失败项 id=0，详情见 errors）。单条则省略 hints 直接给顶层 text。",
+	return t.writeExpTool("add_hint", "Attach a strategic hint to the exploration graph; the planner reads it the next time it generates intents. The hint is stored with the calling agent as its origin (human for the main-agent chat, orchestrator for cross-task orchestration, otherwise the agent's name).\n"+
+		"★Batch preferred: put multiple hints in the hints array in a single submission (saves round trips vs. one call per item). Returns an ids array, same length and order as hints (failed items get id=0, details in errors). For a single hint, omit hints and pass the top-level text.",
 		obj(map[string]any{
-			"hints":        map[string]any{"type": "array", "description": "【优先用这个】要新增的提示数组，按顺序处理。每个元素字段同下方顶层字段（text/asset_ids/traffic_refs）。返回 ids 与本数组等长、同序。", "items": obj(map[string]any{"text": str("提示内容"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": HintTrafficSchema()})},
-			"text":         str("[单条] 提示内容，如'重点挖认证后接口'"),
+			"hints":        map[string]any{"type": "array", "description": "[Prefer this] array of hints to add, processed in order. Each element has the same fields as the top-level ones below (text/asset_ids/traffic_refs). The returned ids match this array in length and order.", "items": obj(map[string]any{"text": str("hint content"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": HintTrafficSchema()})},
+			"text":         str("[single] hint content, e.g. 'focus on post-auth endpoints'"),
 			"traffic_refs": HintTrafficSchema(),
-			"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "锚定的资产 id（可选，0/1/多个）"},
+			"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "asset ids to anchor (optional, 0/1/many)"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Hints    []hintItem `json:"hints"`
-				hintItem            // 单条模式：顶层 text/asset_ids
+				hintItem            // single mode: top-level text/asset_ids
 			}
 			_ = json.Unmarshal(in, &a)
 			batch := len(a.Hints) > 0
@@ -1647,18 +2146,20 @@ func (t *ToolSet) addHint() actool.CoreTool {
 				addedTexts = append(addedTexts, strings.TrimSpace(it.Text))
 			}
 			if len(addedTexts) > 0 {
-				// 唤醒 planner（整批一次）。优先 notifyHint：一次 add_hint 记一条「人新增了
-				// N 条战略提示：…」触发，让 planner 明确"本轮由新增 hint 触发"并看到提示内容；
-				// 未接该回调时退回纯 notify（bare wake，hint 仍折在图里供其自行读取）。
+				// Wake the planner (once for the whole batch). Prefer notifyHint: one
+				// add_hint records a single "<origin> added N strategic hints: …" trigger,
+				// so the planner knows "this round was fired by a new hint", who wrote it,
+				// and sees its content; when the callback isn't wired, fall back to plain
+				// notify (bare wake; the hint is still folded into the graph for it to read).
 				switch {
 				case t.notifyHint != nil:
-					t.notifyHint(addedTexts)
+					t.notifyHint(t.worker, addedTexts)
 				case t.notify != nil:
 					t.notify()
 				}
 			}
 
-			if !batch { // 单条：保持原返回
+			if !batch { // single: keep the original return
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
@@ -1674,11 +2175,11 @@ func (t *ToolSet) addHint() actool.CoreTool {
 
 // killWorkTool lets the planner terminate a single running work (by intent id).
 func (t *ToolSet) killWorkTool() actool.CoreTool {
-	return t.writeExpTool("kill_work", "终止一条正在运行的意图(work)。用于叫停跑偏/无意义的探索；被终止的意图标记为 stopped，不再自动重领。先用 get_worker_output 看看它在干嘛再决定。",
-		obj(map[string]any{"intent_id": idp("要终止的意图 id（= work 句柄）")}, "intent_id"),
+	return t.writeExpTool("kill_work", "Terminate a running intent (work). Used to stop off-track/meaningless exploration; the terminated intent is marked stopped and won't be re-claimed automatically. Check what it's doing with get_worker_output before deciding.",
+		obj(map[string]any{"intent_id": idp("the id of the intent to terminate (= the work handle)")}, "intent_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.killWork == nil {
-				return actool.Errorf("kill_work 当前不可用"), nil
+				return actool.Errorf("kill_work is currently unavailable"), nil
 			}
 			var a struct {
 				IntentID json.RawMessage `json:"intent_id"`
@@ -1686,32 +2187,33 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
 			if id <= 0 {
-				return actool.Errorf("intent_id 必填"), nil
+				return actool.Errorf("intent_id is required"), nil
 			}
 			node, err := t.ts.GetNode(id)
 			if err != nil || node == nil || node.Kind != db.KindIntent {
-				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
+				return actool.Errorf("intent_id must be an intent of this task (related-task intents are read-only)"), nil
 			}
 			if err := t.killWork(id); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 发送终止信号", id)), nil
+			return actool.Text(fmt.Sprintf("termination signal sent to the work of intent %d", id)), nil
 		})
 }
 
 // steerWorkTool lets the planner inject a mid-run course-correction into a running
 // work WITHOUT killing it: the message reaches the worker before its next tool call,
 // which re-plans its next step (already-gathered context is kept). For in-intent
-// nudges ("停做 X、聚焦 Y"); if the whole direction is wrong use kill_work + a new intent.
+// nudges ("stop doing X, focus on Y"); if the whole direction is wrong use kill_work
+// + a new intent.
 func (t *ToolSet) steerWorkTool() actool.CoreTool {
-	return t.writeExpTool("steer_work", "给一条正在运行的意图(work)实时注入纠偏指令，不打断它、不丢已有进展：worker 会在下一步动作前收到你的指令并据此调整。用于'别再走 X、聚焦 Y'这类【意图内】纠偏；若方向整个错了应改用 kill_work 再下新意图。建议先用 get_worker_output 看它在干嘛。",
+	return t.writeExpTool("steer_work", "Inject a course-correction instruction into a running intent (work) in real time, without interrupting it or losing progress: the worker receives your instruction before its next action and adjusts accordingly. For [in-intent] corrections like 'stop doing X, focus on Y'; if the whole direction is wrong, use kill_work and dispatch a new intent instead. Check what it's doing with get_worker_output first.",
 		obj(map[string]any{
-			"intent_id": idp("要纠偏的意图 id（= work 句柄）"),
-			"message":   str("给 worker 的纠偏指令，明确让它停止什么、转向什么"),
+			"intent_id": idp("the id of the intent to steer (= the work handle)"),
+			"message":   str("the course-correction instruction for the worker — state clearly what to stop and what to turn to"),
 		}, "intent_id", "message"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.steerWork == nil {
-				return actool.Errorf("steer_work 当前不可用"), nil
+				return actool.Errorf("steer_work is currently unavailable"), nil
 			}
 			var a struct {
 				IntentID json.RawMessage `json:"intent_id"`
@@ -1720,26 +2222,26 @@ func (t *ToolSet) steerWorkTool() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
 			if id <= 0 {
-				return actool.Errorf("intent_id 必填"), nil
+				return actool.Errorf("intent_id is required"), nil
 			}
 			node, err := t.ts.GetNode(id)
 			if err != nil || node == nil || node.Kind != db.KindIntent {
-				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
+				return actool.Errorf("intent_id must be an intent of this task (related-task intents are read-only)"), nil
 			}
 			if strings.TrimSpace(a.Message) == "" {
-				return actool.Errorf("message 必填"), nil
+				return actool.Errorf("message is required"), nil
 			}
 			if err := t.steerWork(id, a.Message); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 注入纠偏指令（下一步生效）", id)), nil
+			return actool.Text(fmt.Sprintf("course-correction instruction injected into the work of intent %d (takes effect at its next step)", id)), nil
 		})
 }
 
-// getWorkerOutput returns a work's final (or截至中止时的) conclusion text by intent id.
+// getWorkerOutput returns a work's final (or as-of-abort) conclusion text by intent id.
 func (t *ToolSet) getWorkerOutput() actool.CoreTool {
-	return t.readExpTool("get_worker_output", "取本任务或直接关联任务某条意图(work)的最终输出结论。关联任务结果带 source_task_id/inherited=true 且只读。正常结束返回其总结；被终止(stopped)/异常的 work 返回其截至中止时的最后输出。",
-		obj(map[string]any{"intent_id": idp("意图 id（= work 句柄）")}, "intent_id"),
+	return t.readExpTool("get_worker_output", "Fetch the final output conclusion of an intent (work) in this task or a directly related task. Related-task results carry source_task_id/inherited=true and are read-only. A normally finished work returns its summary; a terminated (stopped)/failed work returns its last output as of abort.",
+		obj(map[string]any{"intent_id": idp("intent id (= the work handle)")}, "intent_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				IntentID json.RawMessage `json:"intent_id"`
@@ -1747,14 +2249,14 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
 			if id <= 0 {
-				return actool.Errorf("intent_id 必填"), nil
+				return actool.Errorf("intent_id is required"), nil
 			}
 			intentNode, err := t.ts.GetNodeWithSources(id)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if intentNode == nil || intentNode.Kind != db.KindIntent {
-				return actool.Errorf("intent_id 不属于本任务或其直接关联任务"), nil
+				return actool.Errorf("intent_id does not belong to this task or its directly related tasks"), nil
 			}
 			acts, _, err := t.ts.ActivityListWithSources(id, 0, 1000)
 			if err != nil {
@@ -1777,10 +2279,10 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			if pick == nil {
 				if intentNode.Inherited {
 					return jsonResult(inheritedMap(map[string]any{
-						"intent_id": id, "final_text": "（该 work 尚无任何输出）",
+						"intent_id": id, "final_text": "(this work has no output yet)",
 					}, intentNode.SourceTaskID))
 				}
-				return actool.Text("（该 work 尚无任何输出）"), nil
+				return actool.Text("(this work has no output yet)"), nil
 			}
 			detail, _ := t.ts.ActivityDetailWithSources(pick.ID)
 			if detail == "" {
@@ -1820,16 +2322,16 @@ func traceSteps(acts []db.Activity) []map[string]any {
 // few specific steps. Thinking steps are excluded everywhere.
 func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 	return t.readExpTool("get_worker_trace",
-		"查看某条意图(work)的【执行过程】（区别于 get_worker_output 只给最终结论）。三种用法：\n"+
-			"① 只传 intent_id → 返回该 work 每一步的摘要流（summary≤100字，含 step_id；只是动作轮廓，不含完整输出）；\n"+
-			"② intent_id + q → 只返回命中关键字的步骤摘要（在摘要和完整输出里都搜；仍只给 summary，要看内容用③）；\n"+
-			"③ intent_id + step_ids → 返回这些步骤的完整内容(detail)；一次最多取 5 个，超出只返回前 5 个并在 notice/omitted_step_ids 里告知未取的。\n"+
-			"典型流程：先①/②定位可疑步骤的 step_id，再用③取其完整输出。不含思考(thinking)步骤。支持直接关联任务的历史 trace；其结果带 source_task_id/inherited=true 且只读。",
+		"View an intent (work)'s [execution process] (unlike get_worker_output, which gives only the final conclusion). Three usages:\n"+
+			"① intent_id only → returns a summary stream of the work's steps (summary≤100 chars, with step_id; just an action outline, no full output);\n"+
+			"② intent_id + q → returns only the summaries of steps matching the keyword (searches both summaries and full output; still gives only summary — use ③ for content);\n"+
+			"③ intent_id + step_ids → returns the full content (detail) of those steps; at most 5 per call — extras are dropped after the first 5 and reported in notice/omitted_step_ids.\n"+
+			"Typical flow: locate suspicious steps' step_ids with ①/②, then fetch their full output with ③. Thinking steps are excluded. Historical traces of directly related tasks are supported; their results carry source_task_id/inherited=true and are read-only.",
 		obj(map[string]any{
-			"intent_id": idp("意图 id（= work 句柄）"),
-			"q":         str("关键字：只返回摘要/完整输出命中它的步骤（可选；与 step_ids 互斥）"),
-			"step_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "要取完整内容的 step_id（来自①/②返回；一次最多取 5 个，多传只返回前 5 个，其余在 omitted_step_ids 里列出）"},
-			"limit":     intp("摘要流/检索的返回上限（可选）"),
+			"intent_id": idp("intent id (= the work handle)"),
+			"q":         str("keyword: return only steps whose summary/full output matches it (optional; mutually exclusive with step_ids)"),
+			"step_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "step_ids to fetch full content for (from ①/② returns; at most 5 per call — extras beyond the first 5 are listed in omitted_step_ids)"},
+			"limit":     intp("return cap for the summary stream/search (optional)"),
 		}, "intent_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1841,14 +2343,14 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			id := pid(a.IntentID)
 			if id <= 0 {
-				return actool.Errorf("intent_id 必填"), nil
+				return actool.Errorf("intent_id is required"), nil
 			}
 			intentNode, nodeErr := t.ts.GetNodeWithSources(id)
 			if nodeErr != nil {
 				return actool.Errorf(nodeErr.Error()), nil
 			}
 			if intentNode == nil || intentNode.Kind != db.KindIntent {
-				return actool.Errorf("intent_id 不属于本任务或其直接关联任务"), nil
+				return actool.Errorf("intent_id does not belong to this task or its directly related tasks"), nil
 			}
 			// ③ detail drill-down by step ids, thinking excluded by the store.
 			if len(a.StepIDs) > 0 {
@@ -1896,8 +2398,8 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 					// whether another call is worth it; the notice states the same in prose.
 					result["omitted_step_ids"] = omitted
 					result["notice"] = fmt.Sprintf(
-						"每次最多取 %d 个步骤的完整内容，本次已返回前 %d 个（%v），未取的 %d 个为 %v。"+
-							"若这些内容已足够定位，则无需再取剩余步骤；确需继续时，用这些 step_id 再调一次。",
+						"At most %d steps' full content per call; this call returned the first %d (%v); the %d not fetched are %v."+
+							"If these are enough to locate the issue, no need to fetch the rest; if you really need to continue, call again with those step_ids.",
 						maxStepIDs, len(ids), ids, len(omitted), omitted)
 				}
 				if intentNode.Inherited {
@@ -1929,12 +2431,12 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 // summaries (≤100 chars), each tagged with its intent_id for follow-up drill-down.
 func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 	return t.readExpTool("search_all_worker_traces",
-		"【通常不推荐使用，因为系统中已经给了大部分信息了】在【本任务其他 work 的执行过程】里按关键字(q)检索——用于找回某个 worker 见过、却没写进 fact 的东西（某路径/token/报错等）。"+
-			"已自动排除你自己这条意图的步骤（那些本就在你上下文里）。"+
-			"只返回命中步骤的摘要(summary≤100字)，每条带 intent_id；据此再用 get_worker_trace(intent_id, step_ids=[...]) 取完整内容。",
+		"[Usually not recommended — the system already provides most of the information] Keyword-search (q) across [the execution processes of this task's other works] — to recover something a worker saw but never wrote into a fact (a path/token/error etc.)."+
+			"Your own intent's steps are automatically excluded (those are already in your context)."+
+			"Returns only the matching steps' summaries (summary≤100 chars), each with its intent_id; then fetch full content via get_worker_trace(intent_id, step_ids=[...]).",
 		obj(map[string]any{
-			"q":     str("关键字（在所有 work 步骤的摘要+完整输出里搜）"),
-			"limit": intp("返回上限，默认 100（可选）"),
+			"q":     str("keyword (searched in all work steps' summaries + full output)"),
+			"limit": intp("return cap, default 100 (optional)"),
 		}, "q"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1943,9 +2445,9 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Q) == "" {
-				return actool.Errorf("q 必填"), nil
+				return actool.Errorf("q is required"), nil
 			}
-			// 排除调用者自身这条意图的步骤（worker 的自有 trace 已在其上下文里）。
+			// Exclude the caller's own intent's steps (a worker's own trace is already in its context).
 			acts, err := t.ts.ActivityTraceSearchAllWithSources(t.ownerNode, a.Q, a.Limit)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -1978,12 +2480,12 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 // no process to inspect).
 func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 	return t.readExpTool("list_worker_traces",
-		"【通常不推荐使用，因为系统中已经给了大部分信息了】列出本任务里【已跑过的 work（意图）】索引：intent_id + 一句话方向(summary) + 状态。"+
-			"你(worker)看不到探索图，用它来发现有哪些 work 值得翻看——再用 get_worker_trace(intent_id) 看其步骤、get_worker_trace(intent_id, step_ids=[...]) 取详情。"+
-			"只列已执行的(running/done/exhausted/blocked/stopped)，不含还没跑的 open。注意：你的任务边界仍是你领到的那条意图，看别的 work 只为复用观察/避免重复劳动。",
+		"[Usually not recommended — the system already provides most of the information] List the index of [works (intents) that have run] in this task: intent_id + one-line direction (summary) + state."+
+			"You (worker) can't see the exploration graph; use it to discover which works are worth reviewing — then view their steps with get_worker_trace(intent_id) and fetch details with get_worker_trace(intent_id, step_ids=[...])."+
+			"Only executed ones are listed (running/done/exhausted/blocked/stopped), not the not-yet-run open ones. Note: your task boundary is still the intent you claimed; looking at other works is only for reusing observations/avoiding duplicate work.",
 		obj(map[string]any{
-			"q":     str("按 summary 关键字过滤（可选）"),
-			"limit": intp("返回上限，默认 50（可选）"),
+			"q":     str("filter by summary keyword (optional)"),
+			"limit": intp("return cap, default 50 (optional)"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2037,18 +2539,25 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
 		t.killWorkTool(), t.steerWorkTool(),
-		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
+		// report_finding: if the planner itself has confirmed a finding during
+		// situational assessment, it can register it directly (same tool as the worker's).
 		t.addFinding(),
-		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。
+		// list_companies: view the company list + scopes + asset counts (to get
+		// company_id / understand attribution scopes).
 		t.listCompanies(),
-		// list_assets：规划时按 DSL 检索全资产库（配合 list_untested_assets 的"范围内未测"视角，
-		// 补上"按域名/指纹/端口/状态码等条件在整库里查"的能力）。
+		// list_assets: DSL search of the whole asset library while planning
+		// (complementing list_untested_assets' "in-scope untested" view with the ability
+		// to "query the whole library by domain/fingerprint/port/status code etc.").
 		t.listAssets(),
-		// add_company_scope：规划时可把域名/IP/CIDR/ICP/关键词纳入某公司的资产范围（自动认领命中资产）。
+		// add_company_scope: while planning, pull domains/IPs/CIDRs/ICP
+		// registrations/keywords into a company's asset scope (matching assets are
+		// auto-claimed).
 		t.addCompanyScope(),
-		// add_task_scope：主动把整根域/整公司/某子域/IP 纳入本任务测试范围(覆盖度分母)。
+		// add_task_scope: deliberately pull a whole root domain / whole company / a
+		// subdomain / an IP into this task's test scope (the coverage denominator).
 		t.addTaskScope(),
-		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
+		// list_untested_assets: query untested assets in this task's scope on demand
+		// (by type + paginated), and decide on supplementary testing yourself.
 		t.listUntestedAssets(),
 	}
 }

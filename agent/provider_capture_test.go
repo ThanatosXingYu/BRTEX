@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ThanatosXingYu/BRTEX/llmrec"
+	"github.com/Autumn-27/artex/llmrec"
 )
 
 // The transport is the only layer that still sees the wire bodies: norma builds
@@ -21,7 +21,7 @@ func TestRoundTripCapturesRawBodies(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := quotaAwareHTTPClient("", "")
+	client, err := quotaAwareHTTPClient("", "", "")
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestRoundTripCaptures429BodyAlongsideQuotaRewrite(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := quotaAwareHTTPClient("", "")
+	client, err := quotaAwareHTTPClient("", "", "")
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestRoundTripWithoutCaptureIsUnchanged(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := quotaAwareHTTPClient("", "")
+	client, err := quotaAwareHTTPClient("", "", "")
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}

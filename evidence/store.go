@@ -13,11 +13,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 type Store struct {
@@ -52,7 +53,7 @@ func verifyFile(path, hash string, length int64) error {
 		return err
 	}
 	if n != length || hex.EncodeToString(h.Sum(nil)) != hash {
-		return fmt.Errorf("证据正文校验失败: %s", hash)
+		return fmt.Errorf("evidence body verification failed: %s", hash)
 	}
 	return nil
 }
@@ -76,10 +77,10 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 	}
 	hash = hex.EncodeToString(h.Sum(nil))
 	if n != expectedLength {
-		return "", fmt.Errorf("正文不完整: 预期 %d 字节，读取 %d 字节", expectedLength, n)
+		return "", fmt.Errorf("incomplete body: expected %d bytes, read %d bytes", expectedLength, n)
 	}
 	if expectedHash != "" && expectedHash != hash {
-		return "", errors.New("原始流量正文哈希不匹配")
+		return "", errors.New("original traffic body hash mismatch")
 	}
 	if err = f.Sync(); err != nil {
 		return "", err
@@ -176,7 +177,37 @@ func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.Prepare
 		out = append(out, db.PreparedTrafficEvidence{Ref: byID[e.ID], Snapshot: v})
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	// Enrich after ReadEvidence returns so RewriteInfo is never called while
+	// ReadEvidence holds the traffic writer lock.
+	for i := range out {
+		rewritten, ruleIDs, err := s.Traffic.RewriteInfo(out[i].Snapshot.SourceTrafficID)
+		if err != nil {
+			return nil, fmt.Errorf("read rewrite provenance for %s: %w", out[i].Snapshot.SourceTrafficID, err)
+		}
+		if rewritten {
+			out[i].Snapshot.Rewritten = true
+			if len(ruleIDs) > 0 {
+				ids := slices.Clone(ruleIDs)
+				slices.Sort(ids)
+				out[i].Snapshot.RewriteRuleIDs = slices.Compact(ids)
+			}
+		}
+	}
+	return out, nil
+}
+
+// TrafficExists reports whether a bound snapshot's source exchange is still in
+// the live capture this store binds from. prove_goal uses it through the
+// planner's finding recorder; a missing capture store is an error, so the
+// proof is refused rather than accepted.
+func (s *Store) TrafficExists(ctx context.Context, trafficID string) (bool, error) {
+	if s == nil {
+		return false, errors.New("evidence store unavailable")
+	}
+	return s.Traffic.ExchangeExists(ctx, trafficID)
 }
 
 func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.TrafficRef) (out *db.RecordedFinding, err error) {
@@ -249,7 +280,7 @@ func (s *Store) OpenBody(snapshot db.TrafficEvidenceSnapshot, side string) (*os.
 	if side == "response" {
 		hash, length = snapshot.RespHash, snapshot.RespLen
 	} else if side != "request" {
-		return nil, 0, errors.New("side 必须为 request 或 response")
+		return nil, 0, errors.New("side must be request or response")
 	}
 	path, err := hashPath(s.Dir, hash)
 	if err != nil {
@@ -317,7 +348,7 @@ func (s *Store) WithInstalledSnapshots(ctx context.Context, snapshots []db.Traff
 	return s.DB.WithEvidenceTx(ctx, func(*sql.Tx) error {
 		for _, v := range snapshots {
 			if v.ID != db.TrafficSnapshotID(v) {
-				return errors.New("归档证据快照元数据哈希不匹配")
+				return errors.New("archived evidence snapshot metadata hash mismatch")
 			}
 			for _, body := range []struct {
 				hash   string

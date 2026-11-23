@@ -14,6 +14,12 @@ import (
 // avoid cross-package cleanup races (e.g. DELETE FROM assets WHERE id > X
 // from one package deleting assets created by another).
 func TestMain(m *testing.M) {
+	// Own database per package (#80): with separate databases, packages stop
+	// contending on shared tables and the advisory lock below stops
+	// serializing go test ./... across packages.
+	SuffixTestDatabase("db")
+	box, _ := newSecretBox(testSecretKey)
+	activeSecretBox.Store(box)
 	dsn, _, err := DSN()
 	if err != nil {
 		// No DB configured — tests that need PG will skip themselves.

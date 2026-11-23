@@ -12,7 +12,7 @@ import (
 // Task is a row in the task registry (1:1 with an exploration).
 type Task struct {
 	ID            int64      `json:"id"`
-	Name          string     `json:"name"` // 可选任务名称;空=未命名
+	Name          string     `json:"name"` // optional task name; empty=unnamed
 	CategoryID    *int64     `json:"category_id,omitempty"`
 	CategoryName  string     `json:"category_name,omitempty"`
 	Pinned        bool       `json:"pinned"`
@@ -28,27 +28,39 @@ type Task struct {
 	LLMProfileID  *int64     `json:"llm_profile_id,omitempty"`
 	// Task-level ordered LLM chain. LLMProfileID remains the compatibility alias
 	// for ActiveLLMProfileID while older API clients still send one profile id.
-	LLMProfileIDs      []int64    `json:"llm_profile_ids,omitempty"`
-	ActiveLLMProfileID *int64     `json:"active_llm_profile_id,omitempty"`
-	LLMChainRevision   int64      `json:"-"`
-	LLMFailoverState   string     `json:"llm_failover_state,omitempty"`
-	LLMFailoverReason  string     `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64    `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64    `json:"company_ids,omitempty"`
-	ParentRef          string     `json:"parent_ref,omitempty"` // 父任务 id(编排 spawn 记录;空=顶层)
-	CreatedAt          time.Time  `json:"created_at"`
-	CompletedAt        *time.Time `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout)的时刻;非终态为 nil
-	// 任务级超时(见 docs/任务级超时与收尾设计.md)。
-	TimeoutSeconds int        `json:"timeout_seconds"`        // 0=不限时
-	FirstRunAt     *time.Time `json:"first_run_at,omitempty"` // 首次真正开始运行的时刻(非 created_at);nil=尚未运行
-	DeadlineAt     *time.Time `json:"deadline_at,omitempty"`  // = first_run_at + timeout_seconds;nil=不限或未运行
-	// planner 心跳触发间隔(秒)：距上轮 plan 结束/任务开始满该值且期间无触发 → 触发一轮。
-	// 下限=默认=300(5min)，低于一律抬到 300(在 CreateTask 归一)。见 docs/planner-trigger-impl-plan.md
+	LLMProfileIDs      []int64 `json:"llm_profile_ids,omitempty"`
+	ReadyLLMProfileIDs []int64 `json:"-"`
+	ActiveLLMProfileID *int64  `json:"active_llm_profile_id,omitempty"`
+	LLMChainRevision   int64   `json:"-"`
+	LLMFailoverState   string  `json:"llm_failover_state,omitempty"`
+	LLMFailoverReason  string  `json:"llm_failover_reason,omitempty"`
+	// LLMRotate: per-intent chain-head rotation switch (#85); false = classic
+	// ordered failover from the active head.
+	LLMRotate     bool       `json:"llm_rotate"`
+	SourceTaskIDs []int64    `json:"source_task_ids,omitempty"`
+	CompanyIDs    []int64    `json:"company_ids,omitempty"`
+	ParentRef     string     `json:"parent_ref,omitempty"` // parent task id (recorded by orchestration spawn; empty=top level)
+	CreatedAt     time.Time  `json:"created_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"` // when it entered a terminal state (done/failed/timeout); nil for non-terminal
+	// Task-level timeout (see the task-level timeout and wrap-up design doc).
+	TimeoutSeconds int        `json:"timeout_seconds"`        // 0=no time limit
+	FirstRunAt     *time.Time `json:"first_run_at,omitempty"` // when it first actually started running (not created_at); nil=not yet run
+	DeadlineAt     *time.Time `json:"deadline_at,omitempty"`  // = first_run_at + timeout_seconds, shifted forward by paused intervals on resume; nil=unlimited or not yet run
+	// planner heartbeat trigger interval (seconds): when this much time has passed since the
+	// last plan round ended / the task started, with no trigger in between → trigger a round.
+	// Floor = default = 300 (5min); anything lower is raised to 300 (normalized in CreateTask). See docs/planner-trigger-impl-plan.md
 	PlanHeartbeatSeconds int `json:"plan_heartbeat_seconds"`
-	// CoverageEnabled 是「资产覆盖度功能」总开关(默认 true)。false 时：不计算/不展示测试
-	// 覆盖度、不自动累积 task_scope(source=auto)、不给 agent 开放 add_task_scope/
-	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
-	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
+	// PlanQuietMode gates the planner quiet-mode (#86): edge-triggered rounds
+	// are skipped while work is in flight and the open-goal set is unchanged.
+	PlanQuietMode bool `json:"plan_quiet_mode"`
+	// TargetGate is the per-task opt-in of the approval gate for asset targets.
+	// false (default) = no gate, behaviour unchanged.
+	TargetGate bool `json:"target_gate"`
+	// CoverageEnabled is the master switch of the "asset coverage" feature (default true). When false:
+	// do not compute/show test coverage, do not auto-accumulate task_scope (source=auto), do not open
+	// add_task_scope/list_untested_assets to the agent, and do not inject the coverage block into the
+	// situation view (the scope field is still kept). company associations (task_scope kind=company)
+	// are unrelated to this switch and never affected. See db/task_scope.go.
 	CoverageEnabled bool `json:"coverage_enabled"`
 }
 
@@ -70,16 +82,17 @@ type TaskDeletePreparation struct {
 }
 
 // IsTerminal reports whether a task status is a terminal (finished) state.
-// 单一真源，替换散落各处的 done/failed 硬编码判定。
+// Single source of truth, replacing the scattered hard-coded done/failed checks.
 func IsTerminal(status string) bool {
 	return status == "done" || status == "failed" || status == "timeout"
 }
 
 // CreateTask creates an exploration + task in one transaction and returns the task.
-// timeoutSeconds is the task-level wall-clock budget (0 = 不限时); deadline_at is
+// timeoutSeconds is the task-level wall-clock budget (0 = no limit); deadline_at is
 // stamped later at first real run (see engine), not here.
-// MinPlanHeartbeatSeconds 是 planner 心跳间隔的下限 = 默认 = 10min。
-// 低于它(含缺省 0 / 负值 / 误配的小值)一律抬到 10min，防止把 planner 打爆。
+// MinPlanHeartbeatSeconds is the floor of the planner heartbeat interval = default = 10min.
+// Anything below it (including a missing 0 / negative / misconfigured small value) is
+// raised to 10min, to avoid hammering the planner.
 const MinPlanHeartbeatSeconds = 600
 
 // MaxTaskSourceCount bounds the amount of live inherited context one task can
@@ -144,18 +157,28 @@ func (d *DB) CreateTask(description, goal string, llmProfileID *int64, timeoutSe
 // TaskCreateOptions contains the task data that must be committed atomically
 // with the task/exploration row.
 type TaskCreateOptions struct {
-	Name                 string // 可选任务名称;空=未命名
+	Name                 string // optional task name; empty=unnamed
 	CategoryID           *int64
 	SourceTaskIDs        []int64
 	CompanyIDs           []int64
 	LLMProfileIDs        []int64
 	TimeoutSeconds       int
 	PlanHeartbeatSeconds int
-	// CoverageEnabled 是「资产覆盖度功能」开关;nil=默认开(true)，让不关心该开关的创建
-	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
+	// PlanQuietMode is the per-task quiet-mode switch; nil = default on (#86).
+	PlanQuietMode *bool
+	// CoverageEnabled is the "asset coverage" feature switch; nil=default on (true), letting
+	// creation paths that do not care about the switch (orchestration spawn, old API) keep the
+	// original behavior. Only web task creation can explicitly pass false to turn it off.
 	CoverageEnabled *bool
-	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
+	// InterceptRules are task-level asset interception rules, written into task_intercept_rules in the same transaction as the task at creation.
 	InterceptRules []TaskInterceptRuleInput
+	// LLMRotate enables per-intent round-robin rotation of the task's LLM chain
+	// heads (#85): each claimed worker intent runs on the next profile in the
+	// chain instead of the single active head. nil = off (default), preserving
+	// the ordered-failover semantics.
+	LLMRotate *bool
+	// TargetGate opts the task into the approval gate for asset targets; nil = off.
+	TargetGate *bool
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -184,7 +207,7 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 	// is global and shared, not isolated per task). Being a fact (not a special 'begin' kind) lets every
 	// intent uniformly connect to a fact node, including the first ones.
 	originPayload, _ := json.Marshal(map[string]any{
-		"summary":     "任务起点：" + description + "；目标：" + goal,
+		"summary":     "Task origin: " + description + "; Goal: " + goal,
 		"description": description,
 		"goal":        goal,
 	})
@@ -215,6 +238,10 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		id := opts.LLMProfileIDs[0]
 		active = &id
 	}
+	quietMode := true
+	if opts.PlanQuietMode != nil {
+		quietMode = *opts.PlanQuietMode
+	}
 	t := &Task{
 		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
 		Description: description, Goal: goal, ExplorationID: expID,
@@ -223,12 +250,19 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		SourceTaskIDs:  append([]int64(nil), opts.SourceTaskIDs...),
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
+		PlanQuietMode:   quietMode,
 		CoverageEnabled: coverageEnabled,
 	}
+	rotate := false
+	if opts.LLMRotate != nil {
+		rotate = *opts.LLMRotate
+	}
+	t.LLMRotate = rotate
+	t.TargetGate = opts.TargetGate != nil && *opts.TargetGate
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, plan_quiet_mode, coverage_enabled, llm_rotate, target_gate)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, quietMode, coverageEnabled, rotate, t.TargetGate).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -267,7 +301,7 @@ WITH requested(company_id, position) AS (
     FROM unnest($2::bigint[]) WITH ORDINALITY AS requested(company_id, position)
 ), inserted AS (
     INSERT INTO task_scope(task_id, kind, company_id, source, reason)
-    SELECT $1, 'company', companies.id, 'manual', '任务创建时关联企业'
+    SELECT $1, 'company', companies.id, 'manual', 'associated with company at task creation'
     FROM requested
     JOIN companies ON companies.id=requested.company_id
     ORDER BY requested.position
@@ -295,7 +329,7 @@ WHERE company_id=ANY($2::bigint[])`, taskID, companyIDs); err != nil {
 	}
 	if _, err := tx.Exec(`
 INSERT INTO task_asset_links(task_id, asset_id, source, source_summary)
-SELECT $1, asset.id, $3, '任务创建时关联企业：' || company.name
+SELECT $1, asset.id, $3, 'associated with company at task creation: ' || company.name
 FROM assets asset
 JOIN companies company ON company.id=asset.company_id
 WHERE asset.company_id=ANY($2::bigint[])
@@ -344,18 +378,18 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(plan_quiet_mode,true), COALESCE(coverage_enabled,true), COALESCE(llm_rotate,false), first_run_at, deadline_at, target_gate`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.PlanQuietMode, &t.CoverageEnabled, &t.LLMRotate, &t.FirstRunAt, &t.DeadlineAt, &t.TargetGate); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil
 }
 
-// SetParentRef records a task's parent task id (编排 agent spawn_task 关联).
+// SetParentRef records a task's parent task id (orchestration agent spawn_task association).
 func (d *DB) SetParentRef(id int64, parentRef string) error {
 	_, err := d.Exec(`UPDATE tasks SET parent_ref=NULLIF($2,'') WHERE id=$1`, id, parentRef)
 	return err
@@ -363,7 +397,7 @@ func (d *DB) SetParentRef(id int64, parentRef string) error {
 
 // ListTasks returns alive tasks with pinned tasks first, then newest ids.
 func (d *DB) ListTasks() ([]*Task, error) {
-	// id 是 BIGSERIAL，同一时刻创建的任务也有稳定且唯一的顺序。
+	// id is a BIGSERIAL, so tasks created at the same instant still have a stable, unique order.
 	rows, err := d.Query(`SELECT ` + taskCols + ` FROM tasks WHERE deleted_at IS NULL
 ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, id DESC`)
 	if err != nil {
@@ -392,6 +426,10 @@ ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, id DESC`)
 type TaskPatch struct {
 	Name   *string
 	Pinned *bool
+	// PlanQuietMode flips the per-task quiet-mode switch (#86); nil = leave unchanged.
+	PlanQuietMode *bool
+	// TargetGate flips the per-task target-gate opt-in; nil = leave unchanged.
+	TargetGate *bool
 }
 
 // UpdateTask applies a partial task name/pin mutation and returns the updated row.
@@ -403,9 +441,11 @@ func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
 		WHEN $4::boolean IS NULL THEN pinned_at
 		WHEN $4::boolean THEN COALESCE(pinned_at, now())
 		ELSE NULL
-	END
+	END,
+	plan_quiet_mode = CASE WHEN $5::boolean THEN $6 ELSE plan_quiet_mode END,
+	target_gate = CASE WHEN $7::boolean THEN $8 ELSE target_gate END
 WHERE id=$1 AND deleted_at IS NULL
-RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned))
+RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.PlanQuietMode != nil, patch.PlanQuietMode, patch.TargetGate != nil, patch.TargetGate))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -476,12 +516,13 @@ func (d *DB) SetQueued(id int64, queued bool) error {
 // SetStatus updates a task's lifecycle status. Entering a terminal state
 // (done/failed/timeout) stamps completed_at once (COALESCE keeps the first stamp
 // stable); moving back to a non-terminal state clears it, so a re-run has no stale
-// finish time.
+// finish time (and no stale end_reason).
 func (d *DB) SetStatus(id int64, status string) error {
 	_, err := d.Exec(`
 UPDATE tasks
    SET status = $1,
-       completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END
+       completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END,
+       end_reason = CASE WHEN $1 IN ('done','failed','timeout') THEN end_reason ELSE '' END
  WHERE id = $2`, status, id)
 	return err
 }
@@ -490,12 +531,15 @@ UPDATE tasks
 // terminal, so a completed↔timeout race resolves to the first writer (won=true).
 // Returns won=false (no error) when another terminal status already stuck — the
 // caller then leaves it alone. Non-terminal transitions / re-run still use SetStatus.
-func (d *DB) SetTerminalStatusGuarded(id int64, status string) (won bool, err error) {
+// endReason is stored with the status in the same statement (empty = normal end,
+// EndReasonBudget = run-budget wrap-up); a losing writer stores nothing.
+func (d *DB) SetTerminalStatusGuarded(id int64, status, endReason string) (won bool, err error) {
 	res, err := d.Exec(`
 UPDATE tasks
    SET status = $1,
-       completed_at = COALESCE(completed_at, now())
- WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id)
+       completed_at = COALESCE(completed_at, now()),
+       end_reason = $3
+ WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id, endReason)
 	if err != nil {
 		return false, err
 	}
@@ -503,17 +547,24 @@ UPDATE tasks
 	return n > 0, nil
 }
 
+// ClearRunEndReason drops the end_reason of a task that is running again (a
+// revived run). A terminal task keeps its reason.
+func (d *DB) ClearRunEndReason(id int64) error {
+	_, err := d.Exec(`UPDATE tasks SET end_reason='' WHERE id=$1 AND end_reason<>'' AND status NOT IN ('done','failed','timeout')`, id)
+	return err
+}
+
 // StampFirstRun records a task's first-real-run moment and computes its absolute
 // deadline (= now + timeoutSeconds). Idempotent: only stamps when first_run_at is
 // still NULL, so restarts / re-entries keep the original clock. timeoutSeconds<=0
-// leaves deadline_at NULL (不限时). Returns the resulting deadline (nil = 不限/未变).
+// leaves deadline_at NULL (no limit). Returns the resulting deadline (nil = unlimited/unchanged).
 func (d *DB) StampFirstRun(id int64, timeoutSeconds int) (*time.Time, error) {
 	var deadline *time.Time
 	err := d.QueryRow(`
 UPDATE tasks
    SET first_run_at = COALESCE(first_run_at, now()),
        deadline_at  = CASE
-           WHEN first_run_at IS NOT NULL THEN deadline_at            -- 已盖过章：不动
+           WHEN first_run_at IS NOT NULL THEN deadline_at            -- already stamped: leave it
            WHEN $2 > 0 THEN now() + make_interval(secs => $2)
            ELSE NULL END
  WHERE id = $1
@@ -644,6 +695,14 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
+	// Target pins and approval rows are kept as history too: the pins are revoked,
+	// the open target requests settled, in this transaction.
+	if err := revokeTaskPins(tx, id); err != nil {
+		return result, err
+	}
+	if err := settleTaskTargetRequests(tx, id); err != nil {
+		return result, err
+	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err
 	}

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,8 +29,12 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-const protocolVersion = "2025-06-18"
+const protocolVersion = "2025-11-25"
 const legacySSEProtocolVersion = "2024-11-05"
+
+// mcpMaxRPCBytes is the largest JSON-RPC response (JSON body or SSE data
+// payload) the client will buffer. A remote MCP server is untrusted.
+const mcpMaxRPCBytes = 8 << 20
 
 // ToolName mirrors mcp.ToolName so remote tools share the mcp__server__tool scheme.
 func ToolName(server, name string) string { return "mcp__" + server + "__" + name }
@@ -66,6 +71,11 @@ type Client struct {
 	mu        sync.Mutex
 	nextID    int
 	sessionID string
+	// initialized is set once initialize succeeds. Until then the
+	// MCP-Protocol-Version header is omitted: the spec requires it on requests
+	// after initialization, and the offered version already travels in the
+	// initialize body.
+	initialized bool
 
 	// legacySSE is the pre-2025 MCP SSE transport used by servers such as GSL5.
 	legacySSE    bool
@@ -92,16 +102,87 @@ func normalizeHeaders(headers map[string]string) (map[string]string, error) {
 	return out, nil
 }
 
+// originKey returns the scheme, host and effective port of u, in a form two
+// URLs can be compared with. Empty means u is not an absolute http(s) URL with
+// a host.
+func originKey(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	var port string
+	switch scheme {
+	case "http":
+		port = "80"
+	case "https":
+		port = "443"
+	default:
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	if p := u.Port(); p != "" {
+		port = p
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+// sameOrigin reports whether u has the same scheme, host and effective port as
+// base.
+func sameOrigin(base, u *url.URL) bool {
+	key := originKey(base)
+	return key != "" && key == originKey(u)
+}
+
+// redirectPolicy refuses a redirect that leaves the origin of the configured
+// endpoint, so a remote MCP server cannot retarget authenticated requests.
+func redirectPolicy(base *url.URL) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("mcp: stopped after 10 redirects")
+		}
+		if !sameOrigin(base, req.URL) {
+			return fmt.Errorf("mcp: refusing a redirect to another origin: %s", req.URL.Redacted())
+		}
+		return nil
+	}
+}
+
+// parseMCPURL parses and validates a configured MCP endpoint URL.
+func parseMCPURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("mcp url: %w", err)
+	}
+	if originKey(u) == "" {
+		return nil, fmt.Errorf("mcp url must be an absolute http or https URL with a host: %q", raw)
+	}
+	return u, nil
+}
+
 // New connects to a remote MCP endpoint and performs the initialize handshake.
 // headers are sent on every request (Authorization, custom API keys, …).
 // When insecure is true, TLS certificate verification is skipped so servers that
 // present a self-signed certificate can still be reached (issue #108).
-func New(ctx context.Context, server, url string, headers map[string]string, insecure bool) (*Client, error) {
+// timeoutSeconds bounds each request (handshake, tools/list, one tools/call); 0
+// falls back to the 120s default. Analysis servers with minutes-long tool calls
+// raise it per server.
+func New(ctx context.Context, server, url string, headers map[string]string, insecure bool, timeoutSeconds int) (*Client, error) {
 	cleanHeaders, err := normalizeHeaders(headers)
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Timeout: 120 * time.Second}
+	timeout := 120 * time.Second
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	}
+	base, err := parseMCPURL(url)
+	if err != nil {
+		return nil, err
+	}
+	hc := &http.Client{Timeout: timeout, CheckRedirect: redirectPolicy(base)}
 	if insecure {
 		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
@@ -126,7 +207,11 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{} // the SSE stream is intentionally long-lived.
+	base, err := parseMCPURL(sseURL)
+	if err != nil {
+		return nil, err
+	}
+	hc := &http.Client{CheckRedirect: redirectPolicy(base)} // the SSE stream is intentionally long-lived.
 	if insecure {
 		hc.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	}
@@ -151,7 +236,7 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 		return nil, fmt.Errorf("mcp sse http %d: %s", resp.StatusCode, readSnippet(resp.Body))
 	}
 	reader := bufio.NewReader(resp.Body)
-	endpoint, err := readSSEEndpoint(reader, sseURL)
+	endpoint, err := readSSEEndpoint(reader, base)
 	if err != nil {
 		resp.Body.Close()
 		cancel()
@@ -179,7 +264,11 @@ func NewSSE(ctx context.Context, server, sseURL string, headers map[string]strin
 	return c, nil
 }
 
-func readSSEEndpoint(r *bufio.Reader, base string) (string, error) {
+// readSSEEndpoint reads the message endpoint announced by the SSE stream. The
+// endpoint must stay on the origin of the configured SSE URL: the POSTs that
+// follow carry the operator's headers, and a remote server must not be able to
+// retarget them.
+func readSSEEndpoint(r *bufio.Reader, base *url.URL) (string, error) {
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -197,14 +286,17 @@ func readSSEEndpoint(r *bufio.Reader, base string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("mcp sse endpoint URL: %w", err)
 		}
-		if !u.IsAbs() {
-			b, err := url.Parse(base)
-			if err != nil {
-				return "", err
-			}
-			candidate = b.ResolveReference(u).String()
+		if u.User != nil {
+			return "", errors.New("mcp sse endpoint must not carry userinfo")
 		}
-		return candidate, nil
+		abs := u
+		if !u.IsAbs() {
+			abs = base.ResolveReference(u)
+		}
+		if !sameOrigin(base, abs) {
+			return "", fmt.Errorf("mcp sse endpoint %q is not on the configured origin", abs.Redacted())
+		}
+		return abs.String(), nil
 	}
 }
 
@@ -240,18 +332,47 @@ func (c *Client) readLegacySSE(r *bufio.Reader) {
 }
 
 func (c *Client) initialize(ctx context.Context) error {
-	version := c.protocol
-	if version == "" {
-		version = protocolVersion
+	versions := []string{protocolVersion, "2025-06-18"}
+	if c.legacySSE {
+		versions = []string{legacySSEProtocolVersion}
 	}
-	if _, err := c.call(ctx, "initialize", map[string]any{
-		"protocolVersion": version,
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "artex", "version": "0.2"},
-	}); err != nil {
-		return err
+	for i, version := range versions {
+		c.mu.Lock()
+		c.protocol = version
+		c.mu.Unlock()
+		result, err := c.call(ctx, "initialize", map[string]any{
+			"protocolVersion": version,
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "artex", "version": "0.2"},
+		})
+		if err != nil {
+			if i+1 < len(versions) && isUnsupportedVersion(err) {
+				continue
+			}
+			return err
+		}
+		var negotiated struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		c.mu.Lock()
+		if json.Unmarshal(result, &negotiated) == nil && negotiated.ProtocolVersion != "" {
+			c.protocol = negotiated.ProtocolVersion
+		}
+		c.initialized = true
+		c.mu.Unlock()
+		return c.notify(ctx, "notifications/initialized", map[string]any{})
 	}
-	return c.notify(ctx, "notifications/initialized", map[string]any{})
+	return fmt.Errorf("mcp: no supported protocol version")
+}
+
+// isUnsupportedVersion reports whether err is a server rejecting the offered
+// protocol version: the spec's "Unsupported protocol version" (JSON-RPC -32602,
+// or an HTTP 400 on the MCP-Protocol-Version header) or the
+// UNSUPPORTED_PROTOCOL_VERSION code some servers return instead.
+func isUnsupportedVersion(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported protocol version") ||
+		strings.Contains(msg, "unsupported_protocol_version")
 }
 
 // Tools lists the server's tools and adapts them to CoreTools.
@@ -306,20 +427,23 @@ func (c *Client) wrap(rt remoteTool) actool.CoreTool {
 					Type string `json:"type"`
 					Text string `json:"text"`
 				} `json:"content"`
-				StructuredContent json.RawMessage `json:"structuredContent"`
-				IsError           bool            `json:"isError"`
+				IsError bool `json:"isError"`
 			}
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return actool.Errorf("Error: bad MCP response: " + err.Error()), nil
 			}
-			var text string
+			var b strings.Builder
 			for _, blk := range res.Content {
-				text += blk.Text
+				b.WriteString(blk.Text)
+				if b.Len() > mcpMaxRPCBytes {
+					break
+				}
 			}
-			text = mcpResultText(text, res.StructuredContent)
-			// 与内置/自定义工具一致：超长输出走 Capture——按会话 MaxOutputChars（默认
-			// 30000）截断，配了 ToolOutputDir 时全量溢写到磁盘只留 head + 指针，避免大
-			// MCP 结果整段灌爆上下文。
+			text := b.String()
+			// Consistent with built-in/custom tools: oversized output goes through Capture —
+			// truncated at the session's MaxOutputChars (default 30000), and when
+			// ToolOutputDir is configured the full output spills to disk leaving only the
+			// head + pointer, so a large MCP result does not flood the context whole.
 			return actool.Result{Content: []llm.ContentBlock{llm.TextBlock(actool.Capture(tc, text))}, IsError: res.IsError}, nil
 		},
 	})
@@ -339,8 +463,7 @@ func (c *Client) Call(ctx context.Context, tool string, args any) (string, error
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
-		StructuredContent json.RawMessage `json:"structuredContent"`
-		IsError           bool            `json:"isError"`
+		IsError bool `json:"isError"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return "", fmt.Errorf("bad MCP response: %w", err)
@@ -349,24 +472,10 @@ func (c *Client) Call(ctx context.Context, tool string, args any) (string, error
 	for _, blk := range res.Content {
 		text.WriteString(blk.Text)
 	}
-	out := mcpResultText(text.String(), res.StructuredContent)
 	if res.IsError {
-		return out, fmt.Errorf("mcp tool %q error: %s", tool, out)
+		return text.String(), fmt.Errorf("mcp tool %q error: %s", tool, text.String())
 	}
-	return out, nil
-}
-
-// mcpResultText falls back to structuredContent when the server sends no text
-// blocks, so machine-readable-only results don't surface as blank success.
-func mcpResultText(text string, structured json.RawMessage) string {
-	if strings.TrimSpace(text) != "" {
-		return text
-	}
-	trimmed := strings.TrimSpace(string(structured))
-	if trimmed == "" || trimmed == "null" {
-		return text
-	}
-	return trimmed
+	return text.String(), nil
 }
 
 // Close terminates the MCP session best-effort (DELETE with the session id, per the
@@ -447,17 +556,16 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	version := c.protocol
-	if version == "" {
-		version = protocolVersion
+	c.mu.Lock()
+	sid := c.sessionID
+	initialized, version := c.initialized, c.protocol
+	c.mu.Unlock()
+	if initialized && version != "" {
+		req.Header.Set("MCP-Protocol-Version", version)
 	}
-	req.Header.Set("MCP-Protocol-Version", version)
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
-	c.mu.Lock()
-	sid := c.sessionID
-	c.mu.Unlock()
 	if sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
 	}
@@ -486,8 +594,21 @@ func (c *Client) roundTrip(ctx context.Context, body rpcRequest, expectResp bool
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		return parseSSE(resp.Body, body.ID)
 	}
+	return decodeRPC(resp.Body)
+}
+
+// decodeRPC reads one JSON-RPC response, refusing a body larger than
+// mcpMaxRPCBytes so a remote server cannot force an unbounded allocation.
+func decodeRPC(r io.Reader) (*rpcResponse, error) {
+	data, err := io.ReadAll(io.LimitReader(r, mcpMaxRPCBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("mcp: read json response: %w", err)
+	}
+	if len(data) > mcpMaxRPCBytes {
+		return nil, fmt.Errorf("mcp: json response exceeds %d bytes", mcpMaxRPCBytes)
+	}
 	var out rpcResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("mcp: decode json response: %w", err)
 	}
 	return &out, nil
@@ -578,6 +699,9 @@ func parseSSE(r io.Reader, wantID int) (*rpcResponse, error) {
 		}
 		if strings.HasPrefix(line, "data:") {
 			dataBuf.WriteString(strings.TrimSpace(line[len("data:"):]))
+			if dataBuf.Len() > mcpMaxRPCBytes {
+				return nil, fmt.Errorf("mcp: sse payload exceeds %d bytes", mcpMaxRPCBytes)
+			}
 		}
 	}
 	if resp, ok := flush(); ok {

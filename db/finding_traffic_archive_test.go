@@ -32,7 +32,11 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID); d.DeleteTask(task.ID) }()
+			defer func() {
+				_, _ = d.DeleteFindingsByTask(task.ID)
+				_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+				_ = d.DeleteTask(task.ID)
+			}()
 			f, err := d.Exploration(task.ExplorationID).RecordFinding(t.Context(), RecordFindingInput{TaskID: task.ID, ExplorationID: task.ExplorationID, Summary: "legacy", Severity: "low"})
 			if err != nil {
 				t.Fatal(err)

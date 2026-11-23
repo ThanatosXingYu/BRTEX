@@ -25,8 +25,11 @@ type ReviewInput struct {
 	Version    int               `json:"version"`
 	WorkingDir string            `json:"working_directory,omitempty"`
 	Background *ReviewBackground `json:"background,omitempty"`
-	Tool       string            `json:"tool_name"`
-	Arguments  json.RawMessage   `json:"arguments"`
+	// OperatorPolicy is set in closed mode only: the operator's custom judge
+	// prompt, carried as bounded data for the operator_policy question.
+	OperatorPolicy *ReviewPolicy   `json:"operator_policy,omitempty"`
+	Tool           string          `json:"tool_name"`
+	Arguments      json.RawMessage `json:"arguments"`
 }
 
 type reviewContextKey struct{}
@@ -53,7 +56,7 @@ func WithReviewWorkingDirectory(ctx context.Context, workingDir string) context.
 
 func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessage) (ReviewInput, error) {
 	if !json.Valid(arguments) {
-		return ReviewInput{}, fmt.Errorf("工具参数不是有效 JSON")
+		return ReviewInput{}, fmt.Errorf("tool arguments are not valid JSON")
 	}
 	in := ReviewInput{Version: 4, Tool: tool, Arguments: append(json.RawMessage(nil), arguments...)}
 	if env, ok := ctx.Value(reviewContextKey{}).(reviewEnvironment); ok {

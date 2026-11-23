@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 type taskLLMResolution struct {
@@ -19,7 +19,7 @@ type taskLLMResolution struct {
 
 func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMResolution {
 	if p == nil {
-		return taskLLMResolution{Source: source, Reason: "LLM 配置不存在"}
+		return taskLLMResolution{Source: source, Reason: "LLM profile does not exist"}
 	}
 	id := p.ID
 	result := taskLLMResolution{
@@ -29,19 +29,20 @@ func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMR
 		Model:     p.Model,
 		Source:    source,
 	}
-	if p.APIKey == "" {
-		result.Reason = "LLM 配置未设置 API Key"
+	// Ollama profiles are keyless by design; the other formats need a key.
+	if p.APIKey == "" && p.Format != "ollama" {
+		result.Reason = "LLM profile has no API Key set"
 		return result
 	}
 	if _, _, ok := s.providerForProfile(p.ID); !ok {
-		result.Reason = "LLM 配置格式或参数无效"
+		result.Reason = "LLM profile format or parameters are invalid"
 		return result
 	}
 	result.Available = true
 	return result
 }
 
-// resolveTaskRoleLLM mirrors taskLLMRuntime.current without creating a provider:
+// resolveTaskRoleLLM mirrors taskLLMRuntime.currentFor without creating a provider:
 // role Agent binding -> explicit task chain -> active/global environment config.
 // Database failures are returned rather than represented as an unavailable model.
 func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution, error) {
@@ -67,7 +68,7 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 	state := t.llmStateSnapshot()
 	if len(state.ProfileIDs) > 0 {
 		if state.ActiveID == nil {
-			return taskLLMResolution{Source: "task_chain", Reason: "任务 LLM 配置链额度已耗尽"}, nil
+			return taskLLMResolution{Source: "task_chain", Reason: "task LLM profile chain quota exhausted"}, nil
 		}
 		p, err := s.m.pg.ProfileByID(*state.ActiveID)
 		if err != nil {
@@ -90,14 +91,14 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 	s.cfgMu.Unlock()
 	if on {
 		if name == "" {
-			name = "全局配置"
+			name = "global configuration"
 		}
 		return taskLLMResolution{
 			Name: name, Format: cfg.Provider(), Model: cfg.Model,
 			Source: "environment", Available: true,
 		}, nil
 	}
-	return taskLLMResolution{Source: "global", Reason: "没有可用的 LLM 配置"}, nil
+	return taskLLMResolution{Source: "global", Reason: "no available LLM profile"}, nil
 }
 
 func (s *Server) taskLLMResolutionHandler(w http.ResponseWriter, r *http.Request) {

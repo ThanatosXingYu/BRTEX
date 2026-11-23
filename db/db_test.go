@@ -51,13 +51,31 @@ func TestApplySchemaRetriesOnlyDeadlocks(t *testing.T) {
 	}
 }
 
+func TestCreateDatabaseSQLQuotesName(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"artex", `CREATE DATABASE "artex"`},
+		{"artex-db", `CREATE DATABASE "artex-db"`},
+		{"café", `CREATE DATABASE "café"`},
+		{`artex"`, `CREATE DATABASE "artex"""`},
+		{`x"; DROP TABLE y; --`, `CREATE DATABASE "x""; DROP TABLE y; --"`},
+	}
+	for _, tt := range tests {
+		if got := createDatabaseSQL(tt.name); got != tt.want {
+			t.Errorf("createDatabaseSQL(%q)=%q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
 // testDSN returns the configured DSN, skipping the test when neither the env var
 // nor a config file supplies one (DSN no longer has a built-in default).
 func testDSN(t *testing.T) string {
 	t.Helper()
 	dsn, _, err := DSN()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	return dsn
 }
@@ -67,7 +85,7 @@ func testDSN(t *testing.T) string {
 func TestOpenSeed(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 

@@ -9,13 +9,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	pgdb "github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/archivestore"
+	pgdb "github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 const taskArchivePollInterval = 2 * time.Second
@@ -31,6 +33,19 @@ type archiveBatchItem struct {
 	Queued  bool   `json:"queued"`
 	Error   string `json:"error,omitempty"`
 	Archive int64  `json:"archive_id,omitempty"`
+}
+
+// initTaskArchiveStore captures credentials before New scrubs the process environment.
+func (s *Server) initTaskArchiveStore() {
+	if s.m == nil || s.m.pg == nil {
+		return
+	}
+	s.archiveStore, s.archiveStoreErr = archivestore.FromEnv()
+	if s.archiveStoreErr != nil {
+		log.Printf("[task-archive] storage configuration: %v", s.archiveStoreErr)
+	} else if s.archiveStore != nil {
+		log.Printf("[task-archive] new archives use S3 object storage with full SHA-256 readback verification")
+	}
 }
 
 func (s *Server) startTaskArchiveWorker() {
@@ -88,22 +103,19 @@ func (s *Server) notifyTaskArchiveWorker() {
 }
 
 func (s *Server) runOneTaskArchiveJob() error {
+	if s.ctx.Err() != nil {
+		return s.ctx.Err()
+	}
+	// Retry deferred remote cleanup before claiming more work. Failed cleanup
+	// keeps its durable journal and does not block unrelated local archives.
+	if err := s.recoverRemoteArchiveJournals(); err != nil {
+		log.Printf("[task-archive] deferred object cleanup: %v", err)
+	}
 	job, err := s.m.pg.ClaimTaskArchiveJob(s.ctx)
 	if err != nil || job == nil {
 		return err
 	}
-	var runErr error
-	switch job.State {
-	case pgdb.Archiving:
-		runErr = s.archiveTask(job)
-	case pgdb.Restoring:
-		runErr = s.restoreTaskArchive(job)
-	case pgdb.Deleting:
-		runErr = s.deleteTaskArchive(job)
-	default:
-		runErr = fmt.Errorf("unknown claimed archive state %q", job.State)
-	}
-	if runErr != nil {
+	if runErr := s.runClaimedTaskArchiveJob(job); runErr != nil {
 		if failErr := s.m.pg.FailTaskArchiveJob(job.ID, job.State, runErr); failErr != nil {
 			return errors.Join(runErr, failErr)
 		}
@@ -114,10 +126,38 @@ func (s *Server) runOneTaskArchiveJob() error {
 	return nil
 }
 
+// runClaimedTaskArchiveJob runs one claimed job and turns a panic below it into
+// an ordinary job failure. The worker goroutine has no other recover: a panic
+// there (the S3 upload manager dereferences a nil UploadId when an endpoint
+// answers CreateMultipartUpload without one) would end the whole server with the
+// job half done. The job's deferred rollbacks have already run when the panic is
+// recovered here, so the caller fails the job with its source data in place.
+func (s *Server) runClaimedTaskArchiveJob(job *pgdb.TaskArchive) (runErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[task-archive] archive job %d (%s) panicked: %v\n%s", job.ID, job.State, r, debug.Stack())
+			runErr = fmt.Errorf("archive worker panic: %v", r)
+		}
+	}()
+	switch job.State {
+	case pgdb.Archiving:
+		return s.archiveTask(job)
+	case pgdb.Restoring:
+		return s.restoreTaskArchive(job)
+	case pgdb.Deleting:
+		return s.deleteTaskArchive(job)
+	default:
+		return fmt.Errorf("unknown claimed archive state %q", job.State)
+	}
+}
+
 func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
+	if s.archiveStoreErr != nil {
+		return s.archiveStoreErr
+	}
 	taskID := strconv.FormatInt(job.TaskID, 10)
 	if !s.beginTaskDelete(taskID) {
-		return errors.New("任务正在进行其他归档或删除操作")
+		return errors.New("task is already undergoing another archive or delete operation")
 	}
 	committed := false
 	defer func() {
@@ -129,7 +169,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	drainCtx, cancel := context.WithTimeout(s.ctx, taskDeleteDrainTimeout)
 	defer cancel()
 	if err := s.waitTaskQuiescent(drainCtx, taskID); err != nil {
-		return errors.New("任务仍有运行中的 Agent，请先暂停后重试归档")
+		return errors.New("task still has running agents; pause it before retrying the archive")
 	}
 	if err := s.drainTaskSideQuestions(drainCtx, taskID); err != nil {
 		return err
@@ -155,10 +195,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	if err := os.MkdirAll(filepath.Dir(streamPath), archiveDirMode); err != nil {
 		return err
 	}
-	// Truncate instead of O_EXCL: a failed round can leave the staging root (and
-	// this file) behind when its rollback also failed, and the retry re-snapshots
-	// llm_records from PostgreSQL, so any previous content is stale by definition.
-	streamFile, err := os.OpenFile(streamPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, archiveFileMode)
+	streamFile, err := os.OpenFile(streamPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, archiveFileMode)
 	if err != nil {
 		return err
 	}
@@ -173,7 +210,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		return err
 	}
 	if snapshot.ExplorationID != task.ExplorationID {
-		return errors.New("任务探索记录在归档快照期间发生变化")
+		return errors.New("the task's exploration record changed during the archive snapshot")
 	}
 	if s.m.traffic != nil && len(snapshot.Hosts) > 0 {
 		_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "snapshot_traffic", 38)
@@ -202,6 +239,21 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 			_ = os.Remove(archivePath)
 		}
 	}()
+	storedPath := archivePath
+	var remoteJournal string
+	if s.archiveStore != nil {
+		storedPath = s.archiveStore.URI(job.TaskID, job.ID, checksum)
+		remoteJournal, err = s.writeRemoteArchiveJournal(remoteArchiveJournal{
+			ArchiveID: job.ID, URI: storedPath, LocalPath: archivePath, Operation: "upload",
+		})
+		if err != nil {
+			return err
+		}
+		_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "upload_and_verify", 65)
+		if err := s.archiveStore.Upload(s.ctx, storedPath, archivePath, checksum); err != nil {
+			return err
+		}
+	}
 	var trafficStage *traffic.HostDeleteStage
 	if s.m.traffic != nil && len(snapshot.ExclusiveHosts) > 0 {
 		_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "compact_traffic", 68)
@@ -216,20 +268,27 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		}()
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "compact_database", 78)
-	if err := s.m.pg.CompleteTaskArchive(job.ID, snapshot, archivePath, checksum, originalSize, compressedSize); err != nil {
+	if err := s.m.pg.CompleteTaskArchive(job.ID, snapshot, storedPath, checksum, originalSize, compressedSize); err != nil {
 		return err
 	}
 	committed = true
-	removePackage = false
+	removePackage = s.archiveStore != nil
+	if remoteJournal != "" {
+		// The journal also covers a crash after database commit but before local
+		// package removal. Keep it if cleanup fails, so the worker can retry.
+		if err := removeLocalArchivePackage(archivePath); err == nil {
+			_ = os.Remove(remoteJournal)
+		}
+	}
 	if trafficStage != nil {
 		if err := trafficStage.Commit(); err != nil {
-			warning := "归档已完成，但独占流量热存储清理失败（归档包仍可恢复）：" + err.Error()
+			warning := "archive completed, but cleaning the exclusive traffic hot store failed (the archive package can still restore it): " + err.Error()
 			log.Printf("[task-archive] task %s: %s", taskID, warning)
 			_ = s.m.pg.AppendTaskArchiveWarning(job.ID, warning)
 		}
 	}
 	if err := fileStage.commit(); err != nil {
-		warning := "归档已完成，但暂存目录清理失败：" + err.Error()
+		warning := "archive completed, but cleaning the staging directory failed: " + err.Error()
 		log.Printf("[task-archive] task %s: %s", taskID, warning)
 		_ = s.m.pg.AppendTaskArchiveWarning(job.ID, warning)
 	}
@@ -242,7 +301,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 }
 
 func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
-	if err := validateArchivePath(s.m.dir, job.ArchivePath); err != nil {
+	if err := s.validateStoredArchive(job.ArchivePath); err != nil {
 		return err
 	}
 	// A prior attempt may have committed PostgreSQL and files, then failed only
@@ -250,7 +309,7 @@ func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
 	if restored, err := s.m.pg.IsTaskArchiveRestored(job.ID); err != nil {
 		return err
 	} else if restored {
-		if err := os.Remove(job.ArchivePath); err != nil && !os.IsNotExist(err) {
+		if err := s.removeStoredArchive(job.ArchivePath); err != nil {
 			return err
 		}
 		if err := s.m.pg.CompleteTaskArchiveRestore(job.ID); err != nil {
@@ -269,7 +328,15 @@ func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
 		return err
 	}
 	defer func() { _ = os.RemoveAll(extracted) }()
-	if err := extractTaskArchivePackage(job.ArchivePath, job.SHA256, extracted); err != nil {
+	packagePath := job.ArchivePath
+	if strings.HasPrefix(packagePath, "s3://") {
+		_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "download_and_verify", 12)
+		packagePath = filepath.Join(extracted, "download.tar.zst")
+		if err := s.archiveStore.Download(s.ctx, job.ArchivePath, packagePath, job.SHA256, job.CompressedSize); err != nil {
+			return err
+		}
+	}
+	if err := extractTaskArchivePackage(packagePath, job.SHA256, extracted); err != nil {
 		return err
 	}
 	manifestRaw, err := os.ReadFile(filepath.Join(extracted, "manifest.json"))
@@ -319,7 +386,7 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 		}
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "restore_files", 55)
-	files, err := installTaskArchiveFiles(s.m.dir, extracted, strconv.FormatInt(job.TaskID, 10), job.ID)
+	files, err := installTaskArchiveFiles(s.m.dir, extracted, strconv.FormatInt(job.TaskID, 10), job.ID, s.execPriv)
 	if err != nil {
 		return err
 	}
@@ -349,7 +416,7 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 	}
 	if len(warnings) > 0 {
 		if _, err := s.m.pg.Exploration(snapshot.ExplorationID).AppendActivity(pgdb.Activity{
-			Worker: "system", Kind: "system", Summary: "任务还原完成，但部分关联已降级", Detail: strings.Join(warnings, "\n"),
+			Worker: "system", Kind: "system", Summary: "task restore completed, but some associations were degraded", Detail: strings.Join(warnings, "\n"),
 		}); err != nil {
 			log.Printf("[task-archive] persist restore warnings for task %d: %v", job.TaskID, err)
 		}
@@ -359,7 +426,7 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 		return err
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "consume_package", 95)
-	if err := os.Remove(job.ArchivePath); err != nil && !os.IsNotExist(err) {
+	if err := s.removeStoredArchive(job.ArchivePath); err != nil {
 		return err
 	}
 	if err := s.m.pg.CompleteTaskArchiveRestore(job.ID); err != nil {
@@ -396,8 +463,11 @@ func (s *Server) loadRestoredTask(taskID int64) {
 }
 
 func (s *Server) deleteTaskArchive(job *pgdb.TaskArchive) error {
-	if err := validateArchivePath(s.m.dir, job.ArchivePath); err != nil {
+	if err := s.validateStoredArchive(job.ArchivePath); err != nil {
 		return err
+	}
+	if strings.HasPrefix(job.ArchivePath, "s3://") {
+		return s.deleteRemoteTaskArchive(job)
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "stage_package_delete", 35)
 	staged, moved, err := stageTaskArchivePackageDelete(job.ArchivePath, job.ID)
@@ -421,7 +491,7 @@ func (s *Server) deleteTaskArchive(job *pgdb.TaskArchive) error {
 
 func validateArchivePath(dataDir, candidate string) error {
 	if strings.TrimSpace(candidate) == "" {
-		return errors.New("归档包路径为空")
+		return errors.New("archive package path is empty")
 	}
 	root, err := filepath.Abs(taskArchiveRoot(dataDir))
 	if err != nil {
@@ -433,7 +503,7 @@ func validateArchivePath(dataDir, candidate string) error {
 	}
 	relative, err := filepath.Rel(root, path)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return errors.New("归档包路径不在受管目录内")
+		return errors.New("archive package path is outside the managed directory")
 	}
 	return nil
 }
@@ -452,7 +522,7 @@ func (s *Server) listTaskArchives(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok {
-		writeErr(w, 400, "归档 id 无效")
+		writeErr(w, 400, "invalid archive id")
 		return
 	}
 	item, err := s.m.pg.GetTaskArchive(id)
@@ -461,7 +531,7 @@ func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if item == nil {
-		writeErr(w, 404, "归档不存在")
+		writeErr(w, 404, "archive not found")
 		return
 	}
 	writeJSON(w, 200, item)
@@ -470,7 +540,7 @@ func (s *Server) getTaskArchive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) queueTaskArchive(w http.ResponseWriter, r *http.Request) {
 	id, ok := canonicalTaskID(r.PathValue("id"))
 	if !ok {
-		writeErr(w, 400, "任务 id 无效")
+		writeErr(w, 400, "invalid task id")
 		return
 	}
 	numeric, _ := strconv.ParseInt(id, 10, 64)
@@ -486,7 +556,7 @@ func (s *Server) queueTaskArchive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) queueTaskArchiveRestore(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok {
-		writeErr(w, 400, "归档 id 无效")
+		writeErr(w, 400, "invalid archive id")
 		return
 	}
 	item, err := s.m.pg.QueueTaskArchiveRestore(id)
@@ -501,7 +571,7 @@ func (s *Server) queueTaskArchiveRestore(w http.ResponseWriter, r *http.Request)
 func (s *Server) queueTaskArchiveDelete(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt(r, "id")
 	if !ok {
-		writeErr(w, 400, "归档 id 无效")
+		writeErr(w, 400, "invalid archive id")
 		return
 	}
 	item, err := s.m.pg.QueueTaskArchiveDelete(id)
@@ -515,24 +585,24 @@ func (s *Server) queueTaskArchiveDelete(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) queueTaskArchivesBatch(w http.ResponseWriter, r *http.Request) {
 	var request archiveBatchRequest
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	parsed := normalizeBatchTaskIDs(request.TaskIDs)
 	if len(parsed) == 0 {
-		writeErr(w, 400, "task_ids 不能为空")
+		writeErr(w, 400, "task_ids cannot be empty")
 		return
 	}
 	if len(parsed) > 100 {
-		writeErr(w, 400, "一次最多处理 100 个任务")
+		writeErr(w, 400, "at most 100 tasks can be processed at once")
 		return
 	}
 	ids := make([]string, 0, len(parsed))
 	items := make([]archiveBatchItem, 0, len(parsed))
 	for _, item := range parsed {
 		if !item.valid {
-			items = append(items, archiveBatchItem{ID: item.id, Error: "任务 id 无效"})
+			items = append(items, archiveBatchItem{ID: item.id, Error: "invalid task id"})
 			continue
 		}
 		ids = append(ids, item.id)
@@ -555,7 +625,7 @@ func (s *Server) queueTaskArchivesBatch(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) queueTaskArchiveActionBatch(w http.ResponseWriter, r *http.Request, action string) {
 	var request archiveBatchRequest
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -595,16 +665,16 @@ func (s *Server) deleteTaskArchivesBatch(w http.ResponseWriter, r *http.Request)
 
 func normalizeArchiveIDs(ids []int64) ([]int64, error) {
 	if len(ids) == 0 {
-		return nil, errors.New("archive_ids 不能为空")
+		return nil, errors.New("archive_ids cannot be empty")
 	}
 	if len(ids) > 100 {
-		return nil, errors.New("一次最多处理 100 个归档")
+		return nil, errors.New("at most 100 archives can be processed at once")
 	}
 	seen := map[int64]bool{}
 	out := make([]int64, 0, len(ids))
 	for _, id := range ids {
 		if id <= 0 {
-			return nil, fmt.Errorf("归档 id %d 无效", id)
+			return nil, fmt.Errorf("invalid archive id %d", id)
 		}
 		if !seen[id] {
 			seen[id] = true

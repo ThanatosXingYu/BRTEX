@@ -27,6 +27,8 @@ type InterceptRule struct {
 }
 
 // InterceptPending is one row of intercept_pending.
+// DecidedBy is the actor that settled the request: "" while pending, otherwise
+// human | rule | model | system (timeouts and cancellations).
 type InterceptPending struct {
 	ID             int64           `json:"id"`
 	RuleID         *int64          `json:"rule_id"`
@@ -37,7 +39,8 @@ type InterceptPending struct {
 	ToolInput      json.RawMessage `json:"tool_input"`
 	Status         string          `json:"status"`
 	DecisionSource string          `json:"decision_source"`
-	Reason         string          `json:"reason"` // 规则 message 或模型判定理由(前缀 [模型])
+	DecidedBy      string          `json:"decided_by"`
+	Reason         string          `json:"reason"` // rule message or model decision reason (prefixed with ModelReasonPrefix)
 	DecidedAt      *time.Time      `json:"decided_at"`
 	CreatedAt      time.Time       `json:"created_at"`
 }
@@ -163,19 +166,25 @@ func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, too
 	if ruleID != 0 {
 		ruleIDPtr = &ruleID
 	}
+	// Rows logged here were settled without a human: by the matching rule, or by
+	// the model judge when no rule owns the decision.
+	decidedBy := "model"
+	if ruleID != 0 {
+		decidedBy = "rule"
+	}
 	var id int64
 	err := d.QueryRow(`
-INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, decision_source, audit)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10) RETURNING id`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits)).Scan(&id)
+INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, decision_source, audit, decided_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10, $11) RETURNING id`,
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits), decidedBy).Scan(&id)
 	return id, err
 }
 
-const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source`
+const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source, decided_by`
 
 func scanInterceptPending(s interface{ Scan(...any) error }, p *InterceptPending) error {
 	return s.Scan(&p.ID, &p.RuleID, &p.ConversationID, &p.TaskID, &p.AgentName,
-		&p.ToolName, &p.ToolInput, &p.Status, &p.Reason, &p.DecidedAt, &p.CreatedAt, &p.DecisionSource)
+		&p.ToolName, &p.ToolInput, &p.Status, &p.Reason, &p.DecidedAt, &p.CreatedAt, &p.DecisionSource, &p.DecidedBy)
 }
 
 // ListPendingIntercepts returns all unresolved approval requests, newest first.
@@ -221,17 +230,37 @@ func scanInterceptApprovalRow(rows interface{ Scan(...any) error }, r *Intercept
 	return rows.Scan(
 		&r.ID, &r.RuleID, &r.ConversationID, &r.TaskID, &r.AgentName,
 		&r.ToolName, &r.ToolInput, &r.Status, &r.Reason, &r.DecidedAt, &r.CreatedAt,
-		&r.DecisionSource, &r.ConvTitle, &r.ConvAgentKey, &r.RuleName,
+		&r.DecisionSource, &r.DecidedBy, &r.ConvTitle, &r.ConvAgentKey, &r.RuleName,
 	)
 }
 
+// ModelReasonPrefix starts every reason written by the LLM fallback judge
+// (intercept.JudgeReason); readers derive decision_source='model' from it.
+const ModelReasonPrefix = "[model]"
+
+// legacyModelReasonPrefix is what the judge wrote before the UI translation (e233c02).
+const legacyModelReasonPrefix = "[模型]"
+
+// isModelReason reports whether reason was written by the model judge. The
+// comparison ignores case: readers used to expect "[Model]" while the writer
+// produced "[model]", so stored rows may carry either spelling.
+func isModelReason(reason string) bool {
+	return strings.HasPrefix(strings.ToLower(reason), ModelReasonPrefix) ||
+		strings.HasPrefix(reason, legacyModelReasonPrefix)
+}
+
 // Keep legacy rows without decision_source consistent with their displayed source.
+// Mirrors isModelReason; PostgreSQL LIKE is case-sensitive and '[' is literal.
 const approvalDecisionSource = `COALESCE(NULLIF(ip.decision_source,''), CASE
  WHEN ip.rule_id IS NOT NULL THEN 'rule'
- WHEN ip.reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END)`
+ WHEN lower(ip.reason) LIKE '` + ModelReasonPrefix + `%' OR ip.reason LIKE '` + legacyModelReasonPrefix + `%' THEN 'model' ELSE 'unknown' END)`
 
+// decided_by is returned exactly as stored, never merged with decision_source:
+// rows decided before the column existed keep it empty, so the displayed value
+// is always the one the decided_by filter matches.
 const approvalRowColumns = `ip.id, ip.rule_id, ip.conversation_id, ip.task_id, ip.agent_name,
        ip.tool_name, ip.tool_input, ip.status, ip.reason, ip.decided_at, ip.created_at, ` + approvalDecisionSource + `,
+       ip.decided_by,
        COALESCE(c.title,'') AS conv_title,
        COALESCE(c.agent_key,'') AS conv_agent_key,
        COALESCE(ir.name,'') AS rule_name`
@@ -248,7 +277,7 @@ func interceptSource(ruleID int64, reason string) string {
 	if ruleID != 0 {
 		return "rule"
 	}
-	if strings.HasPrefix(reason, "[模型]") {
+	if isModelReason(reason) {
 		return "model"
 	}
 	return "unknown"
@@ -284,11 +313,12 @@ func (d *DB) ListAllIntercepts(limit int) ([]InterceptApprovalRow, error) {
 	return out, rows.Err()
 }
 
-// InterceptApprovalFilter combines exact status and decision-source filters.
-// Empty fields include all values.
+// InterceptApprovalFilter combines exact status, decision-source and
+// deciding-actor filters. Empty fields include all values.
 type InterceptApprovalFilter struct {
 	Status         string
 	DecisionSource string
+	DecidedBy      string
 }
 
 // ListAllInterceptsPage returns one 1-based page and the total matching count.
@@ -342,6 +372,10 @@ func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptA
 	add("ip.task_id", taskID)
 	add("ip.status", filter.Status)
 	add(approvalDecisionSource, filter.DecisionSource)
+	// Stored actor only, the same value the rows display: deriving it from
+	// decision_source would let decided_by=model match human decisions and
+	// timeouts recorded before the column existed.
+	add("ip.decided_by", filter.DecidedBy)
 	where := ""
 	if len(conditions) > 0 {
 		where = " WHERE " + strings.Join(conditions, " AND ")

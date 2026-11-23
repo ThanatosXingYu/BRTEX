@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 )
 
 // TestPoolProfilesOrder pins the failover chain query: keyless profiles can't
@@ -15,19 +17,24 @@ import (
 func TestPoolProfilesOrder(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Close via Cleanup, registered FIRST so it runs LAST: a plain defer would
+	// close the pool before the row-deleting cleanups below run.
+	t.Cleanup(func() { d.Close() })
 
+	// llm_profiles.name is unique, so a fixed name collides with a row left on
+	// the same database by an earlier run.
+	sfx := fmt.Sprintf("-%d", time.Now().UnixNano())
 	mk := func(name string, priority int, exclude bool, key string) int64 {
 		id, err := d.SaveProfile(&LLMProfile{
-			Name: name, Format: "openai", Model: "m", APIKey: key,
+			Name: name + sfx, Format: "openai", Model: "m", APIKey: key,
 			Priority: priority, PoolExclude: exclude,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+		t.Cleanup(func() { deleteTestProfile(t, d, id) })
 		return id
 	}
 	lo := mk("t-pool-lo", 1, false, "k1")
@@ -42,16 +49,25 @@ func TestPoolProfilesOrder(t *testing.T) {
 	var got []int64
 	for _, p := range chain {
 		switch p.Name {
-		case "t-pool-lo", "t-pool-hi":
+		case "t-pool-lo" + sfx, "t-pool-hi" + sfx:
 			got = append(got, p.ID)
-		case "t-pool-excluded":
+		case "t-pool-excluded" + sfx:
 			t.Fatal("pool_exclude profile entered the failover chain")
-		case "t-pool-nokey":
+		case "t-pool-nokey" + sfx:
 			t.Fatal("keyless profile entered the failover chain")
 		}
 	}
 	if len(got) != 2 || got[0] != hi || got[1] != lo {
 		t.Fatalf("chain order = %v, want [hi=%d lo=%d]", got, hi, lo)
+	}
+}
+
+// deleteTestProfile removes a profile a test created and reports a failed delete
+// instead of silently leaving the row for the next run.
+func deleteTestProfile(t *testing.T, d *DB, id int64) {
+	t.Helper()
+	if _, err := d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id); err != nil {
+		t.Errorf("cleanup profile %d: %v", id, err)
 	}
 }
 
@@ -67,7 +83,7 @@ func TestDeleteProfileContextHonorsCancellation(t *testing.T) {
 func TestConfigStores(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -106,16 +122,16 @@ func TestConfigStores(t *testing.T) {
 	if err != nil || ag == nil {
 		t.Fatalf("planner agent: %v", err)
 	}
-	v1, err := d.SavePrompt(ag.ID, "你是规划者 {{.Goal}}", "init", "test")
+	v1, err := d.SavePrompt(ag.ID, "You are the planner {{.Goal}}", "init", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, _ := d.SavePrompt(ag.ID, "你是规划者 v2 {{.Goal}} {{.Scope}}", "edit", "test")
+	v2, _ := d.SavePrompt(ag.ID, "You are the planner v2 {{.Goal}} {{.Scope}}", "edit", "test")
 	if v2 != v1+1 {
 		t.Fatalf("version should increment: %d -> %d", v1, v2)
 	}
 	cur, _ := d.CurrentPrompt(ag.ID)
-	if cur != "你是规划者 v2 {{.Goal}} {{.Scope}}" {
+	if cur != "You are the planner v2 {{.Goal}} {{.Scope}}" {
 		t.Fatalf("current prompt wrong: %q", cur)
 	}
 	vers, _ := d.ListPromptVersions(ag.ID)

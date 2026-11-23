@@ -15,8 +15,17 @@ func ArchiveEvidenceSnapshots(snapshot *TaskArchiveSnapshot) ([]TrafficEvidenceS
 	if snapshot.FormatVersion < 3 {
 		return nil, ErrTaskArchiveFormatMismatch
 	}
-	err := json.Unmarshal(snapshot.Tables["traffic_evidence_snapshots"], &out)
-	return out, err
+	// The archive keeps the heads as stored (sealed). They are opened here so the
+	// restore can check each content-addressed ID; the insert then seals them once.
+	if err := json.Unmarshal(snapshot.Tables["traffic_evidence_snapshots"], &out); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := out[i].openHeads(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func restoreFindingTrafficTx(tx *sql.Tx, snapshot *TaskArchiveSnapshot) error {

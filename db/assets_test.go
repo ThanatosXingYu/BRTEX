@@ -14,7 +14,7 @@ func testSetup(t *testing.T) (*DB, *AssetStore, *CompanyStore) {
 	t.Helper()
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		SkipPGUnavailable(t, err)
 	}
 	return d, d.Assets(), d.Companies()
 }
@@ -539,20 +539,21 @@ func TestQueryByType(t *testing.T) {
 	}
 }
 
-// TestDeleteByTaskID: 独有资产被删,与其他任务共享的资产仅解除关联(保留),host 反查正确。
+// TestDeleteByTaskID: task-exclusive assets are deleted; assets shared with other
+// tasks are only unlinked (kept); host reverse lookup is correct.
 func TestDeleteByTaskID(t *testing.T) {
 	d, av2, _ := testSetup(t)
 	defer d.Close()
 
 	const taskA = int64(90001)
 	const taskB = int64(90002)
-	// solo:仅属 taskA
+	// solo: belongs to taskA only
 	solo, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "solo-del.test", TaskID: taskA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer deleteAsset(d, solo)
-	// shared:先 taskA 再 taskB → task_ids={A,B}
+	// shared: taskA first then taskB → task_ids={A,B}
 	shared, err := av2.UpsertRootDomain(UpsertRootDomainReq{Domain: "shared-del.test", TaskID: taskA})
 	if err != nil {
 		t.Fatal(err)
@@ -562,13 +563,13 @@ func TestDeleteByTaskID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// host 反查(删资产前):应含两个域名
+	// host reverse lookup (before deleting assets): should contain both domains
 	hosts, err := av2.HostsByTask(taskA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(hosts, "solo-del.test") || !slices.Contains(hosts, "shared-del.test") {
-		t.Fatalf("HostsByTask 缺 host: %v", hosts)
+		t.Fatalf("HostsByTask missing host: %v", hosts)
 	}
 
 	n, err := av2.DeleteByTaskID(taskA)
@@ -576,19 +577,19 @@ func TestDeleteByTaskID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 1 {
-		t.Fatalf("DeleteByTaskID: 应删 1 个独有资产,实删 %d", n)
+		t.Fatalf("DeleteByTaskID: should delete 1 exclusive asset, actually deleted %d", n)
 	}
-	// solo 已删
+	// solo is deleted
 	if a, _ := av2.GetByIDs([]int64{solo}); len(a) != 0 {
-		t.Fatalf("solo 资产应被删除")
+		t.Fatalf("solo asset should have been deleted")
 	}
-	// shared 保留,且 task_ids 只剩 taskB
+	// shared is kept, and task_ids only has taskB left
 	sa, _ := av2.GetByIDs([]int64{shared})
 	if len(sa) != 1 {
-		t.Fatalf("shared 资产应保留")
+		t.Fatalf("shared asset should have been kept")
 	}
 	if slices.Contains(sa[0].TaskIDs, taskA) || !slices.Contains(sa[0].TaskIDs, taskB) {
-		t.Fatalf("shared task_ids 应解除 A 保留 B,得 %v", sa[0].TaskIDs)
+		t.Fatalf("shared task_ids should unlink A and keep B, got %v", sa[0].TaskIDs)
 	}
 }
 
@@ -640,7 +641,8 @@ func TestQueryByTask(t *testing.T) {
 	}
 }
 
-// 任务资产列表按页取,不再被固定条数截断:60 条资产用 25/页要能完整翻出来。
+// The task asset list is paged, no longer truncated at a fixed count: 60 assets
+// at 25 per page must be fully pageable.
 func TestQueryByTaskPaging(t *testing.T) {
 	d, av2, _ := testSetup(t)
 	defer d.Close()
@@ -739,7 +741,7 @@ func TestQueryByCompany(t *testing.T) {
 	}
 }
 
-// 企业资产列表同样按页取,不被固定条数截断。
+// The company asset list is likewise paged, not truncated at a fixed count.
 func TestQueryByCompanyPaging(t *testing.T) {
 	d, av2, cs := testSetup(t)
 	defer d.Close()
@@ -754,7 +756,7 @@ func TestQueryByCompanyPaging(t *testing.T) {
 		t.Fatalf("AddScope: added=%d, errors=%v", added, errs)
 	}
 
-	// UpsertSubdomain 会顺带建根域名资产,一并清掉
+	// UpsertSubdomain also creates the root-domain asset as a side effect; clean it up too
 	defer d.Exec(`DELETE FROM assets WHERE root_domain = 'qbc-paging.io'`)
 
 	const n = 60
@@ -877,6 +879,17 @@ func TestMarshalStringArray(t *testing.T) {
 	if got2 != "{}" {
 		t.Errorf("empty: %q", got2)
 	}
+
+	quoted := marshalStringArray([]string{`say "hi"`, `a\b`})
+	if quoted != `{"say \"hi\"","a\\b"}` {
+		t.Errorf("escape: %q", quoted)
+	}
+
+	// A backslash before a quote must not close the element and inject another.
+	injected := marshalStringArray([]string{`x\",evil,\"y`})
+	if strings.Contains(injected, `","evil`) {
+		t.Errorf("backslash-quote split the array: %q", injected)
+	}
 }
 
 // =====================================================================
@@ -891,12 +904,150 @@ func TestNormalizeURL(t *testing.T) {
 		{"HTTPS://Example.COM/path", "https://example.com/path"},
 		{"http://example.com/", "http://example.com"},
 		{"http://example.com/page", "http://example.com/page"},
+		{"https://u:p@Example.com/app?x=1", "https://example.com/app?x=1"},
+		{"https://user@example.com/", "https://example.com"},
+		{"https://u:p@example.com:8443/users/@alice?x=1", "https://example.com:8443/users/@alice?x=1"},
+		{"https://example.com/@me?r=http://a:b@x/", "https://example.com/@me?r=http://a:b@x/"},
+		{"http://user:secret@ex ample.com/a", "http://ex ample.com/a"},
 	}
 	for _, tc := range tests {
 		got := normalizeURL(tc.raw)
 		if got != tc.want {
 			t.Errorf("normalizeURL(%q): want %q, got %q", tc.raw, tc.want, got)
 		}
+	}
+}
+
+// storedURLRow reads back the url, domain and port of one asset row.
+func storedURLRow(t *testing.T, d *DB, id int64) (string, string, int) {
+	t.Helper()
+	var u, domain *string
+	var port *int
+	if err := d.QueryRow(`SELECT url, domain, port FROM assets WHERE id = $1`, id).Scan(&u, &domain, &port); err != nil {
+		t.Fatalf("read asset %d: %v", id, err)
+	}
+	var us, ds string
+	var p int
+	if u != nil {
+		us = *u
+	}
+	if domain != nil {
+		ds = *domain
+	}
+	if port != nil {
+		p = *port
+	}
+	return us, ds, p
+}
+
+func TestUpsertHTTPServiceStripsUserinfo(t *testing.T) {
+	d, av2, _ := testSetup(t)
+	defer d.Close()
+	cleanup := func() {
+		d.Exec(`DELETE FROM assets WHERE url LIKE '%storeuserinfo-svc.com%' OR domain LIKE '%storeuserinfo-svc.com' OR root_domain = 'storeuserinfo-svc.com'`)
+	}
+	cleanup()
+	defer cleanup()
+
+	id1, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{URL: "https://alice:s3cr3t-one@App.storeuserinfo-svc.com/app?x=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, domain, port := storedURLRow(t, d, id1)
+	if u != "https://app.storeuserinfo-svc.com/app?x=1" || domain != "app.storeuserinfo-svc.com" || port != 443 {
+		t.Fatalf("stored url=%q domain=%q port=%d", u, domain, port)
+	}
+
+	// Same URL, different credentials: deduplicated onto the same row.
+	id2, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{URL: "https://bob:s3cr3t-two@app.storeuserinfo-svc.com/app?x=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id2 != id1 {
+		t.Errorf("dedup across credentials failed: %d vs %d", id2, id1)
+	}
+	var n int
+	d.QueryRow(`SELECT count(*) FROM assets WHERE type = 'service' AND service_type = 'http' AND url LIKE '%storeuserinfo-svc.com/app%'`).Scan(&n)
+	if n != 1 {
+		t.Errorf("want 1 http service row, got %d", n)
+	}
+	d.QueryRow(`SELECT count(*) FROM assets WHERE url LIKE '%s3cr3t%' AND url LIKE '%storeuserinfo-svc.com%'`).Scan(&n)
+	if n != 0 {
+		t.Errorf("credentials stored in %d asset url(s)", n)
+	}
+
+	// @ in the path is kept; only the userinfo goes.
+	id3, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{URL: "https://u:p@app.storeuserinfo-svc.com:8443/users/@alice?x=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, domain, port = storedURLRow(t, d, id3)
+	if u != "https://app.storeuserinfo-svc.com:8443/users/@alice?x=1" || domain != "app.storeuserinfo-svc.com" || port != 8443 {
+		t.Errorf("@ path: stored url=%q domain=%q port=%d", u, domain, port)
+	}
+
+	// Regression: a URL without userinfo is stored unchanged.
+	plain := "https://plain.storeuserinfo-svc.com/@me?q=1"
+	id4, err := av2.UpsertHTTPService(UpsertHTTPServiceReq{URL: plain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, _, _ = storedURLRow(t, d, id4); u != plain {
+		t.Errorf("plain url: want %q, got %q", plain, u)
+	}
+}
+
+func TestUpsertEndpointStripsUserinfo(t *testing.T) {
+	d, av2, _ := testSetup(t)
+	defer d.Close()
+	cleanup := func() {
+		d.Exec(`DELETE FROM assets WHERE url LIKE '%storeuserinfo-ep.com%' OR domain LIKE '%storeuserinfo-ep.com' OR root_domain = 'storeuserinfo-ep.com'`)
+	}
+	cleanup()
+	defer cleanup()
+
+	id1, err := av2.UpsertEndpoint(UpsertEndpointReq{URL: "https://alice:s3cr3t-one@api.storeuserinfo-ep.com/users?id=1", Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, domain, port := storedURLRow(t, d, id1)
+	if u != "https://api.storeuserinfo-ep.com/users?id=1" || domain != "api.storeuserinfo-ep.com" || port != 443 {
+		t.Fatalf("stored url=%q domain=%q port=%d", u, domain, port)
+	}
+
+	id2, err := av2.UpsertEndpoint(UpsertEndpointReq{URL: "https://bob:s3cr3t-two@api.storeuserinfo-ep.com/users?id=1", Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id2 != id1 {
+		t.Errorf("endpoint dedup across credentials failed: %d vs %d", id2, id1)
+	}
+	var n int
+	d.QueryRow(`SELECT count(*) FROM assets WHERE type = 'endpoint' AND url LIKE '%storeuserinfo-ep.com/users%'`).Scan(&n)
+	if n != 1 {
+		t.Errorf("want 1 endpoint row, got %d", n)
+	}
+	d.QueryRow(`SELECT count(*) FROM assets WHERE url LIKE '%s3cr3t%' AND url LIKE '%storeuserinfo-ep.com%'`).Scan(&n)
+	if n != 0 {
+		t.Errorf("credentials stored in %d asset url(s)", n)
+	}
+
+	id3, err := av2.UpsertEndpoint(UpsertEndpointReq{URL: "http://u:p@api.storeuserinfo-ep.com/users/@alice?x=1", Method: "POST"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _, port = storedURLRow(t, d, id3)
+	if u != "http://api.storeuserinfo-ep.com/users/@alice?x=1" || port != 80 {
+		t.Errorf("@ path: stored url=%q port=%d", u, port)
+	}
+
+	plain := "https://plain.storeuserinfo-ep.com/@me?q=1"
+	id4, err := av2.UpsertEndpoint(UpsertEndpointReq{URL: plain, Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, _, _ = storedURLRow(t, d, id4); u != plain {
+		t.Errorf("plain url: want %q, got %q", plain, u)
 	}
 }
 
@@ -993,6 +1144,7 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 		t.Fatalf("empty ip rejected: %v", err)
 	}
 	deleteAsset(d, id)
+	_, _ = d.Exec(`DELETE FROM assets WHERE domain IN ('ip-guard.example.com','example.com')`)
 	id, err = av2.UpsertIP(UpsertIPReq{IP: "203.0.113.7"})
 	if err != nil {
 		t.Fatalf("valid ip rejected: %v", err)
@@ -1008,7 +1160,8 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 // are excluded. Direct source tasks' scope is included.
 func TestQueryDSLInScopeMembership(t *testing.T) {
 	d, assets, _ := testSetup(t)
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	task, err := d.CreateTask("scope membership", "goal", nil, 0, 0)
 	if err != nil {
@@ -1018,18 +1171,21 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID); _ = d.DeleteTask(src.ID) })
+	t.Cleanup(func() {
+		cleanupErr(t, "task", d.DeleteTask(task.ID))
+		cleanupErr(t, "source task", d.DeleteTask(src.ID))
+	})
 	// task ← src is a direct source relation.
 	if _, err := d.Exec(`INSERT INTO task_relations(task_id, source_task_id) VALUES ($1,$2)`, task.ID, src.ID); err != nil {
 		t.Fatal(err)
 	}
 
 	stamp := time.Now().UnixNano()
-	root := fmt.Sprintf("sc%d.invalid", stamp)           // in-scope root domain (task)
-	srcRoot := fmt.Sprintf("src%d.invalid", stamp)       // in-scope via source task
-	out := fmt.Sprintf("out%d.invalid", stamp)           // out of every scope
-	marker := fmt.Sprintf("mk%d", stamp)                 // bare-text token present in all rows
-	foreignTask := stamp + 777                           // asset produced by an unrelated task
+	root := fmt.Sprintf("sc%d.invalid", stamp)     // in-scope root domain (task)
+	srcRoot := fmt.Sprintf("src%d.invalid", stamp) // in-scope via source task
+	out := fmt.Sprintf("out%d.invalid", stamp)     // out of every scope
+	marker := fmt.Sprintf("mk%d", stamp)           // bare-text token present in all rows
+	foreignTask := stamp + 777                     // asset produced by an unrelated task
 
 	// Scope: task owns root; source task owns srcRoot; task owns an IP /24.
 	for _, sc := range []struct {
@@ -1057,7 +1213,7 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		{"subdomain", "api." + root, root, "", "", "", marker},                        // under task root
 		{"service", "www." + root, root, "https://www." + root + "/", "", "", marker}, // service under task root
 		{"endpoint", "www." + root, root, "https://www." + root + "/a?" + marker + "=1", "GET", "", ""},
-		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker}, // under source-task root
+		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker},                                      // under source-task root
 		{"endpoint", "198.51.100.9", "198.51.100.9", "http://198.51.100.9:8080/" + marker, "GET", "", ""}, // IP-literal host, ip col empty
 		{"subdomain", "x." + out, out, "", "", "", marker},                                                // out of scope
 	}
@@ -1077,7 +1233,7 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE id=ANY($1::bigint[]) OR id=ANY($2::bigint[])`, inScopeIDs, outIDs)
+		cleanupExec(t, d, `DELETE FROM assets WHERE id=ANY($1::bigint[]) OR id=ANY($2::bigint[])`, inScopeIDs, outIDs)
 	})
 
 	got, err := assets.QueryDSLInScope(marker, "", task.ID, 50, 0)

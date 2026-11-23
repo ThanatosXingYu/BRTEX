@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
 )
 
 func names(tools []actool.CoreTool) map[string]actool.CoreTool {
@@ -24,16 +24,16 @@ func names(tools []actool.CoreTool) map[string]actool.CoreTool {
 func TestWireTools(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer pg.Close()
 
 	wireTools(pg, nil) // nil domainReg: test only covers filter/decoration, not injection
-	t.Cleanup(func() { agent.ToolResolve = nil })
+	t.Cleanup(func() { agent.SetToolResolve(nil) })
 	// Prevent interactive-shell Bash decoration: if the worker agent has
 	// interactive_shell=true in the DB, ToolResolve would append a note to
 	// Bash's description. Disable that for this test so the undecorated
@@ -52,7 +52,7 @@ func TestWireTools(t *testing.T) {
 	base := append(ts.WorkerTools(), actool.DefaultTools()...)
 	ctx := context.Background()
 
-	worker := names(agent.ToolResolve(ctx, "worker", base))
+	worker := names(agent.ToolResolve()(ctx, "worker", base))
 	if _, ok := worker["record_fact"]; !ok {
 		t.Error("worker lost record_fact")
 	}
@@ -65,7 +65,7 @@ func TestWireTools(t *testing.T) {
 		t.Error("Bash should pass through undecorated, but description changed")
 	}
 	// planner is not bound to record_fact → resolving a base that contains it drops it.
-	planner := names(agent.ToolResolve(ctx, "planner", base))
+	planner := names(agent.ToolResolve()(ctx, "planner", base))
 	if _, ok := planner["record_fact"]; ok {
 		t.Error("planner should not get record_fact (not bound)")
 	}
@@ -73,19 +73,26 @@ func TestWireTools(t *testing.T) {
 	// Edit description + add a default to a scalar param, then confirm the resolved
 	// worker tool reflects both. Restore from code default on cleanup.
 	t.Cleanup(func() { _ = pg.UpsertToolForce(rf.Key, rf.Description, rf.Schema, mustJSON(rf.Agents)) })
+	// Facts-only contract: the fact fields, and so the
+	// editable scalar annotations, live on the facts[] items.
 	var schema map[string]any
 	_ = json.Unmarshal(rf.Schema, &schema)
-	if props, ok := schema["properties"].(map[string]any); ok {
-		if conf, ok := props["confidence"].(map[string]any); ok {
-			conf["default"] = "inferred"
-		}
+	itemProps := func(sc map[string]any) map[string]any {
+		props, _ := sc["properties"].(map[string]any)
+		facts, _ := props["facts"].(map[string]any)
+		items, _ := facts["items"].(map[string]any)
+		ip, _ := items["properties"].(map[string]any)
+		return ip
+	}
+	if conf, ok := itemProps(schema)["confidence"].(map[string]any); ok {
+		conf["default"] = "inferred"
 	}
 	edited := mustJSON(schema)
 	if err := pg.UpdateTool(rf.Key, "EDITED DESC", edited, mustJSON([]string{"worker"}), true); err != nil {
 		t.Fatal(err)
 	}
 
-	worker2 := names(agent.ToolResolve(ctx, "worker", base))
+	worker2 := names(agent.ToolResolve()(ctx, "worker", base))
 	got := worker2["record_fact"]
 	if got == nil {
 		t.Fatal("record_fact missing after edit")
@@ -96,10 +103,99 @@ func TestWireTools(t *testing.T) {
 	// Default injection: omit confidence → handler input should carry the default.
 	// We can't run the real handler (nil store), but InputSchema must show the default.
 	sc := got.InputSchema()
-	props := sc["properties"].(map[string]any)
-	conf := props["confidence"].(map[string]any)
-	if conf["default"] != "inferred" {
+	conf, _ := itemProps(sc)["confidence"].(map[string]any)
+	if conf == nil || conf["default"] != "inferred" {
 		t.Errorf("confidence.default = %v, want inferred", conf["default"])
+	}
+}
+
+// TestHealListTaskCredentialsSchema: a list_task_credentials row seeded by an older
+// build carries "required": [""]. The startup heal drops that key, leaves the rest of
+// the row alone, changes nothing on a second run, and touches no other tool.
+func TestHealListTaskCredentialsSchema(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		db.SkipPGUnavailable(t, err)
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		db.SkipPGUnavailable(t, err)
+	}
+	t.Cleanup(func() { pg.Close() })
+	s := &Server{m: &Manager{pg: pg}}
+
+	const key = "list_task_credentials"
+	// Other tools the heal must never touch: a normal required list, and the same
+	// malformed value under a different key.
+	const probeRequired, probeBlank = "heal_probe_required", "heal_probe_blank"
+	const broken = `{"type":"object","properties":{},"required":[""]}`
+
+	// The package test DB is shared: put back whatever it held for the real key.
+	old, err := pg.GetTool(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if old == nil {
+			pg.Exec(`DELETE FROM tools WHERE key=$1`, key)
+		} else {
+			pg.Exec(`UPDATE tools SET schema=$2::jsonb WHERE key=$1`, key, string(old.Schema))
+		}
+		pg.Exec(`DELETE FROM tools WHERE key IN ($1,$2)`, probeRequired, probeBlank)
+	})
+	for k, schema := range map[string]string{
+		key:           broken,
+		probeRequired: `{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}`,
+		probeBlank:    broken,
+	} {
+		if _, err := pg.Exec(`INSERT INTO tools(key, description, schema, agents) VALUES ($1, 'legacy row', $2::jsonb, '["worker"]')
+ON CONFLICT (key) DO UPDATE SET schema=EXCLUDED.schema`, k, schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type row struct {
+		schema, description, agents, updatedAt string
+		enabled                                bool
+	}
+	read := func(k string) row {
+		t.Helper()
+		var r row
+		if err := pg.QueryRow(`SELECT schema::text, description, agents::text, updated_at::text, enabled FROM tools WHERE key=$1`, k).
+			Scan(&r.schema, &r.description, &r.agents, &r.updatedAt, &r.enabled); err != nil {
+			t.Fatalf("read %s: %v", k, err)
+		}
+		return r
+	}
+	before, beforeRequired, beforeBlank := read(key), read(probeRequired), read(probeBlank)
+
+	s.healListTaskCredentialsSchema()
+
+	healed := read(key)
+	var schema map[string]any
+	if err := json.Unmarshal([]byte(healed.schema), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := schema["required"]; ok {
+		t.Fatalf("required survived the heal: %s", healed.schema)
+	}
+	if schema["type"] != "object" || schema["properties"] == nil {
+		t.Errorf("heal dropped more than required: %s", healed.schema)
+	}
+	if healed.description != before.description || healed.agents != before.agents || healed.enabled != before.enabled {
+		t.Errorf("heal changed description/bindings/enabled: %+v -> %+v", before, healed)
+	}
+
+	s.healListTaskCredentialsSchema()
+
+	if again := read(key); again != healed {
+		t.Errorf("second heal changed the row: %+v -> %+v", healed, again)
+	}
+	if got := read(probeRequired); got != beforeRequired {
+		t.Errorf("heal touched a tool with a non-empty required: %+v -> %+v", beforeRequired, got)
+	}
+	if got := read(probeBlank); got != beforeBlank {
+		t.Errorf("heal touched another tool key: %+v -> %+v", beforeBlank, got)
 	}
 }
 

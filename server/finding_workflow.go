@@ -8,9 +8,9 @@ import (
 	"log"
 	"strconv"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -19,7 +19,7 @@ func (s *Server) seedFindingWorkflowTools() {
 	if value, _, _ := s.m.pg.GetSetting(hostSearchDescriptionFlag); value != "true" {
 		// Only replace the original built-in text. A user-edited description is
 		// authoritative and must survive upgrades.
-		legacy := "查询记录代理已抓取的目标流量（必须指定 host，可再按 URL 子串或正文关键词过滤）。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符），可用来找响应里的密码、密钥、报错、内网地址等。仅返回极轻量索引(id/method/url/status/resp_len)，不含任何响应内容。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页（page=0 起）；要看某条的请求/响应原文用 traffic_get(id)。回看已访问资源、找端点先用它，避免重复 curl 同一 URL。"
+		legacy := "Query the target traffic already captured by the recording proxy (host is required; URL substrings or body keywords can further filter). body_contains runs a full-text search across captured request/response headers and bodies, supporting any substring and Chinese (at least 3 characters) — useful for finding passwords, keys, errors, intranet addresses, etc. in responses. Only an ultra-light index (id/method/url/status/resp_len) is returned, without any response content. By default only 3 entries are returned, at most 10 per page; use page to paginate when there are many results (page starts at 0); use traffic_get(id) to see the raw request/response of an entry. Use it first to review visited resources and find endpoints, avoiding repeated curl of the same URL."
 		if _, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now() WHERE key='traffic_search' AND system AND description=$2`, traffic.TrafficSearchDescription, legacy); err != nil {
 			// Log and leave the flag unset so the next startup retries; do not
 			// return, or a transient error here would also skip the reporter
@@ -27,6 +27,16 @@ func (s *Server) seedFindingWorkflowTools() {
 			log.Printf("[evidence] upgrade traffic_search description: %v", err)
 		} else {
 			_ = s.m.pg.SetSetting(hostSearchDescriptionFlag, "true")
+		}
+	}
+	const getRewriteDescriptionFlag = "traffic_get_rewrite_description_v1"
+	if value, _, _ := s.m.pg.GetSetting(getRewriteDescriptionFlag); value != "true" {
+		// Same rule: only the original built-in text is replaced.
+		legacy := "Fetch the raw request/response of one captured traffic record by id (truncated when too large). Use together with traffic_search to avoid re-curling. A WebSocket (status 101) or SSE (text/event-stream) record shows only its handshake here; read its messages with traffic_messages."
+		if _, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now() WHERE key='traffic_get' AND system AND description=$2`, traffic.TrafficGetDescription, legacy); err != nil {
+			log.Printf("[evidence] upgrade traffic_get description: %v", err)
+		} else {
+			_ = s.m.pg.SetSetting(getRewriteDescriptionFlag, "true")
 		}
 	}
 	const flag = "finding_workflow_tools_v2_reporter"
@@ -54,7 +64,7 @@ func (s *Server) seedFindingWorkflowTools() {
 		props := objectProperty(schema, "properties")
 		if key == "report_finding" {
 			if _, exists := props["evidence_hint_id"]; !exists {
-				props["evidence_hint_id"] = map[string]any{"type": "integer", "description": "可选：本任务中对应此漏洞的 hint ID；读取该提示保存的 traffic_refs 一并绑定，无提示时省略"}
+				props["evidence_hint_id"] = map[string]any{"type": "integer", "description": "optional: the hint ID in this task corresponding to this finding; the traffic_refs saved with that hint are bound as well; omit when there is no hint"}
 			}
 		} else {
 			if _, exists := props["traffic_refs"]; !exists {
@@ -69,7 +79,7 @@ func (s *Server) seedFindingWorkflowTools() {
 				items["type"] = "object"
 			}
 			itemProps := objectProperty(items, "properties")
-			for name, value := range map[string]any{"text": strParam("提示内容"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": agent.HintTrafficSchema()} {
+			for name, value := range map[string]any{"text": strParam("hint content"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": agent.HintTrafficSchema()} {
 				if _, exists := itemProps[name]; !exists {
 					itemProps[name] = value
 				}
@@ -88,7 +98,7 @@ func (s *Server) seedFindingWorkflowTools() {
 	// Upgrade only the original default binding. Customized lists and enabled
 	// flags survive; the one-time flag also preserves future user unbinding.
 	readers := `["worker","reporter"]`
-	for _, key := range []string{"traffic_search", "traffic_get", "traffic_blob"} {
+	for _, key := range []string{"traffic_search", "traffic_get", "traffic_blob", "traffic_messages"} {
 		if _, err := s.m.pg.Exec(`UPDATE tools SET agents=$2::jsonb WHERE key=$1 AND system AND (agents='["worker"]'::jsonb OR (agents @> '["worker","planner","mainagent","auto","pentest"]'::jsonb AND jsonb_array_length(agents)=5))`, key, readers); err != nil {
 			return
 		}
@@ -117,37 +127,37 @@ func objectProperty(parent map[string]any, key string) map[string]any {
 
 func (s *Server) agentFindingTrafficAccess(ctx context.Context, id int64, write bool) error {
 	if id <= 0 {
-		return errors.New("finding_id 必须为独立漏洞记录 ID；不是探索节点 ID")
+		return errors.New("finding_id must be the standalone finding record ID, not an exploration node ID")
 	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		return err
 	}
 	if f == nil {
-		return fmt.Errorf("%w：finding_id=%d。证据工具使用独立漏洞记录 ID，请从 list_task_findings / get_task_node_detail 的 finding_id 字段读取；不要传 id / finding_node_id", db.ErrFindingNotFound, id)
+		return fmt.Errorf("%w: finding_id=%d. Evidence tools use the standalone finding record ID; read it from the finding_id field of list_task_findings / get_task_node_detail; do not pass id / finding_node_id", db.ErrFindingNotFound, id)
 	}
 	if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
 		task := s.m.ResolveTask(strconv.FormatInt(ri.TaskID, 10))
 		if task == nil {
-			return errors.New("任务不存在")
+			return errors.New("task not found")
 		}
 		_, inherited, allowed := findingProvenanceInTask(task, f.TaskID)
 		if !allowed {
-			return errors.New("当前任务不可读取该漏洞")
+			return errors.New("the current task cannot read this finding")
 		}
 		if write && inherited {
-			return errors.New("继承漏洞的流量证据只读，请到来源任务修改")
+			return errors.New("traffic evidence of an inherited finding is read-only; modify it in the source task")
 		}
 	}
 	return nil
 }
 
 func (s *Server) toolBindFindingTraffic() actool.CoreTool {
-	return wrTool("bind_finding_traffic", "为已登记漏洞补绑经核实的真实 HTTP 流量。finding_id 使用独立漏洞记录 ID；不要传探索节点 ID。同批引用全部成功或全部失败，重复引用不覆盖已有说明。补绑会使已有报告标记待更新；不要为补包重新探测或重复创建漏洞。",
-		objSchema(map[string]any{"finding_id": strParam("独立漏洞记录 ID，从 list_task_findings / get_task_node_detail 的 finding_id 字段读取"), "traffic_refs": agent.HintTrafficSchema()}, "finding_id", "traffic_refs"),
+	return wrTool("bind_finding_traffic", "Bind verified real HTTP traffic to an already-registered finding. finding_id is the standalone finding record ID; do not pass an exploration node ID. All refs in a batch succeed or fail together; duplicate refs do not overwrite existing notes. Binding marks any existing report as pending update; do not re-probe or create duplicate findings just to attach more evidence.",
+		objSchema(map[string]any{"finding_id": strParam("standalone finding record ID, read from the finding_id field of list_task_findings / get_task_node_detail"), "traffic_refs": agent.HintTrafficSchema()}, "finding_id", "traffic_refs"),
 		func(ctx context.Context, raw json.RawMessage) (actool.Result, error) {
 			if !s.m.pg.GetBool(settingAgentTrafficBinding, false) {
-				return actool.Errorf("Agent 自动绑定流量已关闭；请在系统设置开启，或使用页面人工绑定。"), nil
+				return actool.Errorf("agent automatic traffic binding is disabled; enable it in system settings, or bind manually on the page."), nil
 			}
 			var args struct {
 				FindingID json.RawMessage `json:"finding_id"`
@@ -161,7 +171,7 @@ func (s *Server) toolBindFindingTraffic() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			if len(args.Refs) == 0 {
-				return actool.Errorf("补绑需要至少一条已核实的 traffic_refs；无流量无需调用此工具"), nil
+				return actool.Errorf("binding requires at least one verified traffic_refs entry; no need to call this tool when there is no traffic"), nil
 			}
 			list, err := s.evidenceStore().Bind(ctx, id, args.Refs)
 			if err != nil {

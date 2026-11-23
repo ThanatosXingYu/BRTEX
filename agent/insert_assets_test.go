@@ -3,10 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 // testDB opens a DB connection, skipping if PG is unavailable.
@@ -14,11 +15,11 @@ func testDB(t *testing.T) *db.DB {
 	t.Helper()
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("no database config (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	d, err := db.Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	return d
 }
@@ -42,7 +43,7 @@ func callInsertAssets(t *testing.T, ts *ToolSet, payload any) map[string]any {
 
 // =====================================================================
 // TestInsertAssetsSubdomainSideEffects
-// 子域名插入 → 自动创建 root_domain + IP 资产，IP 绑定域名
+// subdomain insert → auto-creates root_domain + IP assets, IP binds the domain
 // =====================================================================
 func TestInsertAssetsSubdomainSideEffects(t *testing.T) {
 	d := testDB(t)
@@ -111,7 +112,7 @@ func TestInsertAssetsSubdomainSideEffects(t *testing.T) {
 
 // =====================================================================
 // TestInsertAssetsMultiIPSubdomain
-// 多个 IP 的子域名：所有 IP 都应存入 record_value[]，各自创建 IP 资产
+// subdomain with multiple IPs: all IPs go into record_value[], each gets its own IP asset
 // =====================================================================
 func TestInsertAssetsMultiIPSubdomain(t *testing.T) {
 	d := testDB(t)
@@ -159,7 +160,7 @@ func TestInsertAssetsMultiIPSubdomain(t *testing.T) {
 
 // =====================================================================
 // TestInsertAssetsHTTPServiceTechnologies
-// HTTP 服务插入：technologies 存储并可读回；IP 存在时域名和端口写入 IP 资产
+// HTTP service insert: technologies are stored and readable back; when an IP is present, the domain and port are written to the IP asset
 // =====================================================================
 func TestInsertAssetsHTTPServiceTechnologies(t *testing.T) {
 	d := testDB(t)
@@ -242,7 +243,7 @@ func TestInsertAssetsHTTPServiceTechnologies(t *testing.T) {
 
 // =====================================================================
 // TestInsertAssetsOtherService
-// 非 HTTP 服务：c_segment 自动生成，IP 资产含 open_ports 和 bound_domains
+// non-HTTP service: c_segment is auto-generated, and the IP asset gets open_ports and bound_domains
 // =====================================================================
 func TestInsertAssetsOtherService(t *testing.T) {
 	d := testDB(t)
@@ -303,7 +304,7 @@ func TestInsertAssetsOtherService(t *testing.T) {
 
 // =====================================================================
 // TestInsertAssetsMixedBatch
-// 混合批量插入：一次调用插入多种类型
+// mixed batch insert: multiple types in one call
 // =====================================================================
 func TestInsertAssetsMixedBatch(t *testing.T) {
 	d := testDB(t)
@@ -361,7 +362,7 @@ func TestInsertAssetsMixedBatch(t *testing.T) {
 
 // =====================================================================
 // TestInsertAssetsDedup
-// 幂等写入：同一资产插入两次，返回相同 ID
+// idempotent write: inserting the same asset twice returns the same ID
 // =====================================================================
 func TestInsertAssetsDedup(t *testing.T) {
 	d := testDB(t)
@@ -398,8 +399,9 @@ func TestInsertAssetsDedup(t *testing.T) {
 
 // =====================================================================
 // TestInsertAssetsRejectsHostnameIPPerItem
-// 一批里混入 ip 填了主机名的一条 → 只有那条失败，其余照常入库，
-// 且错误里带得上 index 和改正方法，Agent 下一轮能自己修好。
+// A batch with one entry whose ip holds a hostname → only that entry fails, the
+// others are stored as usual, and the error carries the index plus the fix, so
+// the agent can repair it itself next round.
 // =====================================================================
 func TestInsertAssetsRejectsHostnameIPPerItem(t *testing.T) {
 	d := testDB(t)
@@ -446,5 +448,51 @@ func TestInsertAssetsRejectsHostnameIPPerItem(t *testing.T) {
 	}
 	if stored != 0 {
 		t.Fatalf("rejected hostname still stored in assets.ip (%d rows)", stored)
+	}
+}
+
+func TestInsertAssetsRuleLoadFailure(t *testing.T) {
+	if out, refused := insertAssetsRuleLoadFailure(nil); refused || out.IsError {
+		t.Fatalf("nil error must not refuse: refused=%v IsError=%v %q", refused, out.IsError, out.Flatten())
+	}
+
+	out, refused := insertAssetsRuleLoadFailure(errors.New("sql: database is closed"))
+	text := out.Flatten()
+	if !refused || !out.IsError || !strings.Contains(text, "asset intercept rules are unavailable") {
+		t.Fatalf("want fail-closed refusal, refused=%v IsError=%v %q", refused, out.IsError, text)
+	}
+	for _, leak := range []string{"sql:", "database is closed"} {
+		if strings.Contains(text, leak) {
+			t.Fatalf("tool result leaked the load error: %q", text)
+		}
+	}
+}
+
+func TestInsertAssetsRefusesWhenInterceptRulesUnavailable(t *testing.T) {
+	d := testDB(t)
+	ts := NewToolSet(nil, "")
+	ts.SetAssetStore(d.Assets(), d.Companies())
+	d.Close()
+
+	raw, err := json.Marshal(map[string]any{
+		"assets": []any{
+			map[string]any{"type": "ip", "ip": "203.0.113.50"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ts.insertAssets().Call(context.Background(), raw, nil)
+	if err != nil {
+		t.Fatalf("Call error: %v", err)
+	}
+	text := res.Flatten()
+	if !res.IsError || !strings.Contains(text, "asset intercept rules are unavailable") {
+		t.Fatalf("want fail-closed refusal, IsError=%v %q", res.IsError, text)
+	}
+	for _, leak := range []string{"sql:", "database is closed", "pq:", "connection"} {
+		if strings.Contains(strings.ToLower(text), strings.ToLower(leak)) {
+			t.Fatalf("tool result leaked the load error: %q", text)
+		}
 	}
 }

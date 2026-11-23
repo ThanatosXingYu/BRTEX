@@ -1,4 +1,4 @@
-// Package llmpool implements LLM failover ("轮询"): a Provider decorator that
+// Package llmpool implements LLM failover ("round-robin"): a Provider decorator that
 // walks an ordered chain of LLM profiles and moves to the next one when the
 // current one can't serve the request — out of credit, revoked key, rate-limited
 // past the SDK's own retries, or down.
@@ -10,23 +10,16 @@
 package llmpool
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
-// backoff is the cooling-off ladder, indexed by trip count. The first rung is
-// deliberately short (30s) so a one-off blip costs less than a minute of
-// avoided traffic, and the last is capped at 10 minutes rather than half an
-// hour so a persistently broken profile keeps getting retried within a working
-// session. A fixed cooldown set via SetPolicy replaces the ladder entirely.
-var backoff = []time.Duration{
-	30 * time.Second,
-	time.Minute,
-	time.Minute,
-	2 * time.Minute,
-	5 * time.Minute,
-	10 * time.Minute,
-}
+// backoff is the cooling-off ladder, indexed by trip count: the 1st trip cools
+// for a minute, the 2nd for five, everything after that for half an hour. A
+// profile that is merely rate-limited recovers quickly; one that keeps failing
+// stops being probed every round.
+var backoff = []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute}
 
 // State is one profile's circuit-breaker state.
 type State struct {
@@ -54,7 +47,9 @@ type Registry struct {
 	m  map[int64]*State
 
 	// persist / forget mirror state to the DB so a cooling-off window survives a
-	// restart. Both may be nil (no DB); both are called off the hot path.
+	// restart. Both may be nil (no DB). Both run while r.mu is held, so a later
+	// change to the same profile cannot enqueue ahead of this one. They must not
+	// call back into the registry or wait on database I/O.
 	persist func(id int64, st State)
 	forget  func(id int64)
 
@@ -68,7 +63,7 @@ type Registry struct {
 // SetPolicy overrides the breaker's two knobs. softTrip: how many consecutive
 // transient failures trip it (0 = default softTripAfter; negative = transient
 // failures never trip it, leaving only the deterministic ones). cooldown: a fixed
-// cooling-off window (0 = the 30s…10min ladder). Safe to call at any time.
+// cooling-off window (0 = the 1min/5min/30min ladder). Safe to call at any time.
 func (r *Registry) SetPolicy(softTrip int, cooldown time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -126,16 +121,14 @@ func (r *Registry) IsOpen(id int64) bool { return r.Get(id).Open() }
 // recovers is fully trusted again (and drops the persisted row).
 func (r *Registry) Pass(id int64) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	st := r.m[id]
 	if st == nil || (st.Fails == 0 && st.Trips == 0 && st.OpenUntil.IsZero()) {
-		r.mu.Unlock()
-		return // already clean — nothing to write
+		return // already clean; nothing to write
 	}
 	delete(r.m, id)
-	forget := r.forget
-	r.mu.Unlock()
-	if forget != nil {
-		forget(id)
+	if r.forget != nil {
+		r.forget(id)
 	}
 }
 
@@ -145,6 +138,7 @@ func (r *Registry) Pass(id int64) {
 // true when this call is what opened the breaker, so the caller can log it once.
 func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	st := r.m[id]
 	if st == nil {
 		st = &State{}
@@ -160,23 +154,60 @@ func (r *Registry) Trip(id int64, errMsg string, hard bool) (tripped bool) {
 		st.Fails = 0 // counted into this trip; start fresh for the half-open probe
 		tripped = true
 	}
-	snap := *st
-	persist := r.persist
-	r.mu.Unlock()
-	if persist != nil {
-		persist(id, snap)
+	if r.persist != nil {
+		r.persist(id, *st)
 	}
 	return tripped
 }
 
-// Reset clears one profile's state — the UI's "立即恢复" action.
+// RecordCall applies the failover health policy to one provider call. The Pool
+// calls it for every member attempt, and a caller that runs a provider directly
+// (a task whose selection bypasses the Pool) calls it too, so a profile's state
+// does not depend on which path the request took.
+//
+// stream tells a streaming call from an atomic one; committed says whether any
+// event already reached the caller (streaming only). The rules are the ones the
+// Pool applies:
+//
+//   - a completed call (err == nil) clears the state with Pass;
+//   - a failure that does not trigger failover (context cancellation, a
+//     deterministic 4xx) is ignored on a stream, and clears the state on an
+//     atomic call, matching Complete's non-failover path;
+//   - a failover-eligible stream failure trips only before the first event:
+//     after that the caller already has output and the state is left alone;
+//   - a failover-eligible atomic failure trips.
+//
+// id 0 is a no-op (no profile to key, e.g. an environment-only configuration).
+// It returns whether this call opened the breaker, and the shortened error
+// stored with it.
+func (r *Registry) RecordCall(ctx context.Context, id int64, stream, committed bool, err error) (tripped bool, errMsg string) {
+	if id == 0 {
+		return false, ""
+	}
+	if err == nil {
+		r.Pass(id)
+		return false, ""
+	}
+	if !shouldFailover(ctx, err) {
+		if !stream {
+			r.Pass(id)
+		}
+		return false, ""
+	}
+	if stream && committed {
+		return false, ""
+	}
+	msg := trimErr(err)
+	return r.Trip(id, msg, isHardFailure(err)), msg
+}
+
+// Reset clears one profile's state — the UI's "Recover now" action.
 func (r *Registry) Reset(id int64) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	delete(r.m, id)
-	forget := r.forget
-	r.mu.Unlock()
-	if forget != nil {
-		forget(id)
+	if r.forget != nil {
+		r.forget(id)
 	}
 }
 

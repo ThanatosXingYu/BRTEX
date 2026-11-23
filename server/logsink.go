@@ -5,11 +5,12 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 // LogLine is one captured backend log entry exposed by the /api/logs endpoints.
@@ -75,7 +76,7 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 					TS:    l.CreatedAt.Format(time.RFC3339),
 					Level: l.Level,
 					Tag:   l.Tag,
-					Text:  l.Text,
+					Text:  maskURLCredentials(l.Text), // rows written before the sink masked them
 				})
 			}
 			// Prepend history before any in-memory startup logs already in ring.
@@ -117,10 +118,25 @@ func (s *logSinkT) SetDB(ctx context.Context, pg *db.DB) {
 	})
 }
 
+// urlCredentials matches scheme://user:password@ up to the last @ of the
+// authority.
+var urlCredentials = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@?#]*):[^/\s?#]*@`)
+
+// maskURLCredentials replaces the password of every scheme://user:password@ in
+// text. It is a second line of defence for the log sink, which /api/logs
+// serves: a log call should not format a secret in the first place.
+func maskURLCredentials(text string) string {
+	if !strings.Contains(text, "://") {
+		return text
+	}
+	return urlCredentials.ReplaceAllString(text, "${1}:xxxxx@")
+}
+
 // Write implements io.Writer for the log package: one call per log.Printf line.
 func (s *logSinkT) Write(p []byte) (int, error) {
-	_, _ = s.out.Write(p) // keep the terminal output
-	line := strings.TrimRight(string(p), "\n")
+	text := maskURLCredentials(string(p))
+	_, _ = io.WriteString(s.out, text) // keep the terminal output
+	line := strings.TrimRight(text, "\n")
 	if strings.TrimSpace(line) != "" {
 		s.add(parseLog(line))
 	}
@@ -136,9 +152,15 @@ func (s *logSinkT) add(l LogLine) {
 		s.ring = s.ring[len(s.ring)-s.cap:]
 	}
 	ch := s.dbCh
-	subs := make([]chan LogLine, 0, len(s.subs))
+	// Fan-out stays under the lock. subscribe's cancel removes the channel and
+	// then closes it; a send on a closed channel panics even inside select, so
+	// the send and the close must not interleave. The send does not block: a
+	// full buffer drops the line.
 	for sub := range s.subs {
-		subs = append(subs, sub)
+		select {
+		case sub <- l:
+		default:
+		}
 	}
 	s.mu.Unlock()
 
@@ -146,13 +168,6 @@ func (s *logSinkT) add(l LogLine) {
 	if ch != nil {
 		select {
 		case ch <- dbWriteReq{seq: l.Seq, ll: l}:
-		default:
-		}
-	}
-
-	for _, sub := range subs {
-		select {
-		case sub <- l:
 		default:
 		}
 	}
@@ -212,12 +227,12 @@ func parseLog(line string) LogLine {
 
 func levelOf(msg string) string {
 	low := strings.ToLower(msg)
-	for _, k := range []string{"fatal", "panic", "error", "err:", "失败", "丢弃", "拒绝", "✕", "不可达"} {
+	for _, k := range []string{"fatal", "panic", "error", "err:", "failed", "dropped", "refused", "✕", "unreachable"} {
 		if strings.Contains(low, k) {
 			return "error"
 		}
 	}
-	for _, k := range []string{"warn", "disabled", "禁用", "skip", "stopped", "⚠", "重试"} {
+	for _, k := range []string{"warn", "disabled", "disable", "skip", "stopped", "⚠", "retry"} {
 		if strings.Contains(low, k) {
 			return "warn"
 		}

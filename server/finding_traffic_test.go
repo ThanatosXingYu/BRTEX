@@ -14,14 +14,16 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(string, string, string) *httptest.ResponseRecorder) {
 	t.Helper()
+	skipWithoutDSN(t)
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +38,11 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 		t.Fatal(err)
 	}
 	tid, _ := strconv.ParseInt(task.ID, 10, 64)
-	t.Cleanup(func() { m.pg.Exec(`DELETE FROM task_archives WHERE task_id=$1`, tid); m.pg.DeleteTask(tid) })
+	t.Cleanup(func() {
+		_, _ = m.pg.DeleteFindingsByTask(tid)
+		_, _ = m.pg.Exec(`DELETE FROM task_archives WHERE task_id=$1`, tid)
+		_ = m.pg.DeleteTask(tid)
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
@@ -171,6 +177,11 @@ func TestFindingTrafficAPIAndExport(t *testing.T) {
 	if w = req("GET", fmt.Sprintf("%s/%d", base, first), ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"binary":true`) {
 		t.Fatal(w.Code, w.Body)
 	}
+	// The viewer reads the heads in clear; the table stores them sealed.
+	var rawHead string
+	if err := s.m.pg.QueryRow(`SELECT req_head FROM traffic_evidence_snapshots WHERE id=$1`, list.Bindings[0].SnapshotID).Scan(&rawHead); err != nil || !strings.HasPrefix(rawHead, "enc:v1:") || !strings.Contains(w.Body.String(), `"req_head":"POST / HTTP/1.1"`) {
+		t.Fatalf("head at rest %q (%v), viewer %s", rawHead, err, w.Body)
+	}
 	if w = req("GET", fmt.Sprintf("%s/%d/body?side=response&offset=20001", base, first), ""); w.Code != 422 {
 		t.Fatal(w.Code, w.Body)
 	}
@@ -271,6 +282,7 @@ func TestFindingTrafficArchiveV3RoundTripAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.m.pg.DeleteFinding(shared.FindingID)
 	if _, err = s.m.traffic.DeleteHost("evidence.local"); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +364,7 @@ func TestFindingTrafficArchiveV3RoundTripAndRetry(t *testing.T) {
 	}
 	// The read tool enforces task visibility too.
 	result, err := s.toolGetFindingTraffic().Call(agent.WithRunInfo(ctx, agent.RunInfo{TaskID: sid}), json.RawMessage(fmt.Sprintf(`{"finding_id":"%d"}`, f.FindingID)), nil)
-	if err != nil || !strings.Contains(result.Flatten(), "不可读取") {
+	if err != nil || !strings.Contains(result.Flatten(), "cannot read") {
 		t.Fatal(result, err)
 	}
 }
@@ -389,7 +401,7 @@ func TestFindingTrafficFailedReportDoesNotTrigger(t *testing.T) {
 func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 	s, f, req := trafficEvidenceServer(t)
 	ctx := context.Background()
-	text := strings.Repeat("中文证据🙂", 2000)
+	text := strings.Repeat("multibyte evidence🙂", 2000)
 	seedServerEvidenceFlow(t, s, "unicode", []byte(text))
 	list, err := s.evidenceStore().Bind(ctx, f.FindingID, []db.TrafficRef{{TrafficID: "unicode"}})
 	if err != nil {
@@ -453,7 +465,7 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 	if _, err = s.m.traffic.DeleteHost("evidence.local"); err != nil {
 		t.Fatal(err)
 	}
-	result, err := s.toolUpdateFindingReport().Call(ctx, json.RawMessage(fmt.Sprintf(`{"finding_id":%d,"evidence_version":1,"report":"## 证据报告\n\n证据 #%d：已验证完整请求响应"}`, f.NodeID, list.Bindings[0].ID)), nil)
+	result, err := s.toolUpdateFindingReport().Call(ctx, json.RawMessage(fmt.Sprintf(`{"finding_id":%d,"evidence_version":1,"report":"## Evidence report\n\nEvidence #%d: verified the full request/response"}`, f.NodeID, list.Bindings[0].ID)), nil)
 	if err != nil || result.IsError {
 		t.Fatal(result, err)
 	}
@@ -472,5 +484,21 @@ func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 		if !strings.Contains(w.Body.String(), fmt.Sprint(list.Bindings[0].ID)) {
 			t.Fatal("export omitted evidence ID", format)
 		}
+	}
+}
+
+func TestFindingsZipLongNonASCIINameStaysUTF8(t *testing.T) {
+	f := &db.DBFinding{ID: 7, Severity: "high", Name: strings.Repeat("跨站脚本", 12)}
+	var buf bytes.Buffer
+	if err := writeFindingsEvidenceZip(&buf, []*db.DBFinding{f}, t.TempDir(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := archive.File[0]
+	if entry.NonUTF8 || !utf8.ValidString(entry.Name) || !strings.HasPrefix(entry.Name, "high_跨站脚本") || !strings.HasSuffix(entry.Name, ".md") {
+		t.Fatalf("entry name %q (NonUTF8=%v)", entry.Name, entry.NonUTF8)
 	}
 }

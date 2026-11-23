@@ -9,8 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/llmrec"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -21,7 +22,7 @@ import (
 func TestRecorderPersistsRawWireBodies(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	pg := m.PG()
@@ -73,6 +74,7 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 		if _, err := pg.Exec(`DELETE FROM llm_records WHERE session_id = $1`, session); err != nil {
 			t.Logf("cleanup: %v", err)
 		}
+		_, _ = pg.Exec(`DELETE FROM llm_usage WHERE task_id = '999999' AND profile_name = 'raw-test-profile'`)
 	}()
 
 	ctx := transcript.WithSessionID(context.Background(), session)

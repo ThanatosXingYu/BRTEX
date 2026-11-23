@@ -15,7 +15,8 @@ import (
 	"strconv"
 	"strings"
 
-	pgdb "github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/agent"
+	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -29,11 +30,6 @@ const (
 type archiveFileMove struct {
 	Source   string `json:"source"`
 	Relative string `json:"relative"`
-	// Copied marks a move staged by copy instead of rename (the rename failed,
-	// typically because a live process holds the source on a bind mount). On
-	// rollback the payload copy is authoritative: the best-effort source removal
-	// after the copy may have left the original tree incomplete.
-	Copied bool `json:"copied,omitempty"`
 }
 
 type archiveStageJournal struct {
@@ -128,6 +124,13 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
+	// The command-output spills of the task are packed and deleted with it.
+	spillDir := agent.TaskSpillDir(dataDir, taskID)
+	if _, err := os.Lstat(spillDir); err == nil {
+		targets = append(targets, archiveFileMove{Source: spillDir, Relative: filepath.Join("files", "spill", "tasks", taskID)})
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 	transcriptDir := filepath.Join(dataDir, "transcripts")
 	entries, err := os.ReadDir(transcriptDir)
 	if err != nil && !os.IsNotExist(err) {
@@ -157,24 +160,12 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 	return stage, nil
 }
 
-// stageRename is swappable in tests to force the copy fallback.
-var stageRename = os.Rename
-
-// applyMoves performs the moves recorded in the journal. Entries already sitting
+// applyMoves performs the renames recorded in the journal. Entries already sitting
 // in the payload are skipped, so an interrupted staging round can be resumed in
-// place without moving anything twice. A rename that fails (on Windows bind
-// mounts a live process holding the source makes directory renames fail with
-// permission denied) falls back to a journaled copy instead of failing the
-// archive.
+// place without moving anything twice.
 func (s *taskArchiveFileStage) applyMoves() error {
-	for i := range s.journal.Moves {
-		move := &s.journal.Moves[i]
+	for _, move := range s.journal.Moves {
 		destination := filepath.Join(s.payload, move.Relative)
-		// A leftover .copying directory is always a partial copy: discard it
-		// before deciding whether this move still needs staging.
-		if err := os.RemoveAll(destination + ".copying"); err != nil {
-			return err
-		}
 		if _, err := os.Lstat(destination); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
@@ -191,86 +182,28 @@ func (s *taskArchiveFileStage) applyMoves() error {
 		if err := os.MkdirAll(filepath.Dir(destination), archiveDirMode); err != nil {
 			return err
 		}
-		if err := stageRename(move.Source, destination); err == nil {
-			continue
-		} else if fallbackErr := s.copyFallback(move, destination); fallbackErr != nil {
-			return fmt.Errorf("stage task archive path %s: rename: %v; copy: %w", move.Source, err, fallbackErr)
+		if err := os.Rename(move.Source, destination); err != nil {
+			return fmt.Errorf("stage task archive path %s: %w", move.Source, err)
 		}
 	}
 	return nil
-}
-
-// copyFallback stages a move whose rename failed by copying the tree into the
-// payload and best-effort removing the source. The journal records the copy
-// before it starts, so an interrupted round can be resumed (a copy in place is
-// treated as done) or rolled back.
-func (s *taskArchiveFileStage) copyFallback(move *archiveFileMove, destination string) error {
-	move.Copied = true
-	if err := writeArchiveJournal(filepath.Join(s.root, "journal.json"), s.journal); err != nil {
-		return err
-	}
-	if err := copyArchiveTree(move.Source, destination+".copying"); err != nil {
-		return err
-	}
-	if err := os.Rename(destination+".copying", destination); err != nil {
-		return err
-	}
-	_ = os.RemoveAll(move.Source)
-	return nil
-}
-
-// copyArchiveTree recursively copies source into destination, preserving file
-// modes and skipping symlinks (the package walk skips them too). Directory
-// modes are not preserved: a copied directory must stay writable until the copy
-// finishes.
-func copyArchiveTree(source, destination string) error {
-	return filepath.WalkDir(source, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		relative, err := filepath.Rel(source, current)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(destination, relative)
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if entry.IsDir() {
-			return os.MkdirAll(target, archiveDirMode)
-		}
-		if err := os.MkdirAll(filepath.Dir(target), archiveDirMode); err != nil {
-			return err
-		}
-		input, err := os.Open(current)
-		if err != nil {
-			return err
-		}
-		output, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
-		if err != nil {
-			_ = input.Close()
-			return err
-		}
-		_, copyErr := io.Copy(output, input)
-		return errors.Join(copyErr, output.Close(), input.Close())
-	})
 }
 
 func (s *taskArchiveFileStage) rollback() error {
 	if s == nil || s.done {
 		return nil
 	}
-	var errs []error
-	// Discard partial copies left by an interrupted fallback.
-	for _, move := range s.journal.Moves {
-		if err := os.RemoveAll(filepath.Join(s.payload, move.Relative) + ".copying"); err != nil {
-			errs = append(errs, err)
-		}
+	err := s.rollbackFiles()
+	if err == nil {
+		err = os.RemoveAll(s.root)
 	}
+	s.done = true
+	return err
+}
+
+// Keep the journal until the caller has also cleaned temporary packages.
+func (s *taskArchiveFileStage) rollbackFiles() error {
+	var errs []error
 	for i := len(s.journal.Moves) - 1; i >= 0; i-- {
 		move := s.journal.Moves[i]
 		staged := filepath.Join(s.payload, move.Relative)
@@ -278,28 +211,6 @@ func (s *taskArchiveFileStage) rollback() error {
 			continue
 		} else if err != nil {
 			errs = append(errs, err)
-			continue
-		}
-		if move.Copied {
-			// The payload copy is authoritative: the best-effort source removal
-			// after the copy may have left the original tree incomplete, so the
-			// source is cleared before the copy is renamed back.
-			if _, err := os.Lstat(move.Source); err == nil {
-				if err := os.RemoveAll(move.Source); err != nil {
-					errs = append(errs, err)
-					continue
-				}
-			} else if !os.IsNotExist(err) {
-				errs = append(errs, err)
-				continue
-			}
-			if err := os.MkdirAll(filepath.Dir(move.Source), 0o755); err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			if err := os.Rename(staged, move.Source); err != nil {
-				errs = append(errs, err)
-			}
 			continue
 		}
 		if _, err := os.Lstat(move.Source); err == nil {
@@ -317,12 +228,6 @@ func (s *taskArchiveFileStage) rollback() error {
 			errs = append(errs, err)
 		}
 	}
-	if len(errs) == 0 {
-		if err := os.RemoveAll(s.root); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	s.done = true
 	return errors.Join(errs...)
 }
 
@@ -334,7 +239,11 @@ func (s *taskArchiveFileStage) commit() error {
 	return os.RemoveAll(s.root)
 }
 
-func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int64) (*taskArchiveRestoreFiles, error) {
+// installTaskArchiveFiles moves the extracted workspace, spill directory and
+// transcripts back under the data directory. The workspace is the whole task
+// directory, run directories (main/, i<N>/) included; priv puts their ownership
+// back, and that of the spill directory.
+func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int64, priv ExecPrivilege) (*taskArchiveRestoreFiles, error) {
 	stage := &taskArchiveRestoreFiles{extracted: extractedDir}
 	numericTaskID, err := strconv.ParseInt(taskID, 10, 64)
 	if err != nil || numericTaskID <= 0 {
@@ -342,8 +251,20 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 	}
 	sources := []restoredArchivePath{}
 	workspace := filepath.Join(extractedDir, "files", "tasks", taskID)
+	taskDir := filepath.Join(dataDir, "tasks", taskID)
+	hasWorkspace := false
 	if _, err := os.Lstat(workspace); err == nil {
-		sources = append(sources, restoredArchivePath{Source: workspace, Destination: filepath.Join(dataDir, "tasks", taskID)})
+		sources = append(sources, restoredArchivePath{Source: workspace, Destination: taskDir})
+		hasWorkspace = true
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	spill := filepath.Join(extractedDir, "files", "spill", "tasks", taskID)
+	spillDir := agent.TaskSpillDir(dataDir, taskID)
+	hasSpill := false
+	if _, err := os.Lstat(spill); err == nil {
+		sources = append(sources, restoredArchivePath{Source: spill, Destination: spillDir})
+		hasSpill = true
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -377,6 +298,18 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 		if err := os.Rename(move.Source, move.Destination); err != nil {
 			_ = stage.rollback()
 			return nil, err
+		}
+	}
+	if hasWorkspace {
+		if err := shareRestoredTaskDir(priv, taskDir); err != nil {
+			_ = stage.rollback()
+			return nil, fmt.Errorf("restore the run directory ownership of %s: %w", taskDir, err)
+		}
+	}
+	if hasSpill {
+		if err := shareRestoredSpillDir(priv, spillDir); err != nil {
+			_ = stage.rollback()
+			return nil, fmt.Errorf("restore the spill directory ownership of %s: %w", spillDir, err)
 		}
 	}
 	return stage, nil
@@ -535,18 +468,33 @@ func recoverTaskArchiveStages(dataDir string, pg *pgdb.DB) error {
 			errs = append(errs, getErr)
 			continue
 		}
-		if archive != nil && archive.State == pgdb.ArchiveReady {
+		if archive != nil && archive.ArchivePath != "" && archive.SHA256 != "" {
 			if err := os.RemoveAll(root); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
 		stage := &taskArchiveFileStage{root: root, payload: filepath.Join(root, "payload"), journal: journal}
-		if err := stage.rollback(); err != nil {
+		if err := stage.rollbackFiles(); err != nil {
 			errs = append(errs, err)
+			continue
 		}
-		if archive != nil && archive.ArchivePath != "" {
-			_ = os.Remove(archive.ArchivePath)
+		// The process can exit after compression but before an upload journal or
+		// database location exists. Remove that temporary package only after the
+		// source-file rollback succeeds, for both local and remote backends.
+		packagePath := taskArchivePath(dataDir, journal.ArchiveID, journal.TaskID)
+		if err := validateArchivePath(dataDir, packagePath); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		// A crash inside compression leaves .partial, before any upload journal.
+		// Retain this staging journal on cleanup failure so startup can retry.
+		if err := errors.Join(removeLocalArchivePackage(packagePath), removeLocalArchivePackage(packagePath+".partial")); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := os.RemoveAll(root); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -610,7 +558,7 @@ func stageTaskArchivePackageDelete(archivePath string, archiveID int64) (string,
 	staged := archivePath + fmt.Sprintf(".deleting-%d", archiveID)
 	if _, err := os.Lstat(staged); err == nil {
 		if _, originalErr := os.Lstat(archivePath); originalErr == nil {
-			return staged, false, errors.New("归档包原文件和删除暂存文件同时存在")
+			return staged, false, errors.New("archive package original and delete-staging files both exist")
 		} else if !os.IsNotExist(originalErr) {
 			return staged, false, originalErr
 		}
@@ -685,10 +633,10 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			// 归档格式端到端只支持普通文件与目录（解包端对其它类型直接报错），
-			// 无法还原符号链接。跳过而非整包失败：不读取链接目标(lstat，不越出目录树)，
-			// 也不写入 symlink 条目；链接指向树内时目标文件本身仍会被单独遍历归档。
-			log.Printf("[task-archive] 跳过符号链接（归档不支持，不影响其它文件）：%s", current)
+			// The archive format supports only regular files and directories end to end (the
+			// unpacker errors out on other types), so symlinks cannot be restored. Skip rather
+			// than fail the whole package: the link target is not read (lstat, never leaves the tree) and no symlink entry is written; when a link points inside the tree, the target file itself is still walked and archived separately.
+			log.Printf("[task-archive] skipping symlink (unsupported by the archive, other files unaffected): %s", current)
 			return nil
 		}
 		header, err := tar.FileInfoHeader(info, "")

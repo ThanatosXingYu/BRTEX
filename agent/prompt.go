@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"sync"
 	"text/template"
 	"time"
 )
@@ -10,7 +11,25 @@ import (
 // key and whether one exists. The server wires it to the PG agent_prompts table.
 // When nil or no override exists, agents use their built-in default prompt — so
 // behavior is identical until a user edits a prompt in the UI.
-var PromptOverride func(agentKey string) (string, bool)
+// Guarded by a lock: server wiring can run while agents render prompts.
+var (
+	promptOverrideMu sync.RWMutex
+	promptOverride   func(agentKey string) (string, bool)
+)
+
+// SetPromptOverride installs (or, with nil, removes) the PromptOverride hook.
+func SetPromptOverride(f func(agentKey string) (string, bool)) {
+	promptOverrideMu.Lock()
+	promptOverride = f
+	promptOverrideMu.Unlock()
+}
+
+// PromptOverride returns the current hook, or nil when none is set.
+func PromptOverride() func(agentKey string) (string, bool) {
+	promptOverrideMu.RLock()
+	defer promptOverrideMu.RUnlock()
+	return promptOverride
+}
 
 // Prompt-variable structs — fields mirror each agent's catalog (docs §5a) so a
 // user template referencing a catalog variable renders; referencing anything else
@@ -26,19 +45,20 @@ type GoalsVars struct{ EngagementDescription, DataDir, Now string }
 // elapsed time (e.g. a timed benchmark's "last N hours" window).
 func nowStr() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
 
-// renderSystem returns the rendered system-prompt BODY (段 [A]) for agentKey.
+// renderSystem returns the rendered system-prompt BODY (section [A]) for agentKey.
 // Precedence: the DB-stored template (if any) over the built-in default template
 // (def). BOTH are Go templates now — the built-in default is seeded into the DB
 // verbatim, so the two paths render identically until a user edits the prompt.
 // Rendering always runs (def used to be pre-substituted plain text; it is now a
 // {{.Var}} template like the DB one). On any render error we fall back to the
 // default template, then to the raw default string — an agent never starts with a
-// half-rendered prompt. Callers append the code-owned tail (trafficTool / 中间产物
-// 输出规约) AFTER this, so those can't be edited away via the DB body.
+// half-rendered prompt. Callers append the code-owned tail (trafficTool /
+// intermediate artifact output rules) AFTER this, so those can't be edited away via
+// the DB body.
 func renderSystem(agentKey, def string, vars any) string {
 	tmpl := def
-	if PromptOverride != nil {
-		if t, ok := PromptOverride(agentKey); ok && t != "" {
+	if override := PromptOverride(); override != nil {
+		if t, ok := override(agentKey); ok && t != "" {
 			tmpl = t
 		}
 	}

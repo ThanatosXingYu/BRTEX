@@ -4,10 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toast } from "sonner";
 
+import { t } from "@/i18n";
 import { sseUrl } from "@/lib/api";
 import { isBtwCommand, type SideExchange, type SideHistory, sideAPI } from "@/lib/side-questions";
+import { setVisibleInterval } from "@/lib/polling";
 
-// crypto.randomUUID 仅在安全上下文可用(https/localhost);经 IP+http 访问时降级。
+// crypto.randomUUID is only available in secure contexts (https/localhost); it degrades when accessed via IP+http.
 function newSideRequestID(): string {
   return (
     globalThis.crypto?.randomUUID?.() ?? `btw-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
@@ -120,8 +122,8 @@ export function useSideQuestions(parent: string | null) {
   useEffect(() => {
     if (!open || !parent) return;
     void load();
-    const timer = setInterval(() => void load(), 2000);
-    return () => clearInterval(timer);
+    const stopPolling = setVisibleInterval(() => void load(), 2000);
+    return stopPolling;
   }, [open, parent, load]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: Reconnect after a clear attempt invalidates older callbacks.
@@ -138,7 +140,7 @@ export function useSideQuestions(parent: string | null) {
         restoreFailedDraft([item]);
         if (item.status !== "running") stream.close();
       } catch {
-        setError("旁路数据解析失败，请重新打开面板");
+        setError(t("Failed to parse side-question data; please reopen the panel"));
       }
     });
     stream.addEventListener("cleared", () => {

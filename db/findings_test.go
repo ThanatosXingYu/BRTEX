@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,16 +11,35 @@ import (
 	"time"
 )
 
-// TestDeleteFinding verifies删除漏洞 removes both the findings row and its
-// originating exploration node (kind='finding').
+// TestDeleteFinding verifies that deleting a finding removes both the findings
+// row and its originating exploration node (kind='finding').
+func TestValidFindingReportState(t *testing.T) {
+	for _, s := range []string{
+		FindingReportNone, FindingReportSubmitted, FindingReportAccepted,
+		FindingReportRejected, FindingReportDuplicate,
+	} {
+		if !ValidFindingReportState(s) {
+			t.Fatalf("%q should be valid", s)
+		}
+	}
+	for _, s := range []string{"", "confirmed", "pending", "SUBMITTED", "submitted "} {
+		if ValidFindingReportState(s) {
+			t.Fatalf("%q should be invalid", s)
+		}
+	}
+	if ValidFindingStatus(FindingReportSubmitted) {
+		t.Fatal("submitted must not be a triage status")
+	}
+}
+
 func TestDeleteFinding(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
-	tk, err := d.CreateTask("删除漏洞测试", "目标", nil, 0, 0)
+	tk, err := d.CreateTask("delete finding test", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +51,7 @@ func TestDeleteFinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fid, err := d.AddFinding(tk.ID, nodeID, "XSS", "反射型 XSS", "high", "summary", "poc", "worker", nil)
+	fid, err := d.AddFinding(tk.ID, nodeID, "XSS", "reflected XSS", "high", "summary", "poc", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,13 +78,190 @@ func TestDeleteFinding(t *testing.T) {
 	}
 }
 
+func TestSetFindingStatusMirrorsNodePayload(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		SkipPGUnavailable(t, err)
+	}
+	defer d.Close()
+
+	tk, err := d.CreateTask("finding status node sync", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(tk.ID)
+
+	es := d.Exploration(tk.ExplorationID)
+	nodeID, err := es.AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err := d.AddFinding(tk.ID, nodeID, "XSS", "reflected XSS", "high", "summary", "poc", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteFinding(fid)
+
+	n, err := d.SetFindingStatus(fid, FindingFalsePositive)
+	if err != nil || n != 1 {
+		t.Fatalf("SetFindingStatus: n=%d err=%v", n, err)
+	}
+
+	var status, state string
+	var payload []byte
+	if err := d.QueryRow(`SELECT f.status, n.payload, n.state
+		FROM findings f JOIN exploration_nodes n ON n.id=f.node_id
+		WHERE f.id=$1`, fid).Scan(&status, &payload, &state); err != nil {
+		t.Fatal(err)
+	}
+	if status != FindingFalsePositive {
+		t.Fatalf("findings.status=%q", status)
+	}
+	if state != "confirmed" {
+		t.Fatalf("node state changed: %q", state)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p["status"] != FindingFalsePositive {
+		t.Fatalf("payload status=%v payload=%s", p["status"], payload)
+	}
+
+	if _, found, _, err := d.SetFindingStatusWithNotify(context.Background(), fid, FindingConfirmed); err != nil || !found {
+		t.Fatalf("SetFindingStatusWithNotify: found=%v err=%v", found, err)
+	}
+	if err := d.QueryRow(`SELECT payload FROM exploration_nodes WHERE id=$1`, nodeID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p["status"] != FindingConfirmed {
+		t.Fatalf("tx path payload status=%v", p["status"])
+	}
+}
+
+func TestFindingReportState(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		SkipPGUnavailable(t, err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	tk, err := d.CreateTask("finding report state", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
+
+	es := d.Exploration(tk.ExplorationID)
+	nodeID, err := es.AddNode(KindFinding, map[string]any{"summary": "x", "severity": "high"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err := d.AddFinding(tk.ID, nodeID, "XSS", "reflected XSS", "high", "summary", "poc", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.AddFinding(tk.ID, 0, "XSS", "other", "low", "summary", "poc", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id IN ($1,$2)`, fid, second)
+		_, _ = d.DeleteFinding(fid)
+		_, _ = d.DeleteFinding(second)
+	})
+
+	one, err := d.GetFinding(fid)
+	if err != nil || one == nil || one.ReportState != FindingReportNone {
+		t.Fatalf("new finding report_state: %+v err=%v", one, err)
+	}
+
+	n, err := d.SetFindingReportState(fid, FindingReportSubmitted)
+	if err != nil || n != 1 {
+		t.Fatalf("SetFindingReportState: n=%d err=%v", n, err)
+	}
+	one, _ = d.GetFinding(fid)
+	if one.ReportState != FindingReportSubmitted {
+		t.Fatalf("report_state=%q", one.ReportState)
+	}
+	if one.Status != FindingPending {
+		t.Fatalf("triage status changed: %q", one.Status)
+	}
+
+	var payload []byte
+	if err := d.QueryRow(`SELECT payload FROM exploration_nodes WHERE id=$1`, nodeID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p["report_state"] != FindingReportSubmitted {
+		t.Fatalf("payload report_state=%v", p["report_state"])
+	}
+
+	listed, total, err := d.ListFindingsPage(FindingFilter{TaskID: fmt.Sprintf("%d", tk.ID), ReportState: FindingReportSubmitted}, 1, 20)
+	if err != nil || total != 1 || len(listed) != 1 || listed[0].ID != fid {
+		t.Fatalf("filter submitted: total=%d listed=%d err=%v", total, len(listed), err)
+	}
+
+	st, err := d.FindingStats()
+	if err != nil || st.Submitted < 1 {
+		t.Fatalf("stats submitted undercount: %+v err=%v", st, err)
+	}
+
+	const missingID = int64(999999999)
+	results, err := d.SetFindingReportStates(context.Background(), []int64{fid, second, missingID}, FindingReportAccepted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("want 3 results, got %d", len(results))
+	}
+	if !results[0].Found || !results[0].Changed || results[0].From != FindingReportSubmitted {
+		t.Fatalf("first: %+v", results[0])
+	}
+	if !results[1].Found || !results[1].Changed || results[1].From != FindingReportNone {
+		t.Fatalf("second: %+v", results[1])
+	}
+	if results[2].Found || results[2].Changed {
+		t.Fatalf("missing: %+v", results[2])
+	}
+
+	again, err := d.SetFindingReportStates(context.Background(), []int64{fid}, FindingReportAccepted)
+	if err != nil || len(again) != 1 || again[0].Changed {
+		t.Fatalf("noop batch: %v %v", again, err)
+	}
+
+	var events int
+	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id IN ($1,$2)`, fid, second).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("report_state must not write notification_events: %d (%v)", events, err)
+	}
+
+	one, _ = d.GetFinding(fid)
+	if one.Status != FindingPending {
+		t.Fatalf("bulk report_state mutated triage: %q", one.Status)
+	}
+	if one.ReportState != FindingReportAccepted {
+		t.Fatalf("bulk report_state=%q", one.ReportState)
+	}
+
+	st, err = d.FindingStats()
+	if err != nil || st.Accepted < 2 {
+		t.Fatalf("stats accepted undercount: %+v err=%v", st, err)
+	}
+}
+
 // TestFindingsPageAndStats exercises ListFindingsPage (filter/sort/paging) and
 // FindingStats against the live dev PG. It tags its rows with a unique vulnclass
 // so assertions are isolated from any pre-existing data, and cleans up after.
 func TestFindingsPageAndStats(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -79,7 +276,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 	seed := []struct {
 		sev, status, name string
 	}{
-		{"critical", "pending", "严重漏洞标题"},
+		{"critical", "pending", "Critical Vulnerability Title"},
 		{"high", "resolved", ""},
 		{"high", "resolved", ""},
 		{"high", "pending", ""},
@@ -113,8 +310,8 @@ func TestFindingsPageAndStats(t *testing.T) {
 	if p1[0].Severity != "critical" {
 		t.Fatalf("severity sort: want critical first, got %q", p1[0].Severity)
 	}
-	if p1[0].Name != "严重漏洞标题" {
-		t.Fatalf("name round-trip: want 严重漏洞标题, got %q", p1[0].Name)
+	if p1[0].Name != "Critical Vulnerability Title" {
+		t.Fatalf("name round-trip: want Critical Vulnerability Title, got %q", p1[0].Name)
 	}
 	if p1[1].Severity != "high" {
 		t.Fatalf("severity sort: want high second, got %q", p1[1].Severity)
@@ -159,17 +356,20 @@ func TestFindingsPageAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if one == nil || one.ID != ids[0] || one.Severity != "critical" || one.Name != "严重漏洞标题" {
+	if one == nil || one.ID != ids[0] || one.Severity != "critical" || one.Name != "Critical Vulnerability Title" {
 		t.Fatalf("GetFinding mismatch: %+v", one)
+	}
+	if one.ReportState != FindingReportNone {
+		t.Fatalf("new finding report_state should be none, got %q", one.ReportState)
 	}
 	if one.Report != "" {
 		t.Fatalf("new finding report should be empty, got %q", one.Report)
 	}
 	// report column round-trips through GetFinding.
-	if _, err := d.Exec(`UPDATE findings SET report=$1 WHERE id=$2`, "# 报告\n正文", ids[0]); err != nil {
+	if _, err := d.Exec(`UPDATE findings SET report=$1 WHERE id=$2`, "# Report\nBody", ids[0]); err != nil {
 		t.Fatal(err)
 	}
-	if one, _ = d.GetFinding(ids[0]); one.Report != "# 报告\n正文" {
+	if one, _ = d.GetFinding(ids[0]); one.Report != "# Report\nBody" {
 		t.Fatalf("report not read back: %q", one.Report)
 	}
 	for _, test := range []struct {
@@ -177,10 +377,10 @@ func TestFindingsPageAndStats(t *testing.T) {
 		query string
 		want  int
 	}{
-		{name: "name", query: "严重漏洞标题", want: 1},
+		{name: "name", query: "Critical Vulnerability Title", want: 1},
 		{name: "summary", query: "summary", want: 6},
 		{name: "evidence", query: "poc", want: 6},
-		{name: "report", query: "正文", want: 1},
+		{name: "report", query: "Body", want: 1},
 		{name: "case insensitive vulnclass", query: strings.ToUpper(vc), want: 6},
 	} {
 		t.Run("query_"+test.name, func(t *testing.T) {
@@ -219,7 +419,7 @@ func TestFindingsPageAndStats(t *testing.T) {
 func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -267,7 +467,7 @@ func TestListFindingsPageUsesStableIDTieBreaker(t *testing.T) {
 func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -411,7 +611,7 @@ func TestFindingGroupsAndUnassignedPaging(t *testing.T) {
 func TestAddFindingFollowUpIntent(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 
@@ -438,14 +638,15 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer d.DeleteFinding(findingID)
 
-	auditInput := Activity{Worker: "system", Kind: "text", Summary: "人工提交漏洞深入利用意图", Detail: "验证可利用性并形成证据链"}
-	intentID, audit, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "验证可利用性并形成证据链", auditInput)
+	auditInput := Activity{Worker: "system", Kind: "text", Summary: "Manually submitted vulnerability deep-exploitation intent", Detail: "Verify exploitability and build an evidence chain"}
+	intentID, audit, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "Verify exploitability and build an evidence chain", auditInput)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondID, _, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "从另一条路径深入", Activity{
-		Worker: "system", Kind: "text", Summary: "人工提交漏洞深入利用意图", Detail: "从另一条路径深入",
+	secondID, _, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "Go deeper via another path", Activity{
+		Worker: "system", Kind: "text", Summary: "Manually submitted vulnerability deep-exploitation intent", Detail: "Go deeper via another path",
 	})
 	if err != nil {
 		t.Fatal(err)

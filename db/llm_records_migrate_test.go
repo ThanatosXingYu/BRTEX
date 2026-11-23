@@ -1,22 +1,28 @@
 package db
 
 import (
+	"io/fs"
 	"testing"
 )
 
 // The raw-body columns were added after release, so existing installs only get
-// them through llmRecordsMigrate. This runs the real migration against the dev
+// them through the ALTERs in 0001_llm_records.sql. This runs the real migration against the dev
 // PG on a table stripped back to its pre-upgrade shape, inside a transaction
 // that is always rolled back — PG does transactional DDL, so nothing persists.
 func TestLLMRecordsMigrateAddsRawColumnsToOldTable(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	defer d.Close()
 	if err := d.EnsureLLMRecordsTable(); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
+	content, err := fs.ReadFile(migrationsFS(), llmRecordsMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	llmRecordsMigrateSQL := string(content)
 
 	tx, err := d.Begin()
 	if err != nil {
@@ -28,7 +34,7 @@ func TestLLMRecordsMigrateAddsRawColumnsToOldTable(t *testing.T) {
 	if _, err := tx.Exec(`ALTER TABLE llm_records DROP COLUMN IF EXISTS raw_request, DROP COLUMN IF EXISTS raw_response`); err != nil {
 		t.Fatalf("simulate old table: %v", err)
 	}
-	if _, err := tx.Exec(llmRecordsMigrate); err != nil {
+	if _, err := tx.Exec(llmRecordsMigrateSQL); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -45,7 +51,7 @@ func TestLLMRecordsMigrateAddsRawColumnsToOldTable(t *testing.T) {
 	}
 
 	// Re-running must stay a no-op (the migration runs on every startup).
-	if _, err := tx.Exec(llmRecordsMigrate); err != nil {
+	if _, err := tx.Exec(llmRecordsMigrateSQL); err != nil {
 		t.Fatalf("migrate is not idempotent: %v", err)
 	}
 

@@ -2,13 +2,15 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Dry run: builds, SBOM, attestations and workflow artifacts only. The GitHub
+  # Release and the image push are gated on github.event_name == 'push'.
+  workflow_dispatch:
 
 permissions:
-  contents: write # 创建 Release 需要
-  packages: write # 推送 GHCR 镜像需要
+  contents: write # required to create the Release
 
 jobs:
-  # ① 前端静态导出（一次），产物给交叉编译各平台复用
+  # ① Frontend static export (once), reused by the cross-compiled platform builds
   frontend:
     runs-on: ubuntu-latest
     steps:
@@ -27,7 +29,7 @@ jobs:
           name: web-dist
           path: web/out
 
-  # ② 五平台交叉编译（内嵌前端）+ 打 zip
+  # ② Cross-compile for five platforms (with embedded frontend) + zip packaging
   binaries:
     needs: frontend
     runs-on: ubuntu-latest
@@ -56,8 +58,9 @@ jobs:
           ARTEX_BUILD_VERSION: ${{ github.ref_name }}
           ARTEX_SKIP_FRONTEND: "1"
           ARTEX_SKIP_NPM_CI: "1"
-          # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
-          # Release 使用 Go linker 裁剪和 zip 压缩，优先保证可移植性。
+          # UPX self-extracting ELF binaries crash on some Linux kernels, virtualization
+          # setups, and security policies. Releases use Go linker trimming and zip
+          # compression, prioritizing portability.
           ARTEX_COMPRESS: "0"
           ARTEX_PACKAGE: "1"
           ARTEX_PACKAGE_DIR: dist
@@ -70,18 +73,23 @@ jobs:
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
-      # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
-      - if: matrix.goos == 'linux'
+      # Upload the raw linux/amd64 binary separately for the release job's Syft SBOM scan
+      - if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         uses: actions/upload-artifact@v4
         with:
-          name: bin-linux-${{ matrix.goarch }}
-          path: dist/artex-linux-${{ matrix.goarch }}/artex
+          name: bin-linux-amd64
+          path: dist/artex-linux-amd64/artex
 
-  # ③ 汇总所有 zip → 创建 GitHub Release
+  # ③ Collect all zips → create the GitHub Release
   release:
     needs: binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the Release (softprops/action-gh-release)
+      id-token: write # Sigstore signing of the provenance attestation
+      attestations: write # store the attestation on the repository
     steps:
+      - uses: actions/checkout@v4 # CHANGELOG.md and the extractor script
       - uses: actions/download-artifact@v4
         with:
           pattern: pkg-*
@@ -90,48 +98,124 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         run: sha256sum *.zip > SHA256SUMS
+      # SBOM of what ships: the Go modules embedded in the linux/amd64 binary, plus
+      # the frontend lockfile and the Go module files.
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-amd64
+          path: ${{ runner.temp }}/sbom-src/bin
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        id: syft
+        with:
+          syft-version: v1.54.0
+      - name: Generate CycloneDX SBOM
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          SRC: ${{ runner.temp }}/sbom-src
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p "$SRC/web"
+          cp go.mod go.sum "$SRC/"
+          cp web/package-lock.json "$SRC/web/"
+          sbom="dist/artex-${TAG}.cdx.json"
+          "$SYFT" scan "dir:$SRC" --source-name artex --source-version "$TAG" -o "cyclonedx-json=$sbom"
+          grep -q '"pkg:golang/' "$sbom" || { echo "::error::SBOM has no pkg:golang entries"; exit 1; }
+          grep -q '"pkg:npm/' "$sbom" || { echo "::error::SBOM has no pkg:npm entries"; exit 1; }
+          echo "SBOM_PATH=$sbom" >> "$GITHUB_ENV"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: |
+            dist/SHA256SUMS
+            ${{ env.SBOM_PATH }}
+      - name: Release body from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if bash scripts/extract-changelog-section.sh "$version" CHANGELOG.md > "$RUNNER_TEMP/release-body.md"; then
+            echo "Release body: CHANGELOG.md section [$version]"
+          else
+            echo "::warning::CHANGELOG.md has no section [$version]; using the generic release body"
+            echo "Release $TAG. See CHANGELOG.md for the list of changes in this release." > "$RUNNER_TEMP/release-body.md"
+          fi
       - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push'
         with:
           files: |
             dist/*.zip
             dist/SHA256SUMS
-          generate_release_notes: true
+            ${{ env.SBOM_PATH }}
+          generate_release_notes: false
+          body_path: ${{ runner.temp }}/release-body.md
 
-  # ④ 多架构镜像 → 推 GHCR（复用 binaries 编好的 Linux 二进制，
-  #    镜像里只装工具 + 放二进制；arm64 仅需模拟 apt 层，构建快很多）
+  # ④ Multi-arch image → push to GitHub Container Registry (and optionally Docker Hub
+  #    when DOCKERHUB_ENABLED is set to 'true' alongside DOCKERHUB_IMAGE and
+  #    DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets). Dry runs (workflow_dispatch)
+  #    build both platforms without logging in or pushing.
   docker:
     needs: binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4 # 取 Dockerfile 与 skills/
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin-linux-amd64
-          path: dist/amd64
-      - uses: actions/download-artifact@v4
-        with:
-          name: bin-linux-arm64
-          path: dist/arm64
+      - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && vars.DOCKERHUB_ENABLED == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/thanatosxingyu/brtex
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ vars.DOCKERHUB_ENABLED == 'true' && vars.DOCKERHUB_IMAGE || '' }}
           tags: |
             type=ref,event=tag
+            type=semver,pattern={{version}}
             type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ARTEX_VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # A brand-new GHCR package starts private: the push succeeds, but an
+      # anonymous pull is denied until the package visibility is set to Public.
+      # Use an empty Docker config so the registry login above cannot mask it.
+      - name: Verify the image pulls anonymously
+        if: github.event_name == 'push'
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          tag="${GITHUB_REF_NAME}"
+          cfg="$(mktemp -d)"
+          for attempt in 1 2 3; do
+            if DOCKER_CONFIG="$cfg" docker manifest inspect "ghcr.io/${repo}:${tag}" >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "anonymous pull of ghcr.io/${repo}:${tag} is denied; set the package visibility to Public" >&2
+          exit 1

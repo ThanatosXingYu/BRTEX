@@ -10,7 +10,8 @@ import (
 
 func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanup below.
+	t.Cleanup(func() { d.Close() })
 
 	stamp := time.Now().UnixNano()
 	domain := fmt.Sprintf("scope-lock-%d.example", stamp)
@@ -23,8 +24,8 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE domain = $1`, domain)
-		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2)`, oldCompany, newCompany)
+		cleanupExec(t, d, `DELETE FROM assets WHERE domain = $1`, domain)
+		cleanupExec(t, d, `DELETE FROM companies WHERE id IN ($1,$2)`, oldCompany, newCompany)
 	})
 	if added, _, invalid, validationErrors, err := companies.AddScopeInputsChecked(oldCompany, []ScopeInput{
 		{Kind: "domain", Value: domain},
@@ -90,7 +91,8 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 
 func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanup below.
+	t.Cleanup(func() { d.Close() })
 
 	stamp := time.Now().UnixNano()
 	first, _, err := companies.UpsertCompany(fmt.Sprintf("Tie Break First %d", stamp), "")
@@ -109,8 +111,8 @@ func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 	icp := fmt.Sprintf("ICP-TIE-%d", stamp)
 	appName := fmt.Sprintf("Tie Break App %d", stamp)
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE domain=$1 OR ip=$2 OR app_name=$3`, domain, ip, appName)
-		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2)`, first, second)
+		cleanupExec(t, d, `DELETE FROM assets WHERE domain=$1 OR ip=$2 OR app_name=$3`, domain, ip, appName)
+		cleanupExec(t, d, `DELETE FROM companies WHERE id IN ($1,$2)`, first, second)
 	})
 
 	rules := []ScopeInput{
@@ -172,15 +174,15 @@ func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 }
 
 func TestCompanyScopeLimitsAndCheckedErrors(t *testing.T) {
-	boundary := strings.Repeat("界", MaxCompanyScopeRawRunes)
+	boundary := strings.Repeat("é", MaxCompanyScopeRawRunes)
 	if err := ValidateCompanyScopeInputBounds([]ScopeInput{{Kind: "keyword", Value: boundary}}); err != nil {
 		t.Fatalf("exact raw rune boundary rejected: %v", err)
 	}
 	var validationErr *CompanyScopeValidationError
-	if err := ValidateCompanyScopeInputBounds([]ScopeInput{{Kind: "keyword", Value: boundary + "界"}}); !errors.As(err, &validationErr) {
+	if err := ValidateCompanyScopeInputBounds([]ScopeInput{{Kind: "keyword", Value: boundary + "é"}}); !errors.As(err, &validationErr) {
 		t.Fatalf("oversized raw value error=%v want CompanyScopeValidationError", err)
 	}
-	// 条数不再设上限,只校验单条长度。
+	// The rule count is no longer capped; only the length of each rule is validated.
 	if err := ValidateCompanyScopeInputBounds(make([]ScopeInput, 1000)); err != nil {
 		t.Fatalf("rule count should be unbounded, got %v", err)
 	}
@@ -193,7 +195,8 @@ func TestCompanyScopeLimitsAndCheckedErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanupCompany(d, companyID)
-	// 曾经封顶 256 条,逐个 IP / 域名录范围的企业很容易撞上;现在不限条数。
+	// There used to be a 256-rule cap, which companies entering scopes one IP /
+	// domain at a time hit easily; the count is now unbounded.
 	const bulk = 300
 	rules := make([]ScopeInput, bulk)
 	for i := range rules {
@@ -230,7 +233,7 @@ func TestCompanyScopeLimitsAndCheckedErrors(t *testing.T) {
 func TestCompanyScopeCheckedReturnsSystemErrorSeparately(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		SkipPGUnavailable(t, err)
 	}
 	companies := d.Companies()
 	if err := d.Close(); err != nil {

@@ -377,6 +377,22 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 	seed("1-0002", "b.example.com", hb) // sole reference to blobB
 	seed("1-0003", "c.example.com", hc) // shares blobC with d
 	seed("1-0004", "d.example.com", hc)
+	// d is also a stream exchange whose one message payload spilled to blobD,
+	// referenced through blob_refs like any body.
+	hd := strings.Repeat("d", 64)
+	blobD := filepath.Join(dir, "_blobs", "sha256", "dd", hd+".bin")
+	if err := os.MkdirAll(filepath.Dir(blobD), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blobD, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.DB().Exec(`INSERT INTO stream_messages(exchange_id,seq,ts,direction,kind,size,payload,payload_blob) VALUES('1-0004',1,1,'s2c',2,1,x'78',?)`, hd); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.DB().Exec(`INSERT INTO blob_refs(hash,exchange_id) VALUES(?, '1-0004')`, hd); err != nil {
+		t.Fatal(err)
+	}
 
 	// Delete a: blobA orphaned → removed; blobB/blobC still referenced → kept.
 	if n, err := tr.DeleteHost("a.example"); err != nil || n != 1 {
@@ -399,12 +415,23 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 	if _, err := os.Stat(blobC); err != nil {
 		t.Fatalf("shared blobC removed after deleting one sharer: %v", err)
 	}
+	if _, err := os.Stat(blobD); err != nil {
+		t.Fatalf("stream payload blobD removed while d still references it: %v", err)
+	}
 
-	// Delete d: last reference gone → blobC collected.
+	// Delete d: last reference gone → blobC collected, and d's stream message
+	// and its payload blob go with it.
 	if n, err := tr.DeleteHost("d.example"); err != nil || n != 1 {
 		t.Fatalf("DeleteHost(d.example)=%d, err=%v; want 1, nil", n, err)
 	}
 	if _, err := os.Stat(blobC); !os.IsNotExist(err) {
 		t.Fatalf("blobC still exists after last reference removed: %v", err)
+	}
+	var streamRows int
+	if err := tr.DB().QueryRow(`SELECT COUNT(*) FROM stream_messages`).Scan(&streamRows); err != nil || streamRows != 0 {
+		t.Fatalf("%d stream rows left after deleting d, err=%v", streamRows, err)
+	}
+	if _, err := os.Stat(blobD); !os.IsNotExist(err) {
+		t.Fatalf("stream payload blobD still exists after its exchange was deleted: %v", err)
 	}
 }

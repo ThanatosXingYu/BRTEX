@@ -7,16 +7,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// 平台操作工具(给内置 Auto agent 用):建/改 skill、自定义工具、MCP。都是 host 工具,
-// seed 进 tools 表、默认绑定 auto,经 hostTools 注入。复用现有 db/文件系统逻辑。
+// Platform operation tools (for the built-in Auto agent): create/edit skills,
+// custom tools, MCP. All are host tools, seeded into the tools table, bound to auto by default, and injected via hostTools. They reuse the existing db/filesystem logic.
 
 func (s *Server) platformTools() []actool.CoreTool {
 	return []actool.CoreTool{
+		s.toolMCPStatus(),
+		s.toolAskOperator(),
 		s.toolCreateSkill(),
 		s.toolUpdateSkillFile(),
 		s.toolCreateCustomTool(),
@@ -38,31 +41,31 @@ var platformToolKeys = []string{
 // ---- assets ----
 
 // toolDeleteAssetsByHost hard-deletes every asset tied to one host (exact match).
-// Platform-level (not a per-task tool): operates on the global, cross-task asset库.
+// Platform-level (not a per-task tool): operates on the global, cross-task asset library.
 func (s *Server) toolDeleteAssetsByHost() actool.CoreTool {
 	return wrTool("delete_assets_by_host",
-		"按 host 精确删除资产：删掉该 host 的域名/子域名，以及其下的服务(service)、接口(endpoint)。\n"+
-			"host 完全匹配(小写、去空格)，不是模糊/通配。\n"+
-			"传根域名(如 example.com)会连带删除它的子域名及其服务/接口；传子域名(如 a.example.com)或 IP 只删该 host 自身及其服务/接口。\n"+
-			"⚠️ 硬删除、作用于全局资产库(跨任务共享)、不可撤销。",
+		"Delete assets by exact host: removes the host's domains/subdomains plus the services (service) and endpoints (endpoint) under them.\n"+
+			"host must match exactly (lowercased, whitespace-trimmed); no fuzzy or wildcard matching.\n"+
+			"Passing a root domain (e.g. example.com) also deletes its subdomains and their services/endpoints; passing a subdomain (e.g. a.example.com) or an IP deletes only that host itself and its services/endpoints.\n"+
+			"⚠️ Hard delete, applies to the global asset library (shared across tasks), irreversible.",
 		objSchema(map[string]any{
-			"host": strParam("要删除的 host：域名/子域名/IP。完全匹配，如 example.com 或 a.example.com 或 1.2.3.4"),
+			"host": strParam("The host to delete: domain/subdomain/IP. Exact match, e.g. example.com, a.example.com, or 1.2.3.4"),
 		}, "host"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			as := s.assetStore()
 			if as == nil {
-				return actool.Errorf("资产库未初始化"), nil
+				return actool.Errorf("asset library not initialized"), nil
 			}
 			var a struct {
 				Host string `json:"host"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Host) == "" {
-				return actool.Errorf("host 不能为空"), nil
+				return actool.Errorf("host must not be empty"), nil
 			}
 			counts, err := as.DeleteByHost(a.Host)
 			if err != nil {
-				return actool.Errorf("删除失败: " + err.Error()), nil
+				return actool.Errorf("delete failed: " + err.Error()), nil
 			}
 			var total int64
 			for _, n := range counts {
@@ -80,27 +83,31 @@ func (s *Server) toolDeleteAssetsByHost() actool.CoreTool {
 
 func (s *Server) toolCreateSkill() actool.CoreTool {
 	return wrTool("create_skill",
-		"创建一个新 skill(写 SKILL.md，agentskills.io 规范)。name 小写字母/数字/连字符。",
+		"Create a new skill (writes SKILL.md, agentskills.io spec). name is lowercase letters/digits/hyphens.",
 		objSchema(map[string]any{
-			"name":         strParam("skill 名(小写字母开头，字母/数字/连字符)"),
-			"description":  strParam("skill 描述(必填，说明它做什么/何时用)"),
-			"instructions": strParam("Markdown 正文说明(可选)"),
+			"name":         strParam("skill name (starts with a lowercase letter; letters/digits/hyphens)"),
+			"description":  strParam("skill description (required; what it does / when to use it)"),
+			"instructions": strParam("Markdown body instructions (optional)"),
 		}, "name", "description"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Name, Description, Instructions string }
 			_ = json.Unmarshal(in, &a)
 			if !validSkillName(a.Name) {
-				return actool.Errorf("skill 名不合法(小写字母开头，仅字母/数字/连字符，≤64)"), nil
+				return actool.Errorf("invalid skill name (must start with a lowercase letter, only letters/digits/hyphens, max 64)"), nil
 			}
 			if strings.TrimSpace(a.Description) == "" {
-				return actool.Errorf("description 必填"), nil
+				return actool.Errorf("description is required"), nil
+			}
+			dirCP, err := resolveSkillDir(s.skillDir, a.Name)
+			if err != nil {
+				return actool.Errorf("invalid skill path"), nil
+			}
+			if dirCP.exists {
+				return actool.Errorf("skill already exists: " + a.Name), nil
 			}
 			path := filepath.Join(s.skillDir, a.Name)
-			if _, err := os.Stat(path); err == nil {
-				return actool.Errorf("skill 已存在: " + a.Name), nil
-			}
 			if err := os.MkdirAll(path, 0o755); err != nil {
-				return actool.Errorf(err.Error()), nil
+				return actool.Errorf(safeFSErr(err)), nil
 			}
 			var b strings.Builder
 			b.WriteString("---\n")
@@ -114,7 +121,7 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 			}
 			if err := os.WriteFile(filepath.Join(path, "SKILL.md"), []byte(b.String()), 0o644); err != nil {
 				_ = os.RemoveAll(path)
-				return actool.Errorf(err.Error()), nil
+				return actool.Errorf(safeFSErr(err)), nil
 			}
 			return actool.Text("skill created: " + a.Name), nil
 		})
@@ -122,21 +129,17 @@ func (s *Server) toolCreateSkill() actool.CoreTool {
 
 func (s *Server) toolUpdateSkillFile() actool.CoreTool {
 	return wrTool("update_skill_file",
-		"写/覆盖某个 skill 内的一个文件(默认 SKILL.md)。用于修改技能内容或加脚本/引用。",
+		"Write/overwrite one file inside a skill (SKILL.md by default). Used to modify skill content or add scripts/references.",
 		objSchema(map[string]any{
-			"name":    strParam("skill 名"),
-			"file":    strParam("相对路径(可选，默认 SKILL.md，如 scripts/run.py)"),
-			"content": strParam("文件完整内容"),
+			"name":    strParam("skill name"),
+			"file":    strParam("relative path (optional, SKILL.md by default, e.g. scripts/run.py)"),
+			"content": strParam("full file content"),
 		}, "name", "content"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Name, File, Content string }
 			_ = json.Unmarshal(in, &a)
 			if !validSkillName(a.Name) {
-				return actool.Errorf("skill 名不合法"), nil
-			}
-			skillPath := filepath.Join(s.skillDir, a.Name)
-			if _, err := os.Stat(skillPath); os.IsNotExist(err) {
-				return actool.Errorf("skill 不存在: " + a.Name), nil
+				return actool.Errorf("invalid skill name"), nil
 			}
 			rel := strings.TrimSpace(a.File)
 			if rel == "" {
@@ -144,14 +147,23 @@ func (s *Server) toolUpdateSkillFile() actool.CoreTool {
 			}
 			clean, msg := skillRelPath(rel)
 			if msg != "" {
-				return actool.Errorf("非法路径: " + msg), nil
+				return actool.Errorf("illegal path: " + msg), nil
 			}
-			full := filepath.Join(skillPath, clean)
-			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-				return actool.Errorf(err.Error()), nil
+			skillExists, cp, err := resolveSkillFile(s.skillDir, a.Name, clean)
+			if err != nil {
+				return actool.Errorf("illegal path: invalid path"), nil
 			}
-			if err := os.WriteFile(full, []byte(a.Content), 0o644); err != nil {
-				return actool.Errorf(err.Error()), nil
+			if !skillExists {
+				return actool.Errorf("skill does not exist: " + a.Name), nil
+			}
+			if cp.realPath == cp.realRoot {
+				return actool.Errorf("illegal path: invalid path"), nil
+			}
+			if err := os.MkdirAll(filepath.Dir(cp.realPath), 0o755); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
+			}
+			if err := os.WriteFile(cp.realPath, []byte(a.Content), 0o644); err != nil {
+				return actool.Errorf(safeFSErr(err)), nil
 			}
 			return actool.Text("skill file written: " + a.Name + "/" + clean), nil
 		})
@@ -173,13 +185,13 @@ type customToolToolInput struct {
 func customToolSchema(keyDesc string) map[string]any {
 	return objSchema(map[string]any{
 		"key":         strParam(keyDesc),
-		"description": strParam("发给模型的描述"),
-		"kind":        strParam("shell | command | script(仅Python) | http。shell=bash 环境声明(仅告知模型该工具可在 bash 中直接调用，无需 exec/schema)；其余三种需提供 exec"),
-		"exec":        map[string]any{"type": "object", "description": "执行规格(shell 类型不需要): command→{command}; script→{code}; http→{method,url,headers,body,proxy,use_recording_proxy}"},
-		"schema":      map[string]any{"type": "object", "description": "参数 JSON-Schema(shell/command/script 可留空; http 必填且需含 properties)"},
-		"agents":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "绑定的 agent key(可选)"},
-		"deferred":    map[string]any{"type": "boolean", "description": "是否延迟(shell 类型无效；仅 command/script/http 的不常用工具才开)"},
-		"enabled":     map[string]any{"type": "boolean", "description": "是否启用(默认 true)"},
+		"description": strParam("description shown to the model"),
+		"kind":        strParam("shell | command | script (Python only) | http. shell = a bash environment declaration (merely tells the model this tool can be called directly in bash, no exec/schema needed); the other three require exec"),
+		"exec":        map[string]any{"type": "object", "description": "execution spec (not needed for the shell kind): command→{command}; script→{code}; http→{method,url,headers,body,proxy,use_recording_proxy}"},
+		"schema":      map[string]any{"type": "object", "description": "parameter JSON-Schema (optional for shell/command/script; required for http and must contain properties)"},
+		"agents":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "agent keys to bind (optional)"},
+		"deferred":    map[string]any{"type": "boolean", "description": "whether to defer (no effect for the shell kind; enable only for rarely used command/script/http tools)"},
+		"enabled":     map[string]any{"type": "boolean", "description": "whether enabled (default true)"},
 	}, "key", "kind")
 }
 
@@ -195,23 +207,27 @@ func toDBTool(a customToolToolInput) *db.Tool {
 }
 
 func (s *Server) toolCreateCustomTool() actool.CoreTool {
-	return wrTool("create_custom_tool", "【重要】当安装一些平台没有的工具时，调用该工具将安装的工具放入平台中，让平台可以调用！创建一个自定义工具(shell/command/script/http)。shell=bash 环境声明，只需 key+description+agents，无需 exec/schema。",
-		customToolSchema("工具 key(小写字母开头，字母/数字/下划线)"),
+	return wrTool("create_custom_tool", "[Important] When installing tools the platform does not have, call this tool to put the installed tool into the platform so the platform can call it! Creates a custom tool (shell/command/script/http). shell = a bash environment declaration, needing only key+description+agents, no exec/schema.",
+		customToolSchema("tool key (starts with a lowercase letter; letters/digits/underscores)"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a customToolToolInput
 			_ = json.Unmarshal(in, &a)
 			a.Key = strings.TrimSpace(a.Key)
 			if !reToolKey.MatchString(a.Key) {
-				return actool.Errorf("key 需小写字母开头，仅含小写字母/数字/下划线"), nil
+				return actool.Errorf("key must start with a lowercase letter and contain only lowercase letters/digits/underscores"), nil
 			}
 			if a.Kind != "shell" && a.Kind != "command" && a.Kind != "script" && a.Kind != "http" {
-				return actool.Errorf("kind 需为 shell / command / script / http"), nil
+				return actool.Errorf("kind must be shell / command / script / http"), nil
 			}
 			if a.Kind == "http" && !hasSchemaProps(a.Schema) {
-				return actool.Errorf("http 工具必须提供参数 JSON Schema(不能留空)"), nil
+				return actool.Errorf("http tools must provide a parameter JSON Schema (cannot be empty)"), nil
 			}
 			if exist, _ := s.m.pg.GetTool(a.Key); exist != nil {
-				return actool.Errorf("该 key 已存在: " + a.Key), nil
+				return actool.Errorf("this key already exists: " + a.Key), nil
+			}
+			var err error
+			if a.Exec, err = unmaskToolExec("", nil, a.Kind, a.Exec); err != nil { // nothing stored: a placeholder is refused
+				return actool.Errorf(err.Error()), nil
 			}
 			if err := s.m.pg.CreateCustomTool(toDBTool(a)); err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -221,26 +237,79 @@ func (s *Server) toolCreateCustomTool() actool.CoreTool {
 }
 
 func (s *Server) toolUpdateCustomTool() actool.CoreTool {
-	return wrTool("update_custom_tool", "修改一个已有的自定义工具(按 key)。",
-		customToolSchema("要修改的自定义工具 key"),
+	return wrTool("update_custom_tool", "Update an existing custom tool (by key).",
+		customToolSchema("the key of the custom tool to modify"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a customToolToolInput
 			_ = json.Unmarshal(in, &a)
 			existing, _ := s.m.pg.GetTool(a.Key)
 			if existing == nil || existing.System {
-				return actool.Errorf("只能修改自定义工具: " + a.Key), nil
+				return actool.Errorf("only custom tools can be modified: " + a.Key), nil
 			}
 			if a.Kind != "shell" && a.Kind != "command" && a.Kind != "script" && a.Kind != "http" {
-				return actool.Errorf("kind 需为 shell / command / script / http"), nil
+				return actool.Errorf("kind must be shell / command / script / http"), nil
 			}
 			if a.Kind == "http" && !hasSchemaProps(a.Schema) {
-				return actool.Errorf("http 工具必须提供参数 JSON Schema(不能留空)"), nil
+				return actool.Errorf("http tools must provide a parameter JSON Schema (cannot be empty)"), nil
+			}
+			var err error
+			if a.Exec, err = unmaskToolExec(existing.Kind, existing.Exec, a.Kind, a.Exec); err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			if err := s.m.pg.UpdateCustomTool(toDBTool(a)); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			return actool.Text("custom tool updated: " + a.Key), nil
 		})
+}
+
+// ---- MCP health ----
+
+// toolMCPStatus reports each MCP server's last connect outcome so a worker can
+// notice a missing server (and say so) instead of silently degrading when the
+// catalog is cached but the server is unreachable.
+func (s *Server) toolMCPStatus() actool.CoreTool {
+	return wrTool("mcp_status",
+		"Report the health of every configured MCP server: name, transport, enabled, cached tool count, and the outcome of the last connect attempt (time, ok/error). Use this when tools you expect are missing or before relying on a skill-gated server.",
+		map[string]any{"type": "object", "properties": map[string]any{}},
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			servers, err := s.m.pg.ListMCP()
+			if err != nil {
+				return actool.Errorf("Error: " + err.Error()), nil
+			}
+			var b strings.Builder
+			fmt.Fprintf(&b, "%d MCP server(s):\n", len(servers))
+			for _, m := range servers {
+				status := "never connected"
+				switch {
+				case m.LastConnectOK != nil && *m.LastConnectOK:
+					status = "connected ok"
+				case m.LastConnectOK != nil && !*m.LastConnectOK:
+					status = "DOWN: " + strings.TrimSpace(coalesceStr(m.LastConnectErr, "connect failed"))
+				}
+				fmt.Fprintf(&b, "- %s [%s, %s, %d cached tools]: %s", m.Name, m.Transport, enabledWord(m.Enabled), len(m.Tools), status)
+				if m.LastConnectAt != nil {
+					fmt.Fprintf(&b, " (last attempt %s)", m.LastConnectAt.UTC().Format(time.RFC3339))
+				}
+				b.WriteByte('\n')
+			}
+			b.WriteString("If a server you need is DOWN, tell the operator in your final report instead of working around it.")
+			return actool.Text(b.String()), nil
+		})
+}
+
+func coalesceStr(p *string, fallback string) string {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+func enabledWord(b bool) string {
+	if b {
+		return "enabled"
+	}
+	return "disabled"
 }
 
 // ---- MCP ----
@@ -259,18 +328,18 @@ type mcpToolInput struct {
 
 func mcpSchema(withID bool) map[string]any {
 	props := map[string]any{
-		"name":      strParam("MCP 服务器名"),
+		"name":      strParam("MCP server name"),
 		"transport": strParam("stdio | http / sse"),
-		"command":   strParam("stdio 的启动命令(如 npx)"),
-		"args":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "命令参数数组"},
-		"env":       map[string]any{"type": "object", "description": "环境变量 {KEY:VALUE}"},
-		"url":       strParam("http/sse 的 URL"),
-		"enabled":   map[string]any{"type": "boolean", "description": "是否启用(默认 true)"},
-		"insecure":  map[string]any{"type": "boolean", "description": "http: 跳过 TLS 证书校验(自签证书时置 true, 默认 false)"},
+		"command":   strParam("launch command for stdio (e.g. npx)"),
+		"args":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "array of command arguments"},
+		"env":       map[string]any{"type": "object", "description": "environment variables {KEY:VALUE}"},
+		"url":       strParam("URL for http/sse"),
+		"enabled":   map[string]any{"type": "boolean", "description": "whether enabled (default true)"},
+		"insecure":  map[string]any{"type": "boolean", "description": "http: skip TLS certificate verification (set true for self-signed certificates, default false)"},
 	}
 	required := []string{"name", "transport"}
 	if withID {
-		props["id"] = map[string]any{"type": "integer", "description": "要修改的 MCP 服务器 id"}
+		props["id"] = map[string]any{"type": "integer", "description": "id of the MCP server to modify"}
 		required = []string{"id", "name", "transport"}
 	}
 	return objSchema(props, required...)
@@ -292,14 +361,14 @@ func (a mcpToolInput) toDB() *db.MCPServer {
 }
 
 func (s *Server) toolCreateMCP() actool.CoreTool {
-	return wrTool("create_mcp", "创建一个 MCP 服务器(stdio/http/sse)。创建后其工具需按 agent 可见性授权。",
+	return wrTool("create_mcp", "Create an MCP server (stdio/http/sse). Its tools must be authorized per agent visibility after creation.",
 		mcpSchema(false),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a mcpToolInput
 			_ = json.Unmarshal(in, &a)
 			a.ID = 0
 			if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.Transport) == "" {
-				return actool.Errorf("name / transport 必填"), nil
+				return actool.Errorf("name / transport are required"), nil
 			}
 			id, err := s.m.pg.SaveMCP(a.toDB())
 			if err != nil {
@@ -310,13 +379,13 @@ func (s *Server) toolCreateMCP() actool.CoreTool {
 }
 
 func (s *Server) toolUpdateMCP() actool.CoreTool {
-	return wrTool("update_mcp", "修改一个已有的 MCP 服务器(按 id)。",
+	return wrTool("update_mcp", "Update an existing MCP server (by id).",
 		mcpSchema(true),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a mcpToolInput
 			_ = json.Unmarshal(in, &a)
 			if a.ID == 0 {
-				return actool.Errorf("id 必填"), nil
+				return actool.Errorf("id is required"), nil
 			}
 			if _, err := s.m.pg.SaveMCP(a.toDB()); err != nil {
 				return actool.Errorf(err.Error()), nil

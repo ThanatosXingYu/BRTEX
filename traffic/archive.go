@@ -9,8 +9,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+)
+
+const (
+	archiveVersionV1 = 1
+	archiveVersionV2 = 2
 )
 
 // ArchiveSnapshot is the portable traffic subset embedded in one task archive.
@@ -23,22 +29,24 @@ type ArchiveSnapshot struct {
 }
 
 type ArchiveExchange struct {
-	ID          string `json:"id"`
-	TS          int64  `json:"ts"`
-	Host        string `json:"host"`
-	Method      string `json:"method"`
-	URLTemplate string `json:"url_template"`
-	URL         string `json:"url"`
-	Status      int    `json:"status"`
-	ContentType string `json:"content_type"`
-	ReqLen      int    `json:"req_len"`
-	RespLen     int    `json:"resp_len"`
-	ReqHead     string `json:"req_head"`
-	ReqBody     []byte `json:"req_body,omitempty"`
-	ReqBlob     string `json:"req_blob,omitempty"`
-	RespHead    string `json:"resp_head"`
-	RespBody    []byte `json:"resp_body,omitempty"`
-	RespBlob    string `json:"resp_blob,omitempty"`
+	ID             string  `json:"id"`
+	TS             int64   `json:"ts"`
+	Host           string  `json:"host"`
+	Method         string  `json:"method"`
+	URLTemplate    string  `json:"url_template"`
+	URL            string  `json:"url"`
+	Status         int     `json:"status"`
+	ContentType    string  `json:"content_type"`
+	ReqLen         int     `json:"req_len"`
+	RespLen        int     `json:"resp_len"`
+	ReqHead        string  `json:"req_head"`
+	ReqBody        []byte  `json:"req_body,omitempty"`
+	ReqBlob        string  `json:"req_blob,omitempty"`
+	RespHead       string  `json:"resp_head"`
+	RespBody       []byte  `json:"resp_body,omitempty"`
+	RespBlob       string  `json:"resp_blob,omitempty"`
+	Rewritten      bool    `json:"rewritten,omitempty"`
+	RewriteRuleIDs []int64 `json:"rewrite_rule_ids,omitempty"`
 }
 
 // ExportHosts writes an exact-host snapshot to dir. It holds the traffic writer
@@ -66,7 +74,7 @@ FROM exchanges WHERE host IN (`+strings.Join(placeholders, ",")+`) ORDER BY ts,i
 		return 0, err
 	}
 	defer rows.Close()
-	snapshot := ArchiveSnapshot{Version: 1}
+	snapshot := ArchiveSnapshot{Version: archiveVersionV2}
 	blobs := map[string]struct{}{}
 	for rows.Next() {
 		var item ArchiveExchange
@@ -102,21 +110,37 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
-	for hash := range blobs {
-		source, err := t.blobPath(hash)
+	_ = rows.Close()
+	for i := range snapshot.Exchanges {
+		rewritten, ruleIDs, err := t.RewriteInfo(snapshot.Exchanges[i].ID)
 		if err != nil {
 			return 0, err
 		}
-		data, err := os.ReadFile(source)
-		if err != nil {
-			return 0, err
+		if rewritten {
+			snapshot.Exchanges[i].Rewritten = true
+			snapshot.Exchanges[i].RewriteRuleIDs = ruleIDs
 		}
-		if err := os.WriteFile(filepath.Join(dir, "blobs", hash+".bin"), data, 0o600); err != nil {
-			return 0, err
-		}
-		snapshot.Blobs = append(snapshot.Blobs, hash)
 	}
-	sort.Strings(snapshot.Blobs)
+	if len(blobs) > 0 {
+		snapshot.Blobs = make([]string, 0, len(blobs))
+		for hash := range blobs {
+			snapshot.Blobs = append(snapshot.Blobs, hash)
+		}
+		sort.Strings(snapshot.Blobs)
+		for _, hash := range snapshot.Blobs {
+			source, err := t.blobPath(hash)
+			if err != nil {
+				return 0, err
+			}
+			data, err := os.ReadFile(source)
+			if err != nil {
+				return 0, err
+			}
+			if err := os.WriteFile(filepath.Join(dir, "blobs", hash+".bin"), data, 0o600); err != nil {
+				return 0, err
+			}
+		}
+	}
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		return 0, err
@@ -129,6 +153,11 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 
 // ImportArchive imports only missing exchange IDs. Current hot rows always win,
 // and repeated restore attempts are safe after a partial external failure.
+// Version 1 archives carry no rewrite provenance (imported as unrewritten).
+// Version 2 archives carry per-exchange rewritten + rewrite_rule_ids and
+// reconstruct minimal applied rows in exchange_rewrites (phase='archived',
+// outcome='applied', rule_snapshot=NULL) so RewriteInfo and the rewritten list
+// filter return the same provenance without inventing a rule snapshot.
 func (t *Traffic) ImportArchive(dir string) (int64, error) {
 	if t == nil {
 		return 0, nil
@@ -144,7 +173,7 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 	if err := json.Unmarshal(raw, &snapshot); err != nil {
 		return 0, err
 	}
-	if snapshot.Version != 1 {
+	if snapshot.Version != archiveVersionV1 && snapshot.Version != archiveVersionV2 {
 		return 0, fmt.Errorf("unsupported traffic archive version %d", snapshot.Version)
 	}
 	t.wmu.Lock()
@@ -200,6 +229,11 @@ VALUES(?,?,?,?,?,?,?)`, item.ID, item.ReqHead, item.ReqBody, nullIfEmpty(item.Re
 				}
 			}
 		}
+		if snapshot.Version >= archiveVersionV2 && item.Rewritten {
+			if err := insertArchivedRewriteProvenance(tx, item.ID, item.RewriteRuleIDs); err != nil {
+				return imported, err
+			}
+		}
 		if t.fts {
 			var rowID int64
 			if err := tx.QueryRow(`SELECT rowid FROM exchanges WHERE id=?`, item.ID).Scan(&rowID); err != nil {
@@ -216,6 +250,42 @@ VALUES(?,?,?,?,?,?,?)`, item.ID, item.ReqHead, item.ReqBody, nullIfEmpty(item.Re
 		return imported, err
 	}
 	return imported, nil
+}
+
+// insertArchivedRewriteProvenance writes minimal applied rows so RewriteInfo
+// and the traffic list's rewritten flag/filter return the exact archived
+// provenance without fabricating a rule snapshot or request/response phase.
+func insertArchivedRewriteProvenance(tx *sql.Tx, exchangeID string, ruleIDs []int64) error {
+	ids := normalizeArchiveRuleIDs(ruleIDs)
+	if len(ids) == 0 {
+		_, err := tx.Exec(`INSERT INTO exchange_rewrites(exchange_id,seq,phase,rule_id,outcome,reason)
+VALUES(?,0,'archived',NULL,'applied','archived')`, exchangeID)
+		return err
+	}
+	for seq, rid := range ids {
+		if _, err := tx.Exec(`INSERT INTO exchange_rewrites(exchange_id,seq,phase,rule_id,outcome,reason)
+VALUES(?,?,'archived',?,'applied','archived')`, exchangeID, seq, rid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizeArchiveRuleIDs(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 func uniqueArchiveHosts(hosts []string) []string {

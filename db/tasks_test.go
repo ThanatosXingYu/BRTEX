@@ -11,11 +11,11 @@ import (
 func TestTaskLifecycleAndDeleteCascade(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { d.Close() })
 
-	tk, err := d.CreateTask("迁移测试", "目标X", nil, 0, 0)
+	tk, err := d.CreateTask("migration test", "goal X", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,15 +85,16 @@ func TestTaskLifecycleAndDeleteCascade(t *testing.T) {
 func TestTaskDeleteCascadeAssets(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
-	first, err := d.CreateTask("级联删除测试", "目标A", nil, 0, 0)
+	first, err := d.CreateTask("cascade delete test", "goal A", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := d.CreateTask("共享资产保留测试", "目标B", nil, 0, 0)
+	second, err := d.CreateTask("shared asset retention test", "goal B", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,9 +139,10 @@ func TestTaskDeleteCascadeAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = d.DeleteTask(first.ID)
-		_ = d.DeleteTask(second.ID)
-		_, _ = assets.DeleteByIDs([]int64{exclusiveID, sharedID, anchorOnlyID, protectedID})
+		cleanupErr(t, "first task", d.DeleteTask(first.ID))
+		cleanupErr(t, "second task", d.DeleteTask(second.ID))
+		_, err := assets.DeleteByIDs([]int64{exclusiveID, sharedID, anchorOnlyID, protectedID})
+		cleanupErr(t, "assets", err)
 	})
 
 	hosts, err := assets.HostsByTask(first.ID)
@@ -209,9 +211,10 @@ func TestTaskDeleteCascadeAssets(t *testing.T) {
 func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	suffix := time.Now().UnixNano()
 	profileIDs := make([]int64, 0, 3)
@@ -242,11 +245,11 @@ func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = d.DeleteTask(child.ID)
-		_ = d.DeleteTask(sourceA.ID)
-		_ = d.DeleteTask(sourceB.ID)
+		cleanupErr(t, "child task", d.DeleteTask(child.ID))
+		cleanupErr(t, "source task A", d.DeleteTask(sourceA.ID))
+		cleanupErr(t, "source task B", d.DeleteTask(sourceB.ID))
 		for _, id := range profileIDs {
-			_ = d.DeleteProfile(id)
+			cleanupProfile(t, d, id)
 		}
 	})
 
@@ -304,7 +307,7 @@ func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 	if _, err := d.MarkTaskLLMProfileQuotaExhausted(child.ID, profileIDs[1], "quota_exceeded"); err != nil {
 		t.Fatal(err)
 	}
-	last, err := d.MarkTaskLLMProfileQuotaExhausted(child.ID, profileIDs[2], "余额不足")
+	last, err := d.MarkTaskLLMProfileQuotaExhausted(child.ID, profileIDs[2], "insufficient balance")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,21 +470,23 @@ func TestTaskRelationsAndLLMFailoverChain(t *testing.T) {
 func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	source, err := d.CreateTask("source", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(source.ID) })
+	t.Cleanup(func() { cleanupErr(t, "source task", d.DeleteTask(source.ID)) })
 	if _, err := d.CreateTaskWithOptions("bad", "goal", TaskCreateOptions{SourceTaskIDs: []int64{source.ID, source.ID}}); err == nil {
 		t.Fatal("duplicate source task ids should be rejected")
 	}
 
-	// 终态任务仍然可以改 LLM 配置链:任务结束后主 Agent 对话继续走这条链,
-	// 链上模型不可用时必须还能换。
+	// Terminal tasks can still edit the LLM chain: after a task ends the main agent
+	// conversation keeps using this chain, so it must remain replaceable when the
+	// models on it become unavailable.
 	profileID, err := d.SaveProfile(&LLMProfile{
 		Name: fmt.Sprintf("terminal-chain-%d", time.Now().UnixNano()), Format: "openai",
 		Model: "terminal-model", APIKey: "test-key",
@@ -489,13 +494,13 @@ func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteProfile(profileID) })
+	t.Cleanup(func() { cleanupProfile(t, d, profileID) })
 
 	task, err := d.CreateTask("terminal", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupErr(t, "terminal task", d.DeleteTask(task.ID)) })
 	if err := d.SetStatus(task.ID, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -520,9 +525,10 @@ func TestTaskContextRejectsDuplicatesAndAllowsTerminalLLMEdits(t *testing.T) {
 func TestCreateTaskWithCompanyScopes(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	suffix := time.Now().UnixNano()
 	companyA, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Task Company A %d", suffix), "")
@@ -538,14 +544,14 @@ func TestCreateTaskWithCompanyScopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2,$3)`, companyA, companyB, emptyCompany)
+		cleanupExec(t, d, `DELETE FROM companies WHERE id IN ($1,$2,$3)`, companyA, companyB, emptyCompany)
 	})
 
 	existingTask, err := d.CreateTask("existing company asset owner", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(existingTask.ID) })
+	t.Cleanup(func() { cleanupErr(t, "existing task", d.DeleteTask(existingTask.ID)) })
 	var companyAssetA, companyAssetB int64
 	domainA := fmt.Sprintf("task-company-a-%d.example.test", suffix)
 	domainB := fmt.Sprintf("task-company-b-%d.example.test", suffix)
@@ -561,7 +567,10 @@ VALUES ('root_domain',$1,$1,$2,'explicit')
 RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.Assets().DeleteByIDs([]int64{companyAssetA, companyAssetB}) })
+	t.Cleanup(func() {
+		_, err := d.Assets().DeleteByIDs([]int64{companyAssetA, companyAssetB})
+		cleanupErr(t, "company assets", err)
+	})
 
 	task, err := d.CreateTaskWithOptions("company-scoped task", "use company scope", TaskCreateOptions{
 		CompanyIDs: []int64{companyA, companyB},
@@ -569,7 +578,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() { cleanupErr(t, "company-scoped task", d.DeleteTask(task.ID)) })
 	if fmt.Sprint(task.CompanyIDs) != fmt.Sprint([]int64{companyA, companyB}) {
 		t.Fatalf("creation result company IDs=%v", task.CompanyIDs)
 	}
@@ -607,7 +616,7 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 			t.Errorf("company asset %d missing from task", assetID)
 			continue
 		}
-		if asset.TaskSource != taskCompanyAssetSource || asset.TaskSourceSummary != "任务创建时关联企业："+companyName {
+		if asset.TaskSource != taskCompanyAssetSource || asset.TaskSourceSummary != "associated with company at task creation: "+companyName {
 			t.Errorf("asset %d provenance=%q/%q", assetID, asset.TaskSource, asset.TaskSourceSummary)
 		}
 	}
@@ -671,9 +680,10 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 func TestListTasksOrderByIDDesc(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanups below.
+	t.Cleanup(func() { d.Close() })
 
 	stamp := time.Now().UnixNano()
 	var ids []int64
@@ -682,7 +692,7 @@ func TestListTasksOrderByIDDesc(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
+		t.Cleanup(func() { cleanupErr(t, "order task", d.DeleteTask(tk.ID)) })
 		ids = append(ids, tk.ID)
 	}
 

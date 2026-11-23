@@ -4,14 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/intercept"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -34,18 +36,25 @@ import (
 // independent of the traffic-recording MITM proxy — set it when the search endpoint
 // is only reachable via a VPN/SOCKS proxy. Empty = direct.
 //
-// 注意 deepseek 后端与其它三个的性质不同：DeepSeek 没有可直接调用的搜索接口，
-// 搜索只存在于其 Anthropic 兼容 messages 接口内部(web_search_20250305 server
-// tool)，因此每次搜索会消耗一次模型调用，且搜索请求由 DeepSeek 服务端发出——
-// 不经过本机 Proxy，也不会进流量留痕。
+// Note the deepseek backend differs in nature from the other three: DeepSeek has no
+// directly callable search API — search exists only inside its Anthropic-compatible
+// messages API (the web_search_20250305 server tool), so each search consumes one
+// model call, and the search request is issued by DeepSeek's servers — it does NOT
+// go through the local Proxy, nor into the traffic recording.
+// KeenableSearchTitle is the X-Keenable-Title value ARTEX sends. Fixed in v1:
+// the title identifies the calling application to the provider.
+const KeenableSearchTitle = "ARTEX"
+
 type WebSearchOpts struct {
-	Enabled   bool
-	Backend   string
-	BraveKey  string
-	TavilyKey string
-	Proxy     string
-	// DeepSeek* 来自当前激活的 LLM 配置(仅 anthropic 格式的 DeepSeek 官方端点)，
-	// 不单独配置，随 LLM 配置切换而变。
+	Enabled     bool
+	Backend     string
+	BraveKey    string
+	TavilyKey   string
+	KeenableKey string
+	Proxy       string
+	// DeepSeek* comes from the currently active LLM config (only the official
+	// DeepSeek endpoint in anthropic format) — not configured separately; it follows
+	// the LLM config switch.
 	DeepSeekBaseURL string
 	DeepSeekAPIKey  string
 	DeepSeekModel   string
@@ -58,6 +67,7 @@ type Worker struct {
 	workDir         string
 	proxyAddr       string
 	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
+	factTraffic     FactTrafficLookup // proxy captures for fact provenance (nil = activity-only)
 	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
 	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
 	window          int               // context window in tokens (for compaction)
@@ -85,6 +95,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// lessonsBlock is the raw RSI evidence block. Empty = off. Execute() frames
+	// it with a per-run data envelope (field=lessons) and appends it after the
+	// rendered system prompt. The server renders the text from outcome records.
+	lessonsBlock string
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -138,6 +152,11 @@ func (w *Worker) maxTokens() int {
 // constraints get injected into the worker system prompt. nil = inject (default).
 func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn }
 
+// SetLessonsBlock sets the raw RSI evidence block. Empty disables it. Execute()
+// frames it as data. The server renders it from outcome records; it is never
+// editable through the prompt UI.
+func (w *Worker) SetLessonsBlock(block string) { w.lessonsBlock = block }
+
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
 
@@ -151,20 +170,20 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "You are about to be terminated because your budget is exhausted. Do not run any more commands/probes. Please, in order: (1) write back everything you have identified above but not yet written back, item by item — new assets with insert_assets, exploration conclusions/facts with record_fact, confirmed findings with report_finding; (2) **finally, in a single standalone sentence of plain text** summarize what you did and which key conclusions you reached (this sentence is shown as this run's result — be sure to output it)."
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
 }
 
-// defaultToolsExcept returns actool.DefaultTools() minus the named tools (by
+// defaultToolsExcept returns defaultTools(base) minus the named tools (by
 // CoreTool.Name()). Used to trim SDK default tools an agent shouldn't have.
-func defaultToolsExcept(exclude ...string) []actool.CoreTool {
+func defaultToolsExcept(base string, exclude ...string) []actool.CoreTool {
 	drop := make(map[string]bool, len(exclude))
 	for _, n := range exclude {
 		drop[n] = true
 	}
-	all := actool.DefaultTools()
+	all := defaultTools(base)
 	out := make([]actool.CoreTool, 0, len(all))
 	for _, t := range all {
 		if !drop[t.Name()] {
@@ -188,6 +207,10 @@ func (w *Worker) compactionWindow() int {
 // that MITM proxy. Empty addr disables the hint.
 func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
 
+// SetFactTraffic wires the proxy capture store used to classify recorded facts
+// (#124 row 1). nil keeps the activity-only classification.
+func (w *Worker) SetFactTraffic(l FactTrafficLookup) { w.factTraffic = l }
+
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 
@@ -201,9 +224,18 @@ func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 // honor the proxy vars. ALL_PROXY is set too so a socks5 egress proxy (which curl
 // only reads from ALL_PROXY, not HTTP(S)_PROXY) works in the capture-off path.
 // Empty proxyAddr → nil (direct, unchanged env).
+//
+// With a MITM CA (capture on) the proxy URL carries the pace marker userinfo
+// (egress.MarkProxyURL): the recording proxy then paces this connection's
+// requests by the noise profile. Only Bash gets the marker; WebFetch, the http
+// custom tools and enrich keep the plain URL, since egress paces them already.
+// The global proxy (capture off) is left as configured.
 func proxyEnv(proxyAddr, caCert string) []string {
 	if proxyAddr == "" {
 		return nil
+	}
+	if caCert != "" {
+		proxyAddr = egress.MarkProxyURL(proxyAddr)
 	}
 	env := []string{
 		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
@@ -223,26 +255,46 @@ func proxyEnv(proxyAddr, caCert string) []string {
 	return env
 }
 
-// workerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the worker system
-// prompt, seeded into agent_prompts. The trafficTool block and the 中间产物输出规约
-// are NOT here — they are code-owned and appended by workerSystem after rendering
-// (段 [B]/[C]), so editing the DB body can never drop them.
-const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系统的"执行者"(work agent)。你领到【一条意图】(一句话探索方向)，唯一职责：**完成这一条意图、把发现写回知识图谱、然后停止返回。**
+// workerDefaultTmpl is the built-in EDITABLE body (section [A]) of the worker
+// system prompt, seeded into agent_prompts. The trafficTool block and the
+// intermediate artifact output rules are NOT here — they are code-owned and
+// appended by workerSystem after rendering (sections [B]/[C]), so editing the DB
+// body can never drop them.
+const workerDefaultTmpl = `You are an "executor" (work agent) of a network-security platform's authorized penetration testing system. You are assigned [ONE intent] (a one-sentence exploration direction), and your sole duty is: **complete this one intent, write the findings back into the knowledge graph, then stop and return.**
 
-**边界（红线）**：
-1. **只做你领到的这一条意图**。**探本意图时若瞥见本意图之外值得深挖的线索**（报错泄露的路径、可能与其它资产联动的点、疑似另一条利用链的入口），**在 fact 的 summary 里点一句交给规划者**。
-2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
-3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
+**Boundaries (red lines)**:
+1. **Do only the one intent you were assigned**. **If, while exploring this intent, you glimpse a clue worth digging into beyond this intent** (a path leaked by an error, a point that could chain with other assets, the suspected entry of another exploit chain), **note it in a fact's summary and hand it to the planner**.
+2. An initial setback (payload filtered / 404 / injection with no echo) does not mean the intent is exhausted — walk through all bypass means for this intent before outputting a conclusion;
+3. Operate only within the authorized scope. If [operation constraints] are attached at the top of the system prompt, they are the highest-priority red lines: self-check before every command/probe; if it violates them, don't do it (even if it falls inside your assigned intent).
 
-**边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
-- **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
-- **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
+**Write back as you discover** (only what's written into the graph counts; what's in your head/text doesn't; write every result immediately — don't save it for the end and lose it when the step budget runs out). Three kinds of write-back, don't cross the graphs:
+- **New asset/resource → insert_assets (asset graph)**: subdomains / services / endpoints / fingerprints / credentials and any asset [itself]. **Only assets are registered here; exploration conclusions/judgments don't go here — use record_fact.**
+- **Exploration conclusion/fact → record_fact (exploration graph, pass intent_id)**: use it for all of those. **Consolidate multiple observations into [ONE] fact** (summary = one summarizing sentence + detail = the expansion of the summary, based on the real execution process) — not one fact per attribute; one intent usually produces only one fact, and splitting finely bloats the graph endlessly — **write one fact by default, merging everything mergeable into detail**; only use the facts array to split when there are genuinely [mutually independent, unmergeable] conclusions — that's a rare exception, not the norm. **Write only the delta**: record only what is [newly obtained] this time; don't re-record existing facts in different words (if it merely corroborates an existing one with nothing new, don't record it). **Write only what you actually saw**: give evidence (one line: the command + the most proving one or two output lines — brief; details in detail), and mark confidence (observed = seen directly / inferred = inferred from phenomena). **Declare the source** of every fact: target_response (content the target itself returned: page bodies, headers, error messages, banners, even when a tool fetched it), tool_output (a tool's own result about the target: port states, scanner verdicts, status codes and timings you measured), third_party_intel (OSINT, CVE databases, public reports), operator_input (given by the human operator), or inference (your own reasoning; the default).
+- **Confirmed vulnerability → report_finding (exploration graph, with PoC, pass intent_id)**: **use it only when you actually triggered it this time and obtained reproducible evidence (request/response or command output)**. It is strictly forbidden to treat "version/fingerprint matching a CVE", "the parameter looks injectable", or "inference from external vulnerability databases/changelogs/code diffs" as confirmed, and don't substitute querying a CVE database or comparing patch versions for actually triggering it. Can't trigger it but suspicion remains → record an inferred fact with record_fact (the suspicion point + why it couldn't be triggered) for the planner; don't force it into a finding. Before registering, check list_findings / list_task_findings for an existing finding with the same root cause, endpoint, and parameter: the same defect again means extending that finding's evidence, not registering a duplicate (duplicates burn reviewer trust); a genuinely distinct entry point, parameter, or privilege level remains its own finding per the adversarial gate. When your confidence is not high, also fill report_finding's optional fields: counterevidence = what you tested that did not work; confidence_rationale = why the conclusion holds. Both are optional and never block reporting.
 
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+**Budget discipline (the deadline contract)**: your run has a step budget and a wall-clock budget. Before starting any command or probe, check it can finish well within what remains; never start work whose timeout can outlive the remaining budget — prefer the smaller variant that lands. When the budget is nearly spent or the wrap-up signal arrives, stop opening new work and land everything already collected (facts first, then findings): a result that exists only in your head is lost.
 
-// workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
+After completing this intent, summarize in one sentence what you did and which facts you wrote back.
+
+Adversarial gate before report_finding:
+- A candidate stays a hypothesis until you have actively tried to disprove it. Before reporting, argue the opposite case along five axes: **reachability** (can a real attacker actually get there?), **preconditions** (does exploitation need an unrealistic starting position?), **downstream controls** (does something between the trigger and the goal block the impact?), **scope** (is the affected asset inside the authorized scope?), and **simpler explanation** (is there a benign reason for the observation?).
+- Eliminations need evidence at the same bar as confirmations: cite the specific request, response, or control that kills the candidate. "Probably validated downstream", "looks by design", or "internal only" eliminate nothing.
+- Do not merge distinct candidates: different entry points, different parameters, or different attacker privilege levels are separate findings even when they share one narrative chain.
+- Zero confirmed findings is a valid outcome. Never soften these gates to manufacture output; a precise negative ("class X tested across surfaces Y with method Z; clean"), recorded as a fact, is real work.
+
+Finding quality gates (proof standard, measured impact, testing bounds):
+- **The PoC must demonstrate the attacker's goal achieved end to end** (unauthorized data actually returned, the injected command actually executing with output, another user's resource actually read or modified), not merely that a vulnerable pattern exists or a vulnerable code path runs. When the mechanism fires but a downstream control blocks the goal, record a hardening note, not a finding.
+- **Every reported finding carries a measured impact**: the attacker outcome as a number with its denominator ("3 of 20 payload variants returned other-tenant rows; 17 rejected", "commands executed: 2, output returned: yes") plus what the defense blocked. "The attacker can dump the table" is a claim; "3 of 20 payloads returned rows" is a measurement. If no number is obtainable, record what was attempted and why it is not measurable.
+- **State the proof basis** on every finding: executed-live, executed-lab, or static-analysis-unexecuted. An executed proof outranks a static conclusion; anything never actually triggered is "potential/suspect", never confirmed.
+- **Testing bounds** (bounded and non-destructive does NOT mean read-only): state-changing requests are in bounds when they are the finding's mechanism. Prove the mechanism on your own objects/accounts first, then confirm cross-entity reach on at most three non-owned objects with the smallest request that demonstrates the boundary; prefer reversible values, restore originals where possible, and record every touched object ID in the evidence.
+- **Priority discipline**: low-impact oracles (user/account enumeration, account-existence checks, response-timing differences) and low-yield misconfigurations (permissive CORS) are not standalone findings; record them only when they directly chain into account takeover, authentication bypass, or mass data exposure.
+
+Operator handoff on environmental blocks:
+- When a command or tool fails for an environmental reason (a sandboxed or filtered network path, a missing binary or key, TLS or proxy interception, a permission this runtime lacks), stop after the first failure: do not retry with different flags, do not switch tools hunting for a bypass, and do not fall through to an equivalent command.
+- Call ask_operator with the exact single command the operator should run in their own terminal: one line, copy-pastable, followed by what to paste back. One command per request; never batch. Wait for the reply instead of burning turns.`
+
+// workerTrafficBlock is section [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
 // Gated on recording, NOT on the egress proxy: a global proxy with capture off
 // routes traffic but records nothing, so the tools would not be there. Not stored,
@@ -251,46 +303,146 @@ func workerTrafficBlock(recording bool) string {
 	if !recording {
 		return ""
 	}
-	return "\n\n**流量工具**：\n- traffic_search / traffic_get / traffic_blob：回看响应、找已访问过的资源，**先查流量、不要重复 curl 同一 URL**。traffic_search **必须指定 host**、默认只回 3 条极轻量索引(id/method/url/status/resp_len，无响应内容)，需要更多显式调大 limit；可用 body_contains 在请求/响应正文里做全文搜索(至少 3 字符，支持子串和中文，如找密码/密钥/报错/内网地址)；要看某条原文用 traffic_get(id)，其中超大正文显示为 @blob sha256:<hash>，用 traffic_blob(hash) 分段取全文。"
+	return "\n\n**Traffic tools**:\n- traffic_search / traffic_get / traffic_blob / traffic_messages: review responses, find already-visited resources — **check the traffic first, don't curl the same URL twice**. traffic_search **requires a host** and by default returns only 3 ultra-light index entries (id/method/url/status/resp_len, no response content) — explicitly raise limit when you need more; body_contains does full-text search in request/response bodies (at least 3 characters; supports substrings and CJK text, e.g. for passwords/keys/errors/internal addresses); to see one entry's raw content use traffic_get(id) — oversized bodies show as @blob sha256:<hash>, fetched in segments with traffic_blob(hash). WebSocket (status 101) and SSE (text/event-stream) records are captured too: traffic_get shows the handshake, and traffic_messages(id) lists their messages in order with direction and type."
 }
 
-// artifactSpec is 段 [C]: the code-owned, non-editable tail appended to every
+// artifactSpec is section [C]: the code-owned, non-editable tail appended to every
 // pentest agent's prompt — intermediate artifacts must land in the shared work
 // dir, never /tmp. Guaranteed present regardless of how the DB body is edited.
 func artifactSpec(dir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本任务工作目录 " + dir + "**（相对路径即写在这里，也可用该绝对路径）——**不要写 /tmp、不要用其它绝对路径**。"
+	return "\n\n**Intermediate artifact output rules**: all intermediate artifacts — scripts, payloads, captured response bodies, temporary data — **must be written to this task's work directory " + dir + "** (a relative path writes here; the absolute path works too) — **do NOT write to /tmp, do NOT use other absolute paths**."
 }
 
-// workerArtifactSpec is the worker's 段 [C]: its per-intent run dir is pre-created
-// by the engine (ensureRunDir), so it just writes relative paths there — no manual
-// mkdir, no cross-worker name collisions.
+// workerArtifactSpec is the worker's section [C]: its per-intent run dir is
+// pre-created by the engine (ensureRunDir), so it just writes relative paths there
+// — no manual mkdir, no cross-worker name collisions.
 func workerArtifactSpec(runDir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+	return "\n\n**Intermediate artifact output rules**: all intermediate artifacts — scripts, payloads, captured response bodies, temporary data — **must be written to this intent's dedicated work directory " + runDir + "** (already created automatically; just write with relative paths there — no manual mkdir needed) — **do NOT write to /tmp, do NOT use other absolute paths**."
+}
+
+// mainRunDirName is the run directory of a task's main agent and planner.
+const mainRunDirName = "main"
+
+// runDirMaker creates a run directory below the data directory with the ownership
+// the server wants. The server sets it when agent processes run as the executor
+// (server/execpriv_unix.go); nil keeps a plain MkdirAll.
+var runDirMaker func(base, leaf string) error
+
+// SetRunDirMaker sets how run directories are created. Call it before any agent runs.
+func SetRunDirMaker(f func(base, leaf string) error) { runDirMaker = f }
+
+// makeRunDir creates the run directory leaf below base. Best-effort — on failure,
+// writes fail the same way an unwritable CWD would.
+func makeRunDir(base, leaf string) {
+	if runDirMaker == nil {
+		// 0775: the umask of the server decides the final bits.
+		_ = os.MkdirAll(leaf, 0o775)
+		return
+	}
+	if err := runDirMaker(base, leaf); err != nil {
+		log.Printf("[agent] run directory %s: %v", leaf, err)
+	}
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:
-// <base>/tasks/<taskID> for planner/main; <base>/tasks/<taskID>/i<intentID> for a
-// worker (intentID<=0 → task dir only). The "tasks/" segment groups per-task dirs
-// symmetrically with the chat agent's "sessions/<sessionID>". Best-effort mkdir — on
-// failure, writes fail the same way an unwritable CWD would.
+// <base>/tasks/<taskID>/main for planner/main (intentID<=0);
+// <base>/tasks/<taskID>/i<intentID> for a worker. No run directory is an ancestor of
+// another: the task directory holds the leaves and is no agent's working directory.
+// The "tasks/" segment groups per-task dirs symmetrically with the chat agent's
+// "sessions/<sessionID>".
 func ensureRunDir(base string, taskID, intentID int64) string {
-	dir := filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10))
+	leaf := mainRunDirName
 	if intentID > 0 {
-		dir = filepath.Join(dir, "i"+strconv.FormatInt(intentID, 10))
+		leaf = "i" + strconv.FormatInt(intentID, 10)
 	}
-	_ = os.MkdirAll(dir, 0o755)
+	dir := filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10), leaf)
+	makeRunDir(base, dir)
 	return dir
 }
 
-// cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
-func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
+// EnsureRunDir is ensureRunDir for the server, which places the main agent's
+// uploads in its run directory.
+func EnsureRunDir(base string, taskID, intentID int64) string {
+	return ensureRunDir(base, taskID, intentID)
+}
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+// EnsureSessionDir creates the chat run directory <base>/sessions/<sessionID> the
+// way ensureRunDir creates a task one, and returns it.
+func EnsureSessionDir(base, sessionID string) string {
+	dir := filepath.Join(base, "sessions", sessionID)
+	makeRunDir(base, dir)
+	return dir
+}
+
+// IsRunDirName reports whether name is a run directory inside a task directory:
+// main or i<intentID>.
+func IsRunDirName(name string) bool {
+	if name == mainRunDirName {
+		return true
+	}
+	digits, ok := strings.CutPrefix(name, "i")
+	if !ok || digits == "" {
+		return false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// CachePrefixEnv is the opt-in environment flag enabling the worker system
+// prompt cache-prefix split (P3.5 phase C). Off by default: when unset/false,
+// worker system segments and DynamicBoundary are byte-identical to the legacy
+// layout. Planner, mainagent, chat, and goals are unaffected.
+const CachePrefixEnv = "ARTEX_CACHE_PREFIX"
+
+func cachePrefixEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(CachePrefixEnv))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+// workerSystemParts splits workerSystem at the first per-intent volatile
+// segment (workerArtifactSpec(runDir)) without reordering any text:
+//   - staticPart  = body + untrustedContentTail + workerTrafficBlock
+//   - dynamicHead = workerArtifactSpec(runDir) + noiseProfileBlock
+//
+// Custom DB prompts that reference {{.Now}} remain volatile inside staticPart.
+func workerSystemParts(proxyAddr, caCert, dataDir, runDir string) (staticPart, dynamicHead string) {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	staticPart = body + untrustedContentTail(body) + workerTrafficBlock(caCert != "")
+	dynamicHead = workerArtifactSpec(runDir) + noiseProfileBlock()
+	return staticPart, dynamicHead
+}
+
+func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
+	staticPart, dynamicHead := workerSystemParts(proxyAddr, caCert, dataDir, runDir)
+	return staticPart + dynamicHead
+}
+
+// assembleWorkerSystem builds the worker's SystemPrompt segments and
+// DynamicBoundary. When split is false (default), it delegates directly to
+// deferredSystem(staticPart+dynamicTail, def). When split is true
+// (ARTEX_CACHE_PREFIX=1), it emits two segments [staticPart, dynamic] with
+// DynamicBoundary=1 so sibling workers in the same task share the cached static
+// prefix, absorbing the leading "\n\n" separator from workerArtifactSpec so
+// strings.Join(system, "\n\n") is byte-identical to the unsplit prompt.
+func assembleWorkerSystem(staticPart, dynamicTail string, def DeferredInfo, split bool) (system []string, boundary int) {
+	if !split {
+		return deferredSystem(staticPart+dynamicTail, def)
+	}
+	dyn := strings.TrimPrefix(dynamicTail+def.FindingGuidance+def.SkillIndex, "\n\n")
+	if block := actool.RenderDeferredToolsBlock(def.GlobalNames); block != "" {
+		dyn += "\n\n" + block
+	}
+	return []string{staticPart, dyn}, 1
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -314,7 +466,7 @@ func intentAssetIDs(intent *db.Node) []int64 {
 }
 
 func renderIntentTask(intent *db.Node) string {
-	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
+	return fmt.Sprintf("\n\n[The intent you claimed (your only job this time: do just this one, produce only facts, stop when done)]:\n%s\nIntent id: %d (pass it when writing back record_fact / report_finding)", string(intent.Payload), intent.ID)
 }
 
 // renderWorkerGraphOverview folds the global situational snapshot into the worker's
@@ -322,19 +474,38 @@ func renderIntentTask(intent *db.Node) string {
 // must NOT widen the worker's job — it still does only its assigned intent. Its sole
 // purpose is letting the worker read context (existing facts/assets/hints)
 // so it avoids redundant work and doesn't re-derive what others already found.
-func renderWorkerGraphOverview(data map[string]any) string {
-	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
-	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
-	// 专属的新 map，删键不影响 planner。
+// The derived fields go inside env's frame (#124, F3); env is built once per
+// launch message.
+func renderWorkerGraphOverview(data map[string]any, env dataEnvelope) string {
+	// coverage is a signal for the planner to judge "which class is under-tested /
+	// whether to widen the scope" — it conflicts with the worker's boundary of "do
+	// only the assigned intent, don't chase uncovered points" → drop it from the
+	// worker view. data is a fresh map dedicated to this worker, so deleting the key
+	// doesn't affect the planner.
 	delete(data, "coverage")
-	b, err := json.Marshal(data)
-	if err != nil {
+	sections := renderOverviewSections(data, env)
+	if sections == "" {
 		return "" // fall back silently: the worker just won't have the global context
 	}
-	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
-		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
-		"**发散是好事**：探本意图时尽管深想、多联想。唯一的界线是——别真的动手去执行别的意图（那是别的 worker 的事，由规划者调度）。但凡你联想到有价值的线索（跨资产的联动、疑似另一条利用链的入口、全局层面的可疑点），**务必写进 fact 交规划者**——这是你重要的产出，不是可有可无。宁可多报一条让规划者判断，也别自己咽下去。\n" +
-		string(b)
+	return env.intro() + "\n\n[Global exploration overview (read-only, helps you place your assigned intent in the bigger picture)]:\n" +
+		"Below is the task's current exploration overview. Two purposes: first, know what others have already found — don't repeat; second, let you relate this intent to the global picture while exploring it.\n" +
+		"**Digressing is good**: while exploring this intent, think deep and associate freely. The only boundary is — don't actually go execute other intents (that's other workers' business, scheduled by the planner). But whenever you associate a valuable clue (cross-asset linkage, the suspected entry of another exploit chain, a global-level suspicious point), **be sure to write it into a fact for the planner** — this is an important output of yours, not optional. Better to report one more for the planner to judge than to swallow it yourself." +
+		sections
+}
+
+// writeIntentAutoScope records the intent's target assets as auto scope when
+// coverage is on. coverageEnabled is fail-open: a failed flag read is true, so
+// an outage still writes, including when the stored flag is off.
+func writeIntentAutoScope(as *db.AssetStore, taskID int64, assets []*db.Asset, coverageEnabled bool) {
+	if as == nil || !coverageEnabled {
+		return
+	}
+	for _, a := range assets {
+		if a == nil {
+			continue
+		}
+		_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
+	}
 }
 
 // Execute runs one intent. hooks (the per-task Guard) gates every tool call; may
@@ -361,65 +532,87 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
+	tsx.SetFactTraffic(w.factTraffic)
 	tsx.SetTaskID(taskID)
-	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
+	coverageEnabled := coverageOn(as, taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
+	tsx.SetWorkBase(w.workDir)          // ingest_bbot reads its file under the same base as the file tools below
 	tsx.SetOwnerNode(intent.ID)         // assets this worker discovers anchor to its intent → visible to the task
 	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
-	tsx.SetNotifyFinding(notifyFinding) // report_finding 落库时当场唤醒 planner，带上「哪个意图+finding」
+	tsx.SetNotifyFinding(notifyFinding) // when report_finding lands, wake the planner on the spot with "which intent + finding"
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
-	base := append(tsx.WorkerTools(), w.extraTools...)
-	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
-	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
-	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	base := append(tsx.DropCoverageTools(tsx.WorkerTools()), w.extraTools...)
+	// The worker deliberately gets no MultiEdit/Glob/Grep: precise file edits use Edit,
+	// searching goes through Bash(grep/find) — narrowing the tool surface and reducing
+	// low-value calls. The rest of the SDK default tools (Read/Write/Edit/LS/Bash/Sleep)
+	// are kept as usual.
+	base = append(base, defaultToolsExcept(w.workDir, "MultiEdit", "Glob", "Grep")...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
-	tools, def, cleanup := AugmentTools(ctx, "worker", base)
+	tools, def, cleanup := AugmentTools(WithToolQuery(ctx, nodeSummary(intent)), "worker", base)
 	defer cleanup()
 
-	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
-	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
-	// 长 run 里意图永远在场，续跑时也不依赖 transcript 历史是否留住那条首消息。代价是 system
-	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
-	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
-	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
-	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
+	// The intent is the worker's [sole duty, an invariant across the whole run] → it
+	// goes into the system prompt together with the launch instruction and the raw
+	// data of the intent's anchored target assets: the system prompt is rebuilt for
+	// every run and can never be compacted away, so the intent stays present in long
+	// runs, and a resumed run doesn't depend on whether the transcript kept that first
+	// message. The cost is the system prompt mixing in per-intent volatile data and
+	// losing cross-intent cache reuse; that is a deliberate trade (losing the intent is
+	// far worse than spending tokens). The divergence from the planner ("situation
+	// block in the user turn") is intentional: the planner itself is the intent
+	// producer with no single mandate; the worker has one. Only the [global situation
+	// overview] stays in the launch user message — it is degradable and tolerates
+	// staleness, so compacting it away is harmless.
+	// This intent's dedicated work dir <workDir>/tasks/<taskID>/i<intentID> is created
+	// by the engine first.
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	workerEnv := newDataEnvelope()
+	overview := renderWorkerGraphOverview(tsx.graphOverviewData(), workerEnv)
+	staticPart, dynamicTail := workerSystemParts(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	dynamicTail += frameLessonsBlock(w.lessonsBlock)
 	if w.wantConstraints() {
-		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
+		dynamicTail += constraintBlock(ts) // inject the operation constraints (if any) into the system prompt; the worker strictly obeys them during execution
 	}
-	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
-	sysBody += renderIntentTask(intent)
+	// intent block → launch instruction in the system tail; intent-anchored assets
+	// carry target-influenced fields (PageTitle, Description, etc.) and go into
+	// the launch user message inside workerEnv's data envelope (#124).
+	dynamicTail += renderIntentTask(intent)
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
-				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
-				}
-				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
-				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
-				// 唯一索引保证不会重复添加；重跑/重试同样是幂等 no-op。
-				// 资产覆盖度功能关闭时不再累积测试范围(分母)。
-				if coverageEnabled {
-					for _, a := range assets {
-						_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
+				if block := renderWorkerIntentAssets(assets, workerEnv); block != "" {
+					if strings.TrimSpace(overview) == "" {
+						overview = workerEnv.intro() + block
+					} else {
+						overview += block
 					}
 				}
+				// The assets this intent explicitly targets → automatically join the task's
+				// test scope (same conservative granularity as insertAssets). upsertTaskScope's
+				// ON CONFLICT DO NOTHING + the uq_task_scope unique index guarantee no
+				// duplicate additions; reruns/retries are idempotent no-ops as well.
+				// asset_ids can trace back to target content, so these auto rows count
+				// toward coverage only under a declared domain or IP root (db.declaredScopeFilter);
+				// coverage scope, not enforced.
+				// When the asset-coverage feature is off, the test scope (denominator) is no
+				// longer accumulated. A failed flag read is treated as on, so an outage
+				// still writes, including for a task whose stored flag is off.
+				writeIntentAutoScope(as, taskID, assets, coverageEnabled)
 			}
 		}
 	}
-	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
-	system, boundary := deferredSystem(sysBody, def)
-	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
+	dynamicTail += "\n\nStart executing the intent above: do only it, produce only facts, assets, findings, stop when done."
+	system, boundary := assembleWorkerSystem(staticPart, dynamicTail, def, cachePrefixEnabled())
+	// The task-level deadline (injected via ctx) clamps this run's wall-clock budget +
+	// decides the wrap-up prompt (see taskclock.go).
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
 	settle := wrapupSettlement("worker", []string{"Bash"})
@@ -430,50 +623,64 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		Provider:        w.prov,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
-		Tools:           tools,
+		Tools:           withWebFetch(ctx, tools, w.proxyAddr, w.proxyCACert),
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		// WebFetch 走记录代理，其 HTTP 与 curl 一样被留痕；载入代理 CA 让经 MITM
-		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。proxy 空则直连。
-		EnableWebFetch: true,
-		WebFetchProxy:  w.proxyAddr,
-		WebFetchCACert: w.proxyCACert,
-		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
-		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
+		// WebFetch (added to Tools above) goes through the recording proxy, so its
+		// HTTP is recorded just like curl; loading the proxy CA lets MITM-re-signed
+		// HTTPS certs [verify normally] (rather than disabling verification). Direct
+		// when proxy is empty. Every redirect hop goes through the target gate.
+		// Web search (optional). ddgs needs no key; brave-free needs BraveKey; tavily needs TavilyKey.
+		// WebSearchProxy is a dedicated egress proxy (http/https/socks5), unrelated to the traffic-recording MITM proxy; empty = direct.
 		EnableWebSearch:       w.webSearch.Enabled,
 		WebSearchBackend:      w.webSearch.Backend,
 		BraveSearchAPIKey:     w.webSearch.BraveKey,
 		TavilySearchAPIKey:    w.webSearch.TavilyKey,
+		KeenableSearchAPIKey:  w.webSearch.KeenableKey,
+		KeenableSearchTitle:   KeenableSearchTitle,
 		DeepSeekSearchBaseURL: w.webSearch.DeepSeekBaseURL,
 		DeepSeekSearchAPIKey:  w.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
-		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
+		// Bash subcommands' HTTP goes through the recording proxy + trusts its CA by
+		// default (tools need no -x/-k).
 		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
 		WorkingDir: runDir,
-		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
-		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
-		// 距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
+		MaxTurns:   w.turnCap(ctx), // 0 = unlimited (configurable in agent management); clamped by the intent budget
+		// Wall-clock budget, judged at turn boundaries without interrupting mid-flight;
+		// 0 = unlimited. When a task-level deadline exists, clamp to min(own budget, time
+		// until the deadline) so this run naturally enters wrap-up when the task hits its
+		// deadline (see taskclock.go).
 		MaxDuration: maxDur,
-		// 命中预算(轮次 OR 时长)→ SDK 跑一轮收尾(隐藏 Bash),把已识别的写回,避免烂尾。
-		// clamped(被任务 deadline 夹逼)时用 PromptByReason:因超时=任务到点→任务超时词,
-		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
+		// Hitting the budget (turns OR duration) → the SDK runs a wrap-up round (with
+		// Bash hidden) to write back what's identified, avoiding unfinished tails.
+		// When clamped (by the task deadline), use PromptByReason: timeout = task
+		// deadline → task-timeout prompt; turns = the turn budget ran out inside the
+		// clamped window → fall back to the per-run prompt. Non-clamped stays pure per-run.
 		Settlement: settle,
-		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
-		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
-		ToolOutputDir: cmdOutDir(runDir),
+		// large tool output spills to a file with a head + pointer (SDK tool.Capture);
+		// full output preserved on disk, in cmd-output/ or in the task's spill
+		// directory (spill.go). The truncation cap uses the SDK default (30000 chars).
+		ToolOutputDir: TaskToolOutputDir(w.workDir, taskID, runDir),
 		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		Todos:         actool.NewTodoStore(),                  // session-level scratch todos (TodoWrite), pure planning, discarded on exit
+		NonStreaming:  w.nonStreaming(),                       // when this profile selects non-streaming, use Provider.Complete
+		MaxTokens:     w.maxTokens(),                          // 0 = send no cap; the server default decides
+
+		// On by default; ARTEX_UNTRUSTED_BOUNDARY=0 opts out: nonce-frame tool output as untrusted data.
+		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}
+	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
+	// The session id is the provider-side identity (session header, usage metering)
+	// with or without persistence; Norma only puts it on ctx when it writes a transcript.
+	opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)
+	ctx = transcript.WithSessionID(ctx, opts.SessionID)
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
-		opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)
 	}
 	intentID := intent.ID
 	emitWrap := func(r db.Activity) {
@@ -482,15 +689,17 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			emit(r)
 		}
 	}
-	// 意图 / 启动指令 / 意图锚定资产已随 system prompt 下发（见上方 sysBody 组装）。
-	// 这条启动 user 消息只承载【全局态势 overview】——可降级的了解大局信息，压掉无碍。
-	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
+	// The intent / launch instruction / intent-anchored assets were already delivered
+	// with the system prompt (see the sysBody assembly above). This launch user message
+	// carries only the [global situation overview] — degradable big-picture info, safe
+	// to compact away. In the rare case the overview marshals to empty, fall back to a
+	// launch sentence so the first turn isn't an empty user message.
 	input := overview
 	if strings.TrimSpace(input) == "" {
-		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+		input = "Start executing the intent claimed in system: do only it, produce only facts, assets, findings, stop when done."
 	}
 
-	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
+	// Experimental: when on, noa takes over context compression (archives persist under <workDir>/noa/<SessionID>).
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
 	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
 	ctx = attachSideCapture(ctx, &opts)
@@ -503,24 +712,29 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// restarting from scratch.
 	alreadyRecorded := false
 	if w.tx != nil {
-		_ = s.Resume(opts.SessionID)
+		// A corrupt or unreadable transcript stops the run before any model or tool
+		// call. No terminal reason: the engine marks the intent blocked without the
+		// model_error reruns, which would only fail the same way again.
+		if err := resumeSession(s, opts.SessionID); err != nil {
+			return "", tsx.Writes(), err
+		}
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
 		if len(s.Messages()) > 0 && message == "" {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-			input = "继续执行。"
+			input = "Continue."
 		} else if len(s.Messages()) > 0 {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 		}
 	}
 	if message != "" {
 		if alreadyRecorded {
-			input = "继续执行上一次人工对话输入的新意图。不要重复已经完成的动作。"
+			input = "Continue executing the new intent entered in the previous human conversation. Do not repeat actions already completed."
 		} else if len(s.Messages()) > 0 {
-			input = workerChatMarker(requestID) + "\n【人工对话输入的新意图】\n" + message +
-				"\n\n请立即按这条人工输入执行，完成后再根据上下文决定原任务是否需要继续。"
+			input = workerChatMarker(requestID) + "\n[New intent entered via human conversation]\n" + message +
+				"\n\nExecute this human input immediately; after completing it, decide from the context whether the original task needs to continue."
 		} else {
-			input += "\n\n" + workerChatMarker(requestID) + "\n【人工对话输入的新意图】\n" + message +
-				"\n\n请优先执行这条人工输入。"
+			input += "\n\n" + workerChatMarker(requestID) + "\n[New intent entered via human conversation]\n" + message +
+				"\n\nExecute this human input first."
 		}
 	}
 

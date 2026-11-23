@@ -136,9 +136,15 @@ func tokenize(s string) ([]tok, error) {
 //   and_expr = atom    (AND atom)*
 //   atom     = FIELD | BARE | '(' expr ')'
 
+const (
+	dslMaxLen   = 4096
+	dslMaxDepth = 32
+)
+
 type dslParser struct {
 	tokens []tok
 	pos    int
+	depth  int
 }
 
 func (p *dslParser) peek() tok {
@@ -201,20 +207,25 @@ func (p *dslParser) parseAtom() (*astNode, error) {
 		p.consume()
 		return leafNode(*t.expr), nil
 	case tkLP:
+		if p.depth >= dslMaxDepth {
+			return nil, fmt.Errorf("DSL syntax error: nested parentheses too deep")
+		}
+		p.depth++
 		p.consume()
 		node, err := p.parseOr()
+		p.depth--
 		if err != nil {
 			return nil, err
 		}
 		if p.peek().kind != tkRP {
-			return nil, fmt.Errorf("DSL 语法错误：缺少右括号 ')'")
+			return nil, fmt.Errorf("DSL syntax error: missing closing parenthesis ')'")
 		}
 		p.consume()
 		return node, nil
 	case tkEOF:
-		return nil, fmt.Errorf("DSL 语法错误：表达式不完整")
+		return nil, fmt.Errorf("DSL syntax error: incomplete expression")
 	default:
-		return nil, fmt.Errorf("DSL 语法错误：意外的 token '%s'", t.kind)
+		return nil, fmt.Errorf("DSL syntax error: unexpected token '%s'", t.kind)
 	}
 }
 
@@ -234,6 +245,9 @@ func ParseDSL(s string) (*astNode, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, nil
 	}
+	if len(s) > dslMaxLen {
+		return nil, fmt.Errorf("DSL query is too long")
+	}
 	tokens, err := tokenize(s)
 	if err != nil {
 		return nil, err
@@ -244,7 +258,7 @@ func ParseDSL(s string) (*astNode, error) {
 		return nil, err
 	}
 	if p.peek().kind != tkEOF {
-		return nil, fmt.Errorf("DSL 语法错误：意外的内容 '%s'", p.peek().kind)
+		return nil, fmt.Errorf("DSL syntax error: unexpected content '%s'", p.peek().kind)
 	}
 	return node, nil
 }
@@ -288,7 +302,11 @@ func (b *whereBuilder) build(node *astNode) (string, error) {
 			}
 			parts = append(parts, "("+clause+")")
 		}
-		return strings.Join(parts, " OR "), nil
+		// The whole disjunction must be parenthesised: callers append their own
+		// clauses with AND (the task scope in QueryDSLInScope, the type filter),
+		// and AND binds tighter than OR, so "(a) OR (b) AND scope" would let the
+		// first branch escape the scope.
+		return "(" + strings.Join(parts, " OR ") + ")", nil
 	case "leaf":
 		return b.buildLeaf(*node.expr)
 	}
@@ -316,7 +334,7 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 	if f == "task_id" {
 		n, err := strconv.ParseInt(e.Value, 10, 64)
 		if err != nil {
-			return "", fmt.Errorf("task_id 需要整数值: %s", e.Value)
+			return "", fmt.Errorf("task_id requires an integer value: %s", e.Value)
 		}
 		return b.next(n) + " = ANY(task_ids)", nil
 	}
@@ -325,7 +343,7 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 	if f == "company_id" {
 		n, err := strconv.ParseInt(e.Value, 10, 64)
 		if err != nil {
-			return "", fmt.Errorf("company_id 需要整数值: %s", e.Value)
+			return "", fmt.Errorf("company_id requires an integer value: %s", e.Value)
 		}
 		return "company_id = " + b.next(n), nil
 	}
@@ -334,14 +352,14 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 	if col, ok := knownNumericFields[f]; ok {
 		n, err := strconv.Atoi(e.Value)
 		if err != nil {
-			return "", fmt.Errorf("字段 %s 需要整数值: %s", f, e.Value)
+			return "", fmt.Errorf("field %s requires an integer value: %s", f, e.Value)
 		}
 		op := e.Op
 		if op == "==" {
 			op = "="
 		}
 		if op != "=" && op != "!=" && op != ">" && op != ">=" && op != "<" && op != "<=" {
-			return "", fmt.Errorf("字段 %s 不支持运算符 %s", f, e.Op)
+			return "", fmt.Errorf("field %s does not support operator %s", f, e.Op)
 		}
 		return fmt.Sprintf("%s %s %s", col, op, b.next(n)), nil
 	}
@@ -357,7 +375,7 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 			p := b.next("%" + e.Value + "%")
 			return "EXISTS (SELECT 1 FROM unnest(" + col + ") t(v) WHERE v ILIKE " + p + ")", nil
 		default:
-			return "", fmt.Errorf("数组字段 %s 不支持运算符 %s", f, e.Op)
+			return "", fmt.Errorf("array field %s does not support operator %s", f, e.Op)
 		}
 	}
 
@@ -371,11 +389,11 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		case "!=":
 			return col + " NOT ILIKE " + b.next("%"+e.Value+"%"), nil
 		default:
-			return "", fmt.Errorf("字符串字段 %s 不支持运算符 %s", f, e.Op)
+			return "", fmt.Errorf("string field %s does not support operator %s", f, e.Op)
 		}
 	}
 
-	return "", fmt.Errorf("未知字段: %s", f)
+	return "", fmt.Errorf("unknown field: %s", f)
 }
 
 func buildDSLWhere(node *astNode) (string, []any, error) {
@@ -481,6 +499,12 @@ func ValidateDSL(dsl string) error {
 // type), for server-side pagination — same WHERE as QueryDSL, without LIMIT/OFFSET.
 // taskID > 0 scopes the count to assets attached to that task.
 func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
+	return s.CountDSLForCompany(dsl, typ, taskID, 0)
+}
+
+// CountDSLForCompany is CountDSL narrowed to one company's assets (companyID > 0).
+// The company clause is ANDed outside the compiled DSL, so no DSL text can escape it.
+func (s *AssetStore) CountDSLForCompany(dsl, typ string, taskID, companyID int64) (int, error) {
 	node, err := ParseDSL(dsl)
 	if err != nil {
 		return 0, err
@@ -497,6 +521,10 @@ func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
 		args = append(args, taskID)
 		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
 	}
+	if companyID > 0 {
+		args = append(args, companyID)
+		where += fmt.Sprintf(" AND company_id = $%d", len(args))
+	}
 	var n int
 	err = s.db.QueryRow("SELECT count(*) FROM assets WHERE "+where, args...).Scan(&n)
 	return n, err
@@ -507,6 +535,12 @@ func (s *AssetStore) CountDSL(dsl, typ string, taskID int64) (int, error) {
 // taskID > 0 scopes results to assets attached to that task and hydrates each
 // row's per-task source metadata (as QueryByTask does).
 func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) ([]*Asset, error) {
+	return s.QueryDSLForCompany(dsl, typ, taskID, 0, limit, offset)
+}
+
+// QueryDSLForCompany is QueryDSL narrowed to one company's assets (companyID > 0).
+// The company clause is ANDed outside the compiled DSL, so no DSL text can escape it.
+func (s *AssetStore) QueryDSLForCompany(dsl, typ string, taskID, companyID int64, limit, offset int) ([]*Asset, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -528,6 +562,10 @@ func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) 
 	if taskID > 0 {
 		args = append(args, taskID)
 		where += fmt.Sprintf(" AND $%d = ANY(task_ids)", len(args))
+	}
+	if companyID > 0 {
+		args = append(args, companyID)
+		where += fmt.Sprintf(" AND company_id = $%d", len(args))
 	}
 	args = append(args, limit, offset)
 	q := assetSelectCols + " WHERE " + where +
@@ -553,9 +591,9 @@ func (s *AssetStore) QueryDSL(dsl, typ string, taskID int64, limit, offset int) 
 // direct source tasks') declared scope — membership, not literal value: a
 // root_domain scope returns every subdomain / service / endpoint under it. This is
 // the agent-facing list_assets path, so an agent queries the task's relevant assets
-// instead of the whole shared库. taskID<=0 (non-task contexts: Auto / pentest / chat)
-// has no scope to honor and falls back to the plain global QueryDSL. Rows carry the
-// same per-task source metadata as QueryByTask.
+// instead of the whole shared library. taskID<=0 (non-task contexts: Auto / pentest /
+// chat) has no scope to honor and falls back to the plain global QueryDSL. Rows carry
+// the same per-task source metadata as QueryByTask.
 func (s *AssetStore) QueryDSLInScope(dsl, typ string, taskID int64, limit, offset int) ([]*Asset, error) {
 	if taskID <= 0 {
 		return s.QueryDSL(dsl, typ, 0, limit, offset)

@@ -33,99 +33,101 @@ import { type Tone, toneClasses, toneDot } from "@/lib/status";
 import { taskAssetTypeLabel } from "@/lib/task-assets";
 import type { Edge, ExploreKind, FindingAsset, NewAssetType, TaskNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { setVisibleInterval } from "@/lib/polling";
+import { intlLocale, t } from "@/i18n";
 
 const PAGE_SIZES = [20, 50, 100];
 const POLL_MS = 8000;
 
 type KindMeta = { label: string; icon: LucideIcon; dot: string; chip: string };
 
-// 播报板自己的展示元数据。刻意不复用探索链路图那份:图是拓扑视角(节点卡片、连线配色),
-// 播报是流水视角(时间轴行),两边的信息密度和配色需求不同,各自演进更省事。
+// The broadcast board's own display metadata, deliberately not reusing the exploration graph's copy: the graph is a topology view (node cards, edge colors),
+// the broadcast a stream view (timeline rows); the two differ in information density and color needs, so they evolve separately.
 const KIND_META: Record<string, KindMeta> = {
   begin: {
-    label: "起点",
+    label: t("Start"),
     icon: FlagIcon,
     dot: "bg-slate-500",
     chip: "bg-slate-500/15 text-slate-600 dark:text-slate-300",
   },
   task: {
-    label: "根任务",
+    label: t("Root task"),
     icon: FlagIcon,
     dot: "bg-slate-500",
     chip: "bg-slate-500/15 text-slate-600 dark:text-slate-300",
   },
   goal: {
-    label: "目标",
+    label: t("Goal"),
     icon: TargetIcon,
     dot: "bg-emerald-500",
     chip: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
   },
   intent: {
-    label: "意图",
+    label: t("Intent"),
     icon: CompassIcon,
     dot: "bg-blue-500",
     chip: "bg-blue-500/15 text-blue-600 dark:text-blue-400",
   },
   fact: {
-    label: "事实",
+    label: t("Fact"),
     icon: FlaskConicalIcon,
     dot: "bg-amber-500",
     chip: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
   },
   finding: {
-    label: "漏洞",
+    label: t("Vulnerability"),
     icon: BugIcon,
     dot: "bg-rose-500",
     chip: "bg-rose-500/15 text-rose-600 dark:text-rose-400",
   },
   hint: {
-    label: "提示",
+    label: t("Hint"),
     icon: LightbulbIcon,
     dot: "bg-violet-500",
     chip: "bg-violet-500/15 text-violet-600 dark:text-violet-400",
   },
   digest: {
-    label: "压缩",
+    label: t("Digest"),
     icon: LayersIcon,
     dot: "bg-teal-500",
     chip: "bg-teal-500/15 text-teal-600 dark:text-teal-400",
   },
 };
 
-// 可筛选的类型。起点(fact/state=origin)不单独列,它跟着「事实」一起过滤。
+// Filterable kinds. The start (fact/state=origin) is not listed separately; it is filtered together with "Fact".
 const FILTER_KINDS: ExploreKind[] = ["goal", "intent", "fact", "finding", "hint", "digest"];
 
 const REL_LABEL: Record<string, string> = {
-  spawns: "派生",
-  derived_from: "意图链",
-  yields: "产出",
-  proves: "证明",
-  covers: "压缩",
+  spawns: t("Spawns"),
+  derived_from: t("Intent chain"),
+  yields: t("Yields"),
+  proves: t("Proves"),
+  covers: t("Compresses"),
 };
 
-// goal / intent 的状态语义由全局 status 表提供(StatusBadge);其余类型的状态只在
-// 图和播报里出现,这里补一份。
+// State semantics for goal / intent come from the global status table (StatusBadge); the other kinds' states only
+// appear in the graph and broadcast, so they are defined here.
 const STATE_META: Record<string, Record<string, { label: string; tone: Tone }>> = {
   fact: {
-    origin: { label: "起点", tone: "slate" },
-    confirmed: { label: "已确认", tone: "green" },
-    dismissed: { label: "已否定", tone: "slate" },
+    origin: { label: t("Start"), tone: "slate" },
+    confirmed: { label: t("Confirmed"), tone: "green" },
+    dismissed: { label: t("Dismissed"), tone: "slate" },
   },
   finding: {
-    confirmed: { label: "已确认", tone: "red" },
-    dismissed: { label: "已排除", tone: "slate" },
+    confirmed: { label: t("Confirmed"), tone: "red" },
+    dismissed: { label: t("Excluded"), tone: "slate" },
   },
   hint: {
-    active: { label: "待采纳", tone: "violet" },
-    consumed: { label: "已采纳", tone: "slate" },
+    active: { label: t("Pending adoption"), tone: "violet" },
+    consumed: { label: t("Adopted"), tone: "slate" },
   },
   digest: {
-    active: { label: "生效中", tone: "green" },
-    superseded: { label: "已替代", tone: "slate" },
+    active: { label: t("Active"), tone: "green" },
+    superseded: { label: t("Superseded"), tone: "slate" },
   },
 };
 
-// 任务根是 state=origin 的 fact,播报里读作「起点」。
+// The task root is a fact with state=origin, shown as "Start" in the broadcast.
 function viewKind(n: TaskNode): string {
   return n.type === "fact" && n.state === "origin" ? "begin" : n.type;
 }
@@ -152,14 +154,14 @@ function summaryOf(n: TaskNode): string {
         if (typeof v === "string" && v.trim()) return v;
       }
     } catch {
-      return raw; // 非 JSON payload:原样播报
+      return raw; // non-JSON payload: broadcast as-is
     }
   }
   return raw;
 }
 
 function prettyPayload(raw?: string): string {
-  if (!raw?.trim()) return "（无 payload）";
+  if (!raw?.trim()) return t("(no payload)");
   try {
     return JSON.stringify(JSON.parse(raw), null, 2);
   } catch {
@@ -170,14 +172,14 @@ function prettyPayload(raw?: string): string {
 function relTime(ts: number, now: number): string {
   if (!now || !ts) return "";
   const sec = Math.max(0, (now - ts) / 1000);
-  if (sec < 60) return "刚刚";
-  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
-  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
-  return `${Math.floor(sec / 86400)} 天前`;
+  if (sec < 60) return t("just now");
+  if (sec < 3600) return t("{count} minutes ago", { count: Math.floor(sec / 60) });
+  if (sec < 86400) return t("{count} hours ago", { count: Math.floor(sec / 3600) });
+  return t("{count} days ago", { count: Math.floor(sec / 86400) });
 }
 
-const dayFmt = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "short" });
-const clockFmt = new Intl.DateTimeFormat("zh-CN", {
+const dayFmt = new Intl.DateTimeFormat(intlLocale, { month: "long", day: "numeric", weekday: "short" });
+const clockFmt = new Intl.DateTimeFormat(intlLocale, {
   hour: "2-digit",
   minute: "2-digit",
   second: "2-digit",
@@ -209,16 +211,18 @@ function KindChip({ kind }: { kind: string }) {
   );
 }
 
-// 节点锚定的资产:类型标签 + 可辨识文本。数据随播报页一起下发(node id → 资产),
-// 展开时直接展示,不额外请求。
+// Assets anchored to a node: type label + identifiable text. The data ships with the broadcast page (node id → assets),
+// and is shown on expand without extra requests.
 function AssetList({ assets, dense = false }: { assets: FindingAsset[]; dense?: boolean }) {
   if (assets.length === 0) return null;
   return (
     <div>
-      <div className="mb-1.5 text-xs font-medium text-muted-foreground">涉及资产 · {assets.length}</div>
+      <div className="mb-1.5 text-xs font-medium text-muted-foreground">
+        {t("Assets involved · {count}", { count: assets.length })}
+      </div>
       <ul className="flex flex-wrap gap-1.5">
         {assets.map((a) => {
-          // 运行时 a.type 可能是标签表未覆盖的类型,退回原始字符串。转一层类型让回退不被判成多余。
+          // At runtime a.type may be a kind not covered by the label table; fall back to the raw string. The type cast keeps the fallback from being flagged as redundant.
           const typeLabel =
             (taskAssetTypeLabel as (t: NewAssetType) => string | undefined)(a.type as NewAssetType) || a.type;
           return (
@@ -240,8 +244,8 @@ function AssetList({ assets, dense = false }: { assets: FindingAsset[]; dense?: 
   );
 }
 
-// 悬停在上下游条目上时弹出的节点名片:类型/状态/来源/时间 + 摘要 + payload 片段 + 涉及资产。
-// 数据来自本页已经拿到的 refs,不额外发请求——播报接口已经把邻居节点整份带回来了。
+// Node card shown when hovering an upstream/downstream entry: type/state/source/time + summary + payload snippet + involved assets.
+// Data comes from refs already fetched on this page — the broadcast API returns neighbor nodes in full.
 function RelatedNodeCard({ node, assets }: { node: TaskNode; assets: FindingAsset[] }) {
   const kind = viewKind(node);
   const meta = KIND_META[kind] ?? KIND_META.fact;
@@ -258,11 +262,11 @@ function RelatedNodeCard({ node, assets }: { node: TaskNode; assets: FindingAsse
         )}
       </div>
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
-        <span>类型 {meta.label}</span>
-        <span>来源 {node.origin || "system"}</span>
-        <span>{Number.isNaN(ts) ? node.ts : new Date(ts).toLocaleString("zh-CN")}</span>
+        <span>{t("Type {type}", { type: meta.label })}</span>
+        <span>{t("Source {source}", { source: node.origin || "system" })}</span>
+        <span>{Number.isNaN(ts) ? node.ts : new Date(ts).toLocaleString(intlLocale)}</span>
       </div>
-      <p className="line-clamp-4 text-xs break-words">{summary || "（无摘要）"}</p>
+      <p className="line-clamp-4 text-xs break-words">{summary || t("(no summary)")}</p>
       <AssetList assets={assets} dense />
       <pre className="max-h-40 overflow-auto rounded border bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap">
         {prettyPayload(node.payload)}
@@ -271,7 +275,7 @@ function RelatedNodeCard({ node, assets }: { node: TaskNode; assets: FindingAsse
   );
 }
 
-// 一条播报涉及的上下游:上游 = 指向本节点的边,下游 = 本节点指出去的边。
+// Upstream/downstream of a broadcast entry: upstream = edges pointing to this node, downstream = edges this node points out.
 function RelatedList({
   title,
   rows,
@@ -303,7 +307,7 @@ function RelatedList({
                       className="flex min-w-0 cursor-help items-center gap-2 text-left hover:underline"
                     >
                       <KindChip kind={viewKind(node)} />
-                      <span className="truncate">{summaryOf(node) || `节点 #${node.id}`}</span>
+                      <span className="truncate">{summaryOf(node) || t("Node #{id}", { id: node.id })}</span>
                     </button>
                   </HoverCardTrigger>
                   <HoverCardContent align="start" className="w-96">
@@ -311,7 +315,7 @@ function RelatedList({
                   </HoverCardContent>
                 </HoverCard>
               ) : (
-                <span className="text-muted-foreground">节点 #{row.id}</span>
+                <span className="text-muted-foreground">{t("Node #{id}", { id: row.id })}</span>
               )}
             </li>
           );
@@ -347,13 +351,13 @@ function BroadcastRow({
 
   return (
     <div className={cn("relative grid grid-cols-[4.5rem_1.75rem_1fr] gap-x-2", fresh && "bg-primary/5")}>
-      {/* 时间列 */}
+      {/* Time column */}
       <div className="py-3 text-right text-xs text-muted-foreground tabular-nums">
         <div>{Number.isNaN(ts) ? "--:--:--" : clockFmt.format(ts)}</div>
         <div className="text-[11px] opacity-70">{relTime(ts, now)}</div>
       </div>
 
-      {/* 时间轴:竖线 + 类型圆点 */}
+      {/* Timeline: vertical line + type dot */}
       <div className="relative flex justify-center">
         <span className="absolute inset-y-0 w-px bg-border" />
         <span
@@ -366,7 +370,7 @@ function BroadcastRow({
         </span>
       </div>
 
-      {/* 内容列 */}
+      {/* Content column */}
       <div className="min-w-0 border-b py-3 pr-1 last:border-b-0">
         <button
           type="button"
@@ -386,12 +390,12 @@ function BroadcastRow({
               )}
               {fresh && (
                 <span className="rounded bg-primary px-1.5 py-0.5 text-[10px] font-semibold text-primary-foreground">
-                  新
+                  {t("New")}
                 </span>
               )}
               <span className="ml-auto shrink-0 text-xs text-muted-foreground">{node.origin || "system"}</span>
             </div>
-            <p className={cn("mt-1 text-sm", !open && "line-clamp-2")}>{summary || `节点 #${node.id}`}</p>
+            <p className={cn("mt-1 text-sm", !open && "line-clamp-2")}>{summary || t("Node #{id}", { id: node.id })}</p>
           </div>
         </button>
 
@@ -399,23 +403,23 @@ function BroadcastRow({
           <div className="mt-2 ml-5 flex flex-col gap-3 rounded-md border bg-muted/30 p-3">
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
               <span>
-                节点 <code className="font-mono">#{node.id}</code>
+                {t("Node")} <code className="font-mono">#{node.id}</code>
               </span>
-              <span>类型 {meta.label}</span>
-              <span>来源 {node.origin || "system"}</span>
-              <span>{Number.isNaN(ts) ? node.ts : new Date(ts).toLocaleString("zh-CN")}</span>
+              <span>{t("Type {type}", { type: meta.label })}</span>
+              <span>{t("Source {source}", { source: node.origin || "system" })}</span>
+              <span>{Number.isNaN(ts) ? node.ts : new Date(ts).toLocaleString(intlLocale)}</span>
             </div>
             {node.state === "deleted" && node.delete_reason && (
               <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
-                <span className="font-medium text-destructive">删除原因</span>
+                <span className="font-medium text-destructive">{t("Deletion reason")}</span>
                 <span className="ml-2 break-words text-muted-foreground">{node.delete_reason}</span>
               </div>
             )}
             <AssetList assets={assets[node.id] ?? []} />
             {(upstream.length > 0 || downstream.length > 0) && (
               <div className="flex flex-col gap-3 sm:flex-row">
-                <RelatedList title="上游 · 由此而来" rows={upstream} refs={refs} assets={assets} />
-                <RelatedList title="下游 · 由此产生" rows={downstream} refs={refs} assets={assets} />
+                <RelatedList title={t("Upstream · comes from these")} rows={upstream} refs={refs} assets={assets} />
+                <RelatedList title={t("Downstream · produced by this")} rows={downstream} refs={refs} assets={assets} />
               </div>
             )}
             <div>
@@ -453,8 +457,8 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   const seenRef = React.useRef<Set<string>>(new Set());
   const baselineRef = React.useRef<number | null>(null);
   const streamRef = React.useRef("");
-  // 只有「最新在前的第 1 页」才是真正的直播位；其余位置轮询只更新未读计数，
-  // 不动列表，免得翻页/展开时内容在脚下变。
+  // Only "newest-first page 1" is the real live seat; every other position only updates the unread count,
+  // leaving the list alone so content does not shift under pagination/expand.
   const atLive = page === 1 && order === "desc";
 
   React.useEffect(() => {
@@ -463,7 +467,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
     return () => clearInterval(t);
   }, []);
 
-  // 输入防抖:打字停 300ms 才真正查询,并回到第一页。
+  // Input debounce: the query fires 300ms after typing stops, and returns to page 1.
   React.useEffect(() => {
     const t = setTimeout(() => {
       setQuery(queryInput);
@@ -474,9 +478,9 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
 
   React.useEffect(() => {
     let alive = true;
-    let rendered = false; // 本次查询是否已经把内容渲染出来过
-    // 换任务/筛选/排序 = 换了一条播报流:清掉「新」标记和未读基线。翻页不算换流,
-    // 否则回到最新时就没有未读计数可算了。
+    let rendered = false; // whether this query has already rendered its content
+    // Switching task/filters/sort = switching to a different broadcast stream: clear "new" marks and the unread baseline. Paging is not a stream switch,
+    // otherwise there would be no unread count to compute when returning to the latest.
     const stream = `${taskId}|${kinds.join(",")}|${query}|${order}`;
     if (streamRef.current !== stream) {
       streamRef.current = stream;
@@ -489,7 +493,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
         .explorationNodes(taskId, { page, size, kinds, q: query, order })
         .then((r) => {
           if (!alive) return;
-          // 直播位每轮都刷新;其它位置只渲染第一次,之后轮询仅更新未读计数。
+          // The live seat refreshes every round; other positions render only the first time, then polls just update the unread count.
           if (atLive || !rendered) {
             rendered = true;
             setItems(r.items);
@@ -511,7 +515,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
           setLoaded(true);
         })
         .catch(() => {
-          // 轮询是尽力而为:保留上一次成功的播报内容,下一轮自动重试。
+          // Polling is best-effort: keep the last successful broadcast content and retry automatically next round.
         });
     void load();
     if (!live) {
@@ -519,10 +523,10 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
         alive = false;
       };
     }
-    const timer = setInterval(load, POLL_MS);
+    const stopPolling = setVisibleInterval(load, POLL_MS);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stopPolling();
     };
   }, [taskId, page, size, kinds, query, order, live, atLive]);
 
@@ -537,8 +541,8 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
     setPending(0);
   };
 
-  // 服务端的 refs 只补「不在本页的邻居」,同页节点之间的引用要靠 items 自己兜底,
-  // 否则相邻两条播报互相引用时会退化成光秃秃的「节点 #id」。
+  // Server-side refs only fill in "neighbors not on this page"; references between same-page nodes must fall back to items,
+  // otherwise adjacent broadcasts referencing each other degrade to a bare "Node #id".
   const nodeIndex = React.useMemo(() => {
     const idx: Record<string, TaskNode> = { ...refs };
     for (const n of items) idx[n.id] = n;
@@ -549,16 +553,16 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   const start = total === 0 ? 0 : (page - 1) * size + 1;
   const end = (page - 1) * size + items.length;
 
-  // 换任务或筛选后条数变少时,把越界的页码收回来。
+  // When switching tasks or filters shrinks the count, pull the page number back in bounds.
   React.useEffect(() => {
     if (page > pageCount) setPage(pageCount);
   }, [page, pageCount]);
 
-  // 按天分组:播报流按日期断行,长任务翻页时还能认出「这是哪天的事」。
+  // Group by day: the stream breaks at date boundaries, so paging a long task still shows which day things happened.
   const groups: Array<{ day: string; rows: TaskNode[] }> = [];
   for (const node of items) {
     const ts = Date.parse(node.ts);
-    const day = Number.isNaN(ts) ? "未知日期" : dayFmt.format(ts);
+    const day = Number.isNaN(ts) ? t("Unknown date") : dayFmt.format(ts);
     const last = groups[groups.length - 1];
     if (last && last.day === day) last.rows.push(node);
     else groups.push({ day, rows: [node] });
@@ -566,16 +570,16 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
 
   return (
     <Card className="overflow-hidden py-0">
-      {/* 工具条 */}
+      {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5">
         <div className="relative w-full sm:w-64">
           <SearchIcon className="absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={queryInput}
             onChange={(e) => setQueryInput(e.target.value)}
-            placeholder="搜索内容 / 来源 / 节点 id"
+            placeholder={t("Search content / source / node id")}
             className="h-8 pl-8"
-            aria-label="搜索播报"
+            aria-label={t("Search broadcasts")}
           />
         </div>
         <div className="flex flex-wrap items-center gap-1">
@@ -607,7 +611,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
                 setPage(1);
               }}
             >
-              清除
+              {t("Clear")}
             </Button>
           )}
         </div>
@@ -620,25 +624,29 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
               setOrder((o) => (o === "desc" ? "asc" : "desc"));
               setPage(1);
             }}
-            aria-label={order === "desc" ? "当前最新在前，点击改为最早在前" : "当前最早在前，点击改为最新在前"}
+            aria-label={
+              order === "desc"
+                ? t("Currently newest first; click to switch to oldest first")
+                : t("Currently oldest first; click to switch to newest first")
+            }
           >
             {order === "desc" ? <ArrowDownIcon /> : <ArrowUpIcon />}
-            {order === "desc" ? "最新在前" : "最早在前"}
+            {order === "desc" ? t("Newest first") : t("Oldest first")}
           </Button>
           <Button
             variant={live ? "outline" : "secondary"}
             size="sm"
             className="h-8"
             onClick={() => setLive((v) => !v)}
-            aria-label={live ? "暂停自动刷新" : "恢复自动刷新"}
+            aria-label={live ? t("Pause auto-refresh") : t("Resume auto-refresh")}
           >
             {live ? <PauseIcon /> : <PlayIcon />}
-            {live ? "自动刷新" : "已暂停"}
+            {live ? t("Auto-refresh") : t("Paused")}
           </Button>
         </div>
       </div>
 
-      {/* 离开直播位时的未读提示 */}
+      {/* Unread hint shown when away from the live seat */}
       {!atLive && pending > 0 && (
         <button
           type="button"
@@ -646,7 +654,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
           className="flex w-full items-center justify-center gap-1.5 border-b bg-primary/10 py-1.5 text-xs font-medium text-primary hover:bg-primary/15"
         >
           <ArrowUpToLineIcon className="size-3.5" />
-          {pending > 99 ? "99+" : pending} 条新播报 · 回到最新
+          {t("{count} new broadcasts · Back to latest", { count: pending > 99 ? "99+" : pending })}
         </button>
       )}
 
@@ -659,7 +667,9 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
           </div>
         ) : items.length === 0 ? (
           <p className="py-10 text-center text-sm text-muted-foreground">
-            {query || kinds.length > 0 ? "没有符合条件的播报。" : "这个任务还没有产生探索节点。"}
+            {query || kinds.length > 0
+              ? t("No broadcasts match the filters.")
+              : t("This task has not produced any exploration nodes yet.")}
           </p>
         ) : (
           groups.map((group) => (
@@ -696,7 +706,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             <SelectGroup>
               {PAGE_SIZES.map((n) => (
                 <SelectItem key={n} value={String(n)}>
-                  {n} / 页
+                  {t("{count} / page", { count: n })}
                 </SelectItem>
               ))}
             </SelectGroup>
@@ -711,7 +721,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             size="icon-sm"
             disabled={page <= 1}
             onClick={() => setPage((p) => Math.max(1, p - 1))}
-            aria-label="上一页"
+            aria-label={t("Previous page")}
           >
             <ChevronLeftIcon />
           </Button>
@@ -723,7 +733,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             size="icon-sm"
             disabled={page >= pageCount}
             onClick={() => setPage((p) => Math.min(pageCount, p + 1))}
-            aria-label="下一页"
+            aria-label={t("Next page")}
           >
             <ChevronRightIcon />
           </Button>

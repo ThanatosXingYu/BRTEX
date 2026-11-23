@@ -62,7 +62,7 @@ func onlyExchangeID(t *testing.T, tr *Traffic) string {
 	t.Helper()
 	var id string
 	if err := tr.DB().QueryRow(`SELECT id FROM exchanges`).Scan(&id); err != nil {
-		t.Fatalf("读取 exchange id: %v", err)
+		t.Fatalf("read exchange id: %v", err)
 	}
 	return id
 }
@@ -75,11 +75,11 @@ func TestRecordKeepsBodiesInIndex(t *testing.T) {
 
 	tr.record(newFlow("api.example.com", "POST", "/v1/login",
 		[]byte(`{"user":"admin","password":"P@ssw0rd"}`),
-		[]byte(`{"token":"abc123","note":"内网测试账号"}`)))
+		[]byte(`{"token":"abc123","note":"internal test account"}`)))
 
 	// The URL-mirroring tree is gone: no host directory, no nested path segments.
 	if _, err := os.Stat(filepath.Join(dir, "api.example.com")); !os.IsNotExist(err) {
-		t.Fatalf("record 仍在磁盘上创建 host 目录（stat err=%v）", err)
+		t.Fatalf("record still created a host directory on disk (stat err=%v)", err)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -87,7 +87,7 @@ func TestRecordKeepsBodiesInIndex(t *testing.T) {
 	}
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "_") {
-			t.Fatalf("data 目录下出现非内部目录 %q，说明仍在写文件树", e.Name())
+			t.Fatalf("non-internal directory %q found under data dir; still writing a file tree", e.Name())
 		}
 	}
 
@@ -98,12 +98,12 @@ func TestRecordKeepsBodiesInIndex(t *testing.T) {
 	}
 	for _, want := range []string{"POST /v1/login HTTP/1.1", "Host: api.example.com", `"password":"P@ssw0rd"`} {
 		if !strings.Contains(req, want) {
-			t.Fatalf("请求原文缺少 %q，实际：\n%s", want, req)
+			t.Fatalf("raw request missing %q, got:\n%s", want, req)
 		}
 	}
-	for _, want := range []string{"HTTP 200", `"token":"abc123"`, "内网测试账号"} {
+	for _, want := range []string{"HTTP 200", `"token":"abc123"`, "internal test account"} {
 		if !strings.Contains(resp, want) {
-			t.Fatalf("响应原文缺少 %q，实际：\n%s", want, resp)
+			t.Fatalf("raw response missing %q, got:\n%s", want, resp)
 		}
 	}
 }
@@ -114,39 +114,39 @@ func TestRecordKeepsBodiesInIndex(t *testing.T) {
 func TestFullTextSearchMatchesBodies(t *testing.T) {
 	tr, _ := openTraffic(t)
 	if !tr.fts {
-		t.Skip("驱动未启用 FTS5")
+		t.Skip("driver does not have FTS5 enabled")
 	}
 	const host = "api.example.com"
 	tr.record(newFlow(host, "POST", "/v1/login",
 		[]byte(`{"user":"admin","password":"P@ssw0rd"}`),
-		[]byte(`{"token":"abc123","note":"内网测试账号"}`)))
+		[]byte(`{"token":"abc123","note":"internal test account"}`)))
 	tr.record(newFlow(host, "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
 
 	hits := func(term string) int {
 		t.Helper()
 		rows, err := tr.query(host, "", term, 0, 10)
 		if err != nil {
-			t.Fatalf("按正文搜索 %q 出错：%v", term, err)
+			t.Fatalf("body search for %q failed: %v", term, err)
 		}
 		return len(rows)
 	}
 	if n := hits("password"); n != 1 {
-		t.Fatalf("搜 password 命中 %d 条，应为 1", n)
+		t.Fatalf("search for password hit %d rows, want 1", n)
 	}
 	// Substring inside a token — the default unicode61 tokenizer cannot do this.
 	if n := hits("ssw0r"); n != 1 {
-		t.Fatalf("搜子串 ssw0r 命中 %d 条，应为 1", n)
+		t.Fatalf("search for substring ssw0r hit %d rows, want 1", n)
 	}
-	if n := hits("内网测试"); n != 1 {
-		t.Fatalf("搜中文命中 %d 条，应为 1", n)
+	if n := hits("internal test"); n != 1 {
+		t.Fatalf("search for 'internal test' hit %d rows, want 1", n)
 	}
 	if n := hits("nonexistent-marker"); n != 0 {
-		t.Fatalf("无关关键词命中 %d 条，应为 0", n)
+		t.Fatalf("unrelated keyword hit %d rows, want 0", n)
 	}
 
 	// Too-short terms are reported, not silently treated as "no match".
 	if _, err := tr.query(host, "", "ab", 0, 10); err == nil {
-		t.Fatal("两字符正文关键词应返回明确错误")
+		t.Fatal("a two-character body keyword should return an explicit error")
 	}
 }
 
@@ -156,14 +156,14 @@ func TestFullTextSearchMatchesBodies(t *testing.T) {
 func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 	tr, dir := openTraffic(t)
 	if !tr.fts {
-		t.Skip("驱动未启用 FTS5")
+		t.Skip("driver does not have FTS5 enabled")
 	}
 	const host = "dump.example.com"
 	const marker = "DB_PASSWORD=hunter2"
 	// Marker sits far past blobPreview, so only the full-text index can find it.
 	big := []byte(strings.Repeat("-- MySQL dump\n", maxInlineBody/14+2000) + marker)
 	if len(big) <= maxInlineBody+blobPreview {
-		t.Fatalf("测试数据不够大：%d 字节", len(big))
+		t.Fatalf("test data not large enough: %d bytes", len(big))
 	}
 	tr.record(newFlow(host, "GET", "/backup.sql", nil, big, withRespType("application/sql")))
 
@@ -173,15 +173,15 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(hash) != 64 {
-		t.Fatalf("resp_blob=%q，应为 64 位 sha256", hash)
+		t.Fatalf("resp_blob=%q, want a 64-char sha256", hash)
 	}
 	blob := filepath.Join(dir, "_blobs", "sha256", hash[:2], hash+".bin")
 	st, err := os.Stat(blob)
 	if err != nil {
-		t.Fatalf("blob 未落盘到单层桶 %s：%v", blob, err)
+		t.Fatalf("blob not written to single-level bucket %s: %v", blob, err)
 	}
 	if st.Size() != int64(len(big)) {
-		t.Fatalf("blob 大小 %d，应为 %d", st.Size(), len(big))
+		t.Fatalf("blob size %d, want %d", st.Size(), len(big))
 	}
 
 	// The reference is registered, which is what GC consults.
@@ -190,7 +190,7 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if refs != 1 {
-		t.Fatalf("blob_refs 行数 %d，应为 1", refs)
+		t.Fatalf("blob_refs rows %d, want 1", refs)
 	}
 
 	// Inline: a readable preview plus the pointer, not the whole body.
@@ -199,16 +199,16 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(resp, "-- MySQL dump") {
-		t.Fatalf("响应缺少头部预览：\n%s", clip(resp, 300))
+		t.Fatalf("response missing head preview:\n%s", clip(resp, 300))
 	}
 	if !strings.Contains(resp, "@blob sha256:"+hash) {
-		t.Fatalf("响应缺少 blob 指针：\n%s", clip(resp, 300))
+		t.Fatalf("response missing blob pointer:\n%s", clip(resp, 300))
 	}
 	if strings.Contains(resp, marker) {
-		t.Fatal("预览不应包含超出 blobPreview 的内容")
+		t.Fatal("preview must not contain content past blobPreview")
 	}
 	if len(resp) > blobPreview*2 {
-		t.Fatalf("内联内容 %d 字节，远超预览上限", len(resp))
+		t.Fatalf("inline content %d bytes, far beyond the preview cap", len(resp))
 	}
 
 	// Searchable despite living on disk — the index was fed from memory.
@@ -217,7 +217,7 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rows) != 1 {
-		t.Fatalf("超大正文中的关键词命中 %d 条，应为 1", len(rows))
+		t.Fatalf("keyword in oversized body hit %d rows, want 1", len(rows))
 	}
 
 	// And retrievable in pages.
@@ -226,13 +226,13 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if total != int64(len(big)) {
-		t.Fatalf("BlobRange total=%d，应为 %d", total, len(big))
+		t.Fatalf("BlobRange total=%d, want %d", total, len(big))
 	}
 	if string(data) != marker {
-		t.Fatalf("BlobRange 读到 %q，应为 %q", data, marker)
+		t.Fatalf("BlobRange read %q, want %q", data, marker)
 	}
 	if _, _, err := tr.BlobRange("../../etc/passwd", 0, 10); err == nil {
-		t.Fatal("非法 hash 应被拒绝")
+		t.Fatal("illegal hash should be rejected")
 	}
 }
 
@@ -241,7 +241,7 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 func TestBinaryBodyStaysOutOfIndex(t *testing.T) {
 	tr, _ := openTraffic(t)
 	if !tr.fts {
-		t.Skip("驱动未启用 FTS5")
+		t.Skip("driver does not have FTS5 enabled")
 	}
 	const host = "cdn.example.com"
 	const marker = "SECRETINIMAGE"
@@ -254,14 +254,14 @@ func TestBinaryBodyStaysOutOfIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rows) != 0 {
-		t.Fatalf("二进制正文不应进入全文索引，却命中 %d 条", len(rows))
+		t.Fatalf("binary body must not enter the full-text index, but hit %d rows", len(rows))
 	}
 	_, resp, err := tr.Get(onlyExchangeID(t, tr))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(resp, "[binary image/png") || !strings.Contains(resp, "magic=89504e47") {
-		t.Fatalf("二进制正文应展示类型与魔数，实际：\n%s", clip(resp, 300))
+		t.Fatalf("binary body should show type and magic bytes, got:\n%s", clip(resp, 300))
 	}
 }
 
@@ -289,13 +289,13 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, 1, host, "GET", "/", "http://"+host+"/", 200
 
 	req, resp, err := tr.Get(id)
 	if err != nil {
-		t.Fatalf("历史记录应仍可读取：%v", err)
+		t.Fatalf("legacy record should still be readable: %v", err)
 	}
 	if !strings.Contains(req, "Host: old.example.com") {
-		t.Fatalf("历史请求原文错误：%q", req)
+		t.Fatalf("legacy raw request wrong: %q", req)
 	}
 	if !strings.Contains(resp, "legacy body") {
-		t.Fatalf("历史响应原文错误：%q", resp)
+		t.Fatalf("legacy raw response wrong: %q", resp)
 	}
 }
 
@@ -318,13 +318,13 @@ func TestGCCollectsBlobsAndEmptyBuckets(t *testing.T) {
 	}
 
 	if n, err := tr.DeleteHostsExact([]string{host}); err != nil || n != 1 {
-		t.Fatalf("DeleteHostsExact=(%d,%v)，应为 (1,nil)", n, err)
+		t.Fatalf("DeleteHostsExact=(%d,%v), want (1,nil)", n, err)
 	}
 	if _, err := os.Stat(filepath.Join(bucket, hash+".bin")); !os.IsNotExist(err) {
-		t.Fatalf("失去引用的 blob 未被回收：%v", err)
+		t.Fatalf("unreferenced blob not collected: %v", err)
 	}
 	if _, err := os.Stat(bucket); !os.IsNotExist(err) {
-		t.Fatalf("空桶目录未被清理：%v", err)
+		t.Fatalf("empty bucket directory not cleaned up: %v", err)
 	}
 	// Bodies and full-text rows go with the exchange.
 	for _, q := range []string{
@@ -336,7 +336,7 @@ func TestGCCollectsBlobsAndEmptyBuckets(t *testing.T) {
 			t.Fatal(err)
 		}
 		if c != 0 {
-			t.Fatalf("%s = %d，应为 0", q, c)
+			t.Fatalf("%s = %d, want 0", q, c)
 		}
 	}
 	if tr.fts {
@@ -345,7 +345,7 @@ func TestGCCollectsBlobsAndEmptyBuckets(t *testing.T) {
 			t.Fatal(err)
 		}
 		if c != 0 {
-			t.Fatalf("全文索引残留 %d 条", c)
+			t.Fatalf("full-text index has %d leftover rows", c)
 		}
 	}
 }
@@ -355,7 +355,7 @@ func TestGCCollectsBlobsAndEmptyBuckets(t *testing.T) {
 func TestPageSearchesBodies(t *testing.T) {
 	tr, _ := openTraffic(t)
 	if !tr.fts {
-		t.Skip("驱动未启用 FTS5")
+		t.Skip("driver does not have FTS5 enabled")
 	}
 	tr.record(newFlow("api.example.com", "POST", "/v1/login", nil, []byte(`{"error":"invalid credentials"}`)))
 	tr.record(newFlow("api.example.com", "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
@@ -365,11 +365,11 @@ func TestPageSearchesBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 	if total != 1 || len(rows) != 1 {
-		t.Fatalf("正文关键词命中 total=%d rows=%d，应为 1/1", total, len(rows))
+		t.Fatalf("body keyword hit total=%d rows=%d, want 1/1", total, len(rows))
 	}
 	// Metadata matching still works alongside it.
 	if _, total, err := tr.Page(PageQuery{Query: "health", RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 1 {
-		t.Fatalf("URL 关键词 total=%d err=%v，应为 1", total, err)
+		t.Fatalf("URL keyword total=%d err=%v, want 1", total, err)
 	}
 }
 
@@ -386,31 +386,31 @@ func TestPageFiltersAndSort(t *testing.T) {
 
 	// Status class band.
 	if rows, _, err := tr.Page(PageQuery{Status: "4xx", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
-		t.Fatalf("status=4xx 应命中 1 条 404，得 %d 条 err=%v", len(rows), err)
+		t.Fatalf("status=4xx should hit one 404 row, got %d rows err=%v", len(rows), err)
 	}
 	// Exact status.
 	if rows, _, err := tr.Page(PageQuery{Status: "500", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 500 {
-		t.Fatalf("status=500 应命中 1 条，得 %d 条 err=%v", len(rows), err)
+		t.Fatalf("status=500 should hit 1 row, got %d rows err=%v", len(rows), err)
 	}
 	// Response-size lower bound (>=60 keeps only the 100-byte row).
 	if rows, _, err := tr.Page(PageQuery{RespMin: 60, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].RespLen != 100 {
-		t.Fatalf("resp_min=60 应命中 1 条 100B，得 %d 条 err=%v", len(rows), err)
+		t.Fatalf("resp_min=60 should hit one 100B row, got %d rows err=%v", len(rows), err)
 	}
 	// Path (url_template) filter narrows to the /api/admin exchange.
 	if rows, _, err := tr.Page(PageQuery{Path: "/api/admin", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
-		t.Fatalf("path=/api/admin 应命中 1 条，得 %d 条 err=%v", len(rows), err)
+		t.Fatalf("path=/api/admin should hit 1 row, got %d rows err=%v", len(rows), err)
 	}
 	// Sort by response length, ascending then descending.
 	asc, _, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1, Sort: "resp_len", Order: "asc"}, 0, 100)
 	if err != nil || len(asc) != 3 {
-		t.Fatalf("resp_len asc 应返回 3 条，得 %d 条 err=%v", len(asc), err)
+		t.Fatalf("resp_len asc should return 3 rows, got %d rows err=%v", len(asc), err)
 	}
 	if asc[0].RespLen != 10 || asc[1].RespLen != 50 || asc[2].RespLen != 100 {
-		t.Fatalf("resp_len asc 顺序错误：%d,%d,%d", asc[0].RespLen, asc[1].RespLen, asc[2].RespLen)
+		t.Fatalf("resp_len asc order wrong: %d,%d,%d", asc[0].RespLen, asc[1].RespLen, asc[2].RespLen)
 	}
 	desc, _, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1, Sort: "resp_len", Order: "desc"}, 0, 100)
 	if err != nil || len(desc) != 3 || desc[0].RespLen != 100 || desc[2].RespLen != 10 {
-		t.Fatalf("resp_len desc 顺序错误 err=%v", err)
+		t.Fatalf("resp_len desc order wrong err=%v", err)
 	}
 }
 
@@ -463,18 +463,18 @@ func TestNormalizeSearchHost(t *testing.T) {
 
 // TestTruncateUTF8 guards the preview cut: never split a multi-byte rune.
 func TestTruncateUTF8(t *testing.T) {
-	s := "内网测试账号"
+	s := "internal test account"
 	for n := 0; n <= len(s); n++ {
 		got := truncateUTF8([]byte(s), n)
 		if !strings.HasPrefix(s, got) {
-			t.Fatalf("n=%d 截断结果 %q 不是原串前缀", n, got)
+			t.Fatalf("n=%d truncation result %q is not a prefix of the original", n, got)
 		}
 		if len(got) > n {
-			t.Fatalf("n=%d 截断后 %d 字节，超出上限", n, len(got))
+			t.Fatalf("n=%d truncated to %d bytes, over the cap", n, len(got))
 		}
 	}
 	if got := truncateUTF8([]byte("abc"), 10); got != "abc" {
-		t.Fatalf("短于上限时应原样返回，得到 %q", got)
+		t.Fatalf("below the cap should return as-is, got %q", got)
 	}
 }
 
@@ -497,7 +497,7 @@ func TestIsBinaryBody(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := isBinaryBody(c.ct, []byte(c.body)); got != c.want {
-			t.Errorf("isBinaryBody(%q, %q)=%v，应为 %v", c.ct, c.body, got, c.want)
+			t.Errorf("isBinaryBody(%q, %q)=%v, want %v", c.ct, c.body, got, c.want)
 		}
 	}
 }
@@ -523,6 +523,121 @@ func TestRecordConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if exchanges != n || bodies != n {
-		t.Fatalf("并发写入后 exchanges=%d bodies=%d，应各为 %d", exchanges, bodies, n)
+		t.Fatalf("after concurrent writes exchanges=%d bodies=%d, want %d each", exchanges, bodies, n)
+	}
+}
+
+func TestTrafficPageRewrittenFlagAndFilter(t *testing.T) {
+	tr, _ := openTraffic(t)
+	insertEx := func(id string, ts int64, host string, status int) {
+		t.Helper()
+		if _, err := tr.DB().Exec(`INSERT INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, ts, host, "GET", "/p/"+id, "https://"+host+"/p/"+id, status, "text/plain", 0, 10, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	insertEx("rw-a-200", 1, "alpha.example", 200)
+	insertEx("rw-b-404", 2, "beta.example", 404)
+	insertEx("orig-a-200", 3, "alpha.example", 200)
+	insertEx("skip-a-404", 4, "alpha.example", 404)
+	insertEx("err-b-200", 5, "beta.example", 200)
+
+	if _, err := tr.DB().Exec(`INSERT INTO exchange_rewrites(exchange_id,seq,phase,rule_id,outcome) VALUES
+('rw-a-200',0,'request',1,'applied'),
+('rw-b-404',0,'response',2,'applied'),
+('skip-a-404',0,'request',3,'skipped'),
+('err-b-200',0,'response',4,'error')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default ("") and "all" return all 5 with accurate Rewritten flags.
+	for _, filter := range []string{"", RewriteFilterAll} {
+		rows, total, err := tr.Page(PageQuery{Rewritten: filter, RespMin: -1, RespMax: -1}, 0, 20)
+		if err != nil || total != 5 || len(rows) != 5 {
+			t.Fatalf("filter=%q got (%d, total=%d, err=%v), want (5, 5, nil)", filter, len(rows), total, err)
+		}
+		got := map[string]bool{}
+		for _, r := range rows {
+			got[r.ID] = r.Rewritten
+		}
+		if !got["rw-a-200"] || !got["rw-b-404"] || got["orig-a-200"] || got["skip-a-404"] || got["err-b-200"] {
+			t.Fatalf("filter=%q flags = %v", filter, got)
+		}
+	}
+
+	// Rewritten filter (canonical + true alias).
+	for _, filter := range []string{RewriteFilterRewritten, "true"} {
+		rows, total, err := tr.Page(PageQuery{Rewritten: filter, RespMin: -1, RespMax: -1}, 0, 20)
+		if err != nil || total != 2 || len(rows) != 2 {
+			t.Fatalf("filter=%q got (%d, total=%d, err=%v), want (2, 2, nil)", filter, len(rows), total, err)
+		}
+		for _, r := range rows {
+			if !r.Rewritten {
+				t.Fatalf("filter=%q returned non-rewritten row %s", filter, r.ID)
+			}
+		}
+	}
+
+	// Original filter (canonical + false alias) includes plain, skipped-only, and error-only.
+	for _, filter := range []string{RewriteFilterOriginal, "false"} {
+		rows, total, err := tr.Page(PageQuery{Rewritten: filter, RespMin: -1, RespMax: -1}, 0, 20)
+		if err != nil || total != 3 || len(rows) != 3 {
+			t.Fatalf("filter=%q got (%d, total=%d, err=%v), want (3, 3, nil)", filter, len(rows), total, err)
+		}
+		for _, r := range rows {
+			if r.Rewritten {
+				t.Fatalf("filter=%q returned rewritten row %s", filter, r.ID)
+			}
+		}
+	}
+
+	// Combined with host + status and pagination.
+	rows, total, err := tr.Page(PageQuery{Host: "alpha", Status: "200", Rewritten: RewriteFilterRewritten, RespMin: -1, RespMax: -1}, 0, 10)
+	if err != nil || total != 1 || len(rows) != 1 || rows[0].ID != "rw-a-200" {
+		t.Fatalf("combined host+status+rewritten = (%+v, total=%d, err=%v)", rows, total, err)
+	}
+	p0, total0, err := tr.Page(PageQuery{Rewritten: RewriteFilterOriginal, RespMin: -1, RespMax: -1}, 0, 2)
+	p1, total1, err2 := tr.Page(PageQuery{Rewritten: RewriteFilterOriginal, RespMin: -1, RespMax: -1}, 1, 2)
+	if err != nil || err2 != nil || total0 != 3 || total1 != 3 || len(p0) != 2 || len(p1) != 1 {
+		t.Fatalf("pagination original p0=(%d/%d,%v) p1=(%d/%d,%v)", len(p0), total0, err, len(p1), total1, err2)
+	}
+
+	// Search also carries Rewritten.
+	srows, err := tr.Search("alpha.example", 0, 10)
+	if err != nil || len(srows) != 3 {
+		t.Fatalf("Search = (%d, %v), want (3, nil)", len(srows), err)
+	}
+	found := map[string]bool{}
+	for _, r := range srows {
+		found[r.ID] = r.Rewritten
+	}
+	if !found["rw-a-200"] || found["orig-a-200"] || found["skip-a-404"] {
+		t.Fatalf("Search rewritten flags = %v", found)
+	}
+}
+
+// TestPageHostsAllowlist pins the company-scope filter: an exact host allowlist
+// keeps only those hosts (the substring Host filter stays independent), and
+// MatchNone forces an empty result for a company that owns no host.
+func TestPageHostsAllowlist(t *testing.T) {
+	tr, _ := openTraffic(t)
+	tr.record(newFlow("api.example.com", "GET", "/a", nil, []byte("a")))
+	tr.record(newFlow("api.other.example", "GET", "/b", nil, []byte("b")))
+	tr.record(newFlow("shop.example.com", "GET", "/c", nil, []byte("c")))
+
+	rows, total, err := tr.Page(PageQuery{Hosts: []string{"api.example.com", "shop.example.com"}, RespMin: -1, RespMax: -1}, 0, 100)
+	if err != nil || total != 2 || len(rows) != 2 {
+		t.Fatalf("allowlist should keep 2 rows, got total=%d rows=%d err=%v", total, len(rows), err)
+	}
+	// Exact match: api.other.example is not api.example.com.
+	if rows, _, err := tr.Page(PageQuery{Hosts: []string{"api.example.com"}, RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 {
+		t.Fatalf("exact allowlist should keep 1 row, got %d err=%v", len(rows), err)
+	}
+	if _, total, err := tr.Page(PageQuery{MatchNone: true, RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 0 {
+		t.Fatalf("MatchNone should match nothing, got total=%d err=%v", total, err)
+	}
+	if _, total, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 3 {
+		t.Fatalf("no filter should return all 3, got %d err=%v", total, err)
 	}
 }

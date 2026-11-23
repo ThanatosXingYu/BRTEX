@@ -12,32 +12,38 @@ import (
 	"time"
 )
 
-// feishuChannel 实现飞书（含 Lark）自定义机器人，走交互式卡片。
+// feishuChannel implements the Feishu (incl. Lark) custom bot, using interactive
+// cards.
 //
-// 平台特性：
-//   - 加签算法与钉钉**不同**，且极易写错，见 feishuSign 注释。
-//   - 与钉钉一样把业务错误塞在 HTTP 200 的 body 里（code != 0）。
-//   - 卡片 header 支持颜色模板，用级别映射配色，让人在消息列表里一眼看出严重程度。
+// Platform traits:
+//   - The signing algorithm is **different** from DingTalk's and extremely easy to
+//     get wrong; see the feishuSign comment.
+//   - Like DingTalk, business errors are stuffed into the body of an HTTP 200
+//     (code != 0).
+//   - Card headers support color templates; mapping severity to colors lets people
+//     spot severity at a glance in the message list.
 type feishuChannel struct{}
 
 func (feishuChannel) Kind() string { return KindFeishu }
 
-// 飞书自定义机器人约 5 次/秒，折合 100 次/分钟。
+// Feishu custom bots allow about 5 requests/second, i.e. 100 per minute.
 func (feishuChannel) DefaultRatePerMin() int { return 100 }
 
-// Webhook 地址末段即机器人唯一标识，属凭据。
+// The last segment of the webhook URL is the bot's unique identifier and counts
+// as a credential.
 func (feishuChannel) SecretKeys() []string { return []string{"webhook", "secret"} }
 
-// 同理：改 Webhook 地址必须对新地址重新表态签名密钥。
+// Likewise: changing the webhook URL requires re-declaring the signing secret for
+// the new address.
 func (feishuChannel) DestinationKeys() []string { return []string{"webhook"} }
 
 func (feishuChannel) Validate(cfg map[string]any) error {
 	hook := cfgString(cfg, "webhook")
 	if hook == "" {
-		return errors.New("缺少 Webhook 地址")
+		return errors.New("missing Webhook URL")
 	}
 	if err := validateHTTPURL(hook); err != nil {
-		return fmt.Errorf("Webhook 地址无效: %w", err)
+		return fmt.Errorf("invalid webhook URL: %w", err)
 	}
 	return nil
 }
@@ -51,7 +57,8 @@ func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) 
 		"msg_type": "interactive",
 		"card":     card,
 	}
-	// 加签参数与消息同层，且只在配置了 secret 时出现。
+	// Signing parameters sit at the same level as the message, and appear only
+	// when a secret is configured.
 	if secret := cfgString(cfg, "secret"); secret != "" {
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
 		payload["timestamp"] = ts
@@ -64,39 +71,41 @@ func (c feishuChannel) Send(ctx context.Context, cfg map[string]any, m Message) 
 	var res struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
-		// 部分版本的飞书 hook 用这套字段名，一并兼容。
+		// Some versions of the Feishu hook use this set of field names; support both.
 		StatusCode    int    `json:"StatusCode"`
 		StatusMessage string `json:"StatusMessage"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
-		return 0, fmt.Errorf("解析飞书响应失败: %w (%s)", err, snippet(raw))
+		return 0, fmt.Errorf("failed to parse Feishu response: %w (%s)", err, snippet(raw))
 	}
 	if res.Code != 0 {
-		return 0, Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.Code, res.Msg))
+		return 0, Permanent(fmt.Errorf("Feishu returned error %d: %s", res.Code, res.Msg))
 	}
 	if res.StatusCode != 0 {
-		return 0, Permanent(fmt.Errorf("飞书返回错误 %d: %s", res.StatusCode, res.StatusMessage))
+		return 0, Permanent(fmt.Errorf("Feishu returned error %d: %s", res.StatusCode, res.StatusMessage))
 	}
 	return kept, nil
 }
 
-// feishuSign 按飞书官方规则计算签名。
+// feishuSign computes the signature per Feishu's official rules.
 //
-// 这里特别容易踩坑：官方样例是
+// This is especially easy to get wrong: the official sample is
 //
 //	hmac.new(string_to_sign.encode(), digestmod=sha256)
 //
-// 也就是 **key = timestamp + "\n" + secret，message 为空**，而不是直觉上的
-// 「key=secret, message=stringToSign」——那正是钉钉的算法。两边算法刚好反过来，
-// 照着另一家的实现写必然签名校验失败（报 19021）。
+// That is, **key = timestamp + "\n" + secret, with an empty message** — not the
+// intuitive "key=secret, message=stringToSign", which is exactly DingTalk's
+// algorithm. The two algorithms are mirror images of each other, and copying the
+// other platform's implementation always fails signature verification (error
+// 19021).
 func feishuSign(timestamp, secret string) string {
 	stringToSign := timestamp + "\n" + secret
 	mac := hmac.New(sha256.New, []byte(stringToSign))
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// feishuSeverityTemplate 把漏洞级别映射到卡片 header 配色模板。
-// 未知级别用 grey——不用 blue，免得和 low 混淆。
+// feishuSeverityTemplate maps vulnerability severity to a card header color
+// template. Unknown severities use grey — not blue, to avoid confusion with low.
 func feishuSeverityTemplate(severity string) string {
 	switch severity {
 	case "critical":
@@ -112,47 +121,88 @@ func feishuSeverityTemplate(severity string) string {
 	}
 }
 
-// feishuMaxCardBytes 是卡片内容的保守上限。飞书对卡片有体积限制，超了整条被拒；
-// 取一个明显低于官方上限的值，把 JSON 包装开销也算进来。
-const feishuMaxCardBytes = 24000
+// feishuMaxCardBytes is a conservative cap on card content. Feishu custom bots
+// reject a request body over 20 KB as a whole (not truncated); pick a value
+// clearly below that limit to also cover JSON wrapping overhead.
+const feishuMaxCardBytes = 16000
 
-// feishuCard 构造交互式卡片，返回卡片与**实际写入的条目数**。
-// kept 的用途同 markdownBody：只有真正进了卡片的条目才该被标记为已送达。
+// feishuEnvelopeBytes is the size of what Send serializes around the card when a
+// signing secret is configured (without one the request is smaller):
+//
+//	{"card":…,"msg_type":"interactive","sign":"<44 characters>","timestamp":"<10 digits>"}
+const feishuEnvelopeBytes = 113
+
+// feishuCard builds the interactive card and returns it along with the **number
+// of items actually written**. kept serves the same purpose as in markdownBody:
+// only items that actually made it into the card should be marked as sent.
 func feishuCard(m Message) (map[string]any, int) {
-	elements := []any{}
-	kept := 0
-	if m.Batch {
-		// 先按整条打包再拼头部：头部要写「其余 N 条将在下一条消息继续」，
-		// N 必须来自实际装下的条数。
-		kept = packItemCount(m.Items, feishuMaxCardBytes, markdownReservedBytes, "", byteSize, func(it Item, idx int) string {
-			return feishuBatchLine(it, idx+1)
-		})
-		items := m.Items[:kept]
-		elements = append(elements, feishuMarkdownDiv(markdownBatchIntro(m, items, len(m.Items))))
-		for i, it := range items {
-			elements = append(elements, feishuMarkdownDiv(feishuBatchLine(it, i+1)))
-		}
-		if m.HomeURL != "" {
-			elements = append(elements, feishuButton("在平台中查看全部", m.HomeURL))
-		}
-	} else if len(m.Items) > 0 {
-		kept = 1
-		it := m.Items[0]
-		elements = append(elements, feishuMarkdownDiv(feishuItemLines(it)))
-		if it.DetailURL != "" {
-			elements = append(elements, feishuButton("查看详情", it.DetailURL))
-		}
-	}
-
+	lim := m.limits()
+	// budget is the final truncation backstop for one item's text, the same role
+	// TruncateBytes plays in markdownBody. With the summary or asset limit set to
+	// 0 an item has no other bound, and an oversized card loses the whole message.
+	budget := feishuMaxCardBytes - markdownReservedBytes
 	card := map[string]any{
-		"config":   map[string]any{"wide_screen_mode": true},
-		"header":   map[string]any{"title": map[string]any{"tag": "plain_text", "content": markdownTitle(m)}},
-		"elements": elements,
+		"config": map[string]any{"wide_screen_mode": true},
+		"header": map[string]any{"title": map[string]any{"tag": "plain_text", "content": markdownTitle(m)}},
 	}
 	if len(m.Items) > 0 {
 		card["header"].(map[string]any)["template"] = feishuSeverityTemplate(m.Items[0].Severity)
 	}
+	elements := []any{}
+	kept := 0
+	if m.Batch {
+		// digest assembles the elements of a digest card around the lines of its
+		// first n items. The intro must state "the remaining N items will continue
+		// in the next message", and N must come from the number of items that
+		// actually fit.
+		digest := func(n int, lines []any) []any {
+			out := []any{feishuMarkdownDiv(markdownBatchIntro(m, m.Items[:n], len(m.Items)))}
+			out = append(out, lines...)
+			if m.HomeURL != "" {
+				out = append(out, feishuButton("View all on the platform", m.HomeURL))
+			}
+			return out
+		}
+		// Pack whole items (see packItemCount) against the request body as it will
+		// be serialized, not against the text of the lines. Each line is sent as
+		// its own element: about 52 bytes of JSON around the text, plus whatever
+		// the encoding escapes. Counted as text alone, several hundred short lines
+		// left as one request of more than twice the 20 KB limit. The rest of the
+		// body is measured too: it changes with the number of items kept (the
+		// intro) and with the platform link.
+		//
+		// The first item is always kept: otherwise one oversized item would jam
+		// the whole batch in place. Its text is truncated to budget.
+		var lines []any
+		used := 0
+		for i, it := range m.Items {
+			line := feishuMarkdownDiv(TruncateBytes(feishuBatchLine(it, i+1, lim), budget))
+			used += feishuJSONSize(line) + 1 // the element and its separating comma
+			card["elements"] = digest(i+1, nil)
+			if i > 0 && feishuEnvelopeBytes+feishuJSONSize(card)+used > feishuMaxCardBytes {
+				break
+			}
+			lines = append(lines, line)
+		}
+		kept = len(lines)
+		elements = digest(kept, lines)
+	} else if len(m.Items) > 0 {
+		kept = 1
+		it := m.Items[0]
+		elements = append(elements, feishuMarkdownDiv(TruncateBytes(feishuItemLines(it, lim), budget)))
+		if it.DetailURL != "" {
+			elements = append(elements, feishuButton("View details", it.DetailURL))
+		}
+	}
+
+	card["elements"] = elements
 	return card, kept
+}
+
+// feishuJSONSize returns the number of bytes v takes in the request body.
+func feishuJSONSize(v any) int {
+	raw, _ := json.Marshal(v)
+	return len(raw)
 }
 
 func feishuMarkdownDiv(content string) map[string]any {
@@ -171,35 +221,36 @@ func feishuButton(label, url string) map[string]any {
 	}
 }
 
-// feishuItemLines 渲染单个漏洞的 lark_md 正文。
+// feishuItemLines renders the lark_md body of a single vulnerability.
 //
-// lark_md 与 markdown 是同族的文本格式，同样会解析链接与强调，所以来自外部
-// 的字段一律过 markdownText（单行化 + 转义）——否则一条漏洞标题就能在
-// 飞书里变成可点击的外链。
-func feishuItemLines(it Item) string {
+// lark_md and markdown are sibling text formats that also parse links and
+// emphasis, so every field coming from outside goes through markdownText
+// (single-lining + escaping) — otherwise a single vulnerability title could turn
+// into a clickable external link inside Feishu.
+func feishuItemLines(it Item, lim Limits) string {
 	out := fmt.Sprintf("**%s · %s**", SeverityLabel(it.Severity), markdownText(it.Title(), 0))
 	if it.IsStatusChange() {
-		out += fmt.Sprintf("\n**状态变更**：%s → %s",
+		out += fmt.Sprintf("\n**Status change**: %s → %s",
 			markdownText(StatusLabel(it.FromStatus), 0), markdownText(StatusLabel(it.ToStatus), 0))
 	}
 	if it.VulnClass != "" && it.VulnClass != it.Title() {
-		out += fmt.Sprintf("\n**类型**：%s", markdownText(it.VulnClass, 0))
+		out += fmt.Sprintf("\n**Type**: %s", markdownText(it.VulnClass, 0))
 	}
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
-		out += fmt.Sprintf("\n**资产**：%s", markdownText(a, 0))
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
+		out += fmt.Sprintf("\n**Assets**: %s", markdownText(a, 0))
 	}
 	if it.Summary != "" {
-		if s := markdownText(it.Summary, maxSummaryRunes); s != "" {
-			out += fmt.Sprintf("\n**摘要**：%s", s)
+		if s := markdownText(it.Summary, lim.SummaryRunes); s != "" {
+			out += fmt.Sprintf("\n**Summary**: %s", s)
 		}
 	}
 	return out
 }
 
-// feishuBatchLine 渲染汇总卡片里的一条。
-func feishuBatchLine(it Item, index int) string {
+// feishuBatchLine renders one entry of a digest card.
+func feishuBatchLine(it Item, index int, lim Limits) string {
 	line := fmt.Sprintf("**%d. %s · %s**", index, SeverityLabel(it.Severity), markdownText(it.Title(), 0))
-	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
+	if a := assetLine(it.Assets, lim.AssetsShown); a != "" {
 		line += " — " + markdownText(a, 0)
 	}
 	return line

@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 	"github.com/google/uuid"
@@ -68,6 +68,74 @@ func TestCompleteForwardsAtomicResponse(t *testing.T) {
 	}
 }
 
+// The usage sink sees each metered call once, with the usage the llm_usage row gets.
+func TestUsageSinkSeesMeteredCalls(t *testing.T) {
+	var got []llm.Usage
+	ctx := WithUsageSink(context.Background(), func(u llm.Usage) { got = append(got, u) })
+	recorder := Wrap(meteredStreamProvider{}, nil, "model", "profile", "", "", func() bool { return false })
+	for _, err := range recorder.Stream(ctx, llm.CompletionRequest{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, _, err := recorder.Complete(ctx, llm.CompletionRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	want := []llm.Usage{{InputTokens: 23, OutputTokens: 5}, {InputTokens: 7, OutputTokens: 3}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("sink saw %+v, want %+v", got, want)
+	}
+	// A call that gets no llm_usage row (no model, zero usage) is not seen either.
+	got = nil
+	empty := Wrap(completeProvider{}, nil, "", "", "", "", nil)
+	empty.recordUsage(ctx, "", 0, "", llm.Usage{}, 0, "ok")
+	if len(got) != 0 {
+		t.Fatalf("sink saw an unmetered call: %+v", got)
+	}
+}
+
+// The stop sink sees the final stop reason of each call that completes, which the
+// harness otherwise drops: a refusal is an empty, tool-less turn like any other.
+func TestStopSinkSeesFinalStopReason(t *testing.T) {
+	var got []string
+	ctx := WithStopSink(context.Background(), func(stop string) { got = append(got, stop) })
+	recorder := Wrap(refusalStreamProvider{}, nil, "model", "profile", "", "", func() bool { return false })
+	for _, err := range recorder.Stream(ctx, llm.CompletionRequest{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, _, err := recorder.Complete(ctx, llm.CompletionRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "refusal" || got[1] != "stop" {
+		t.Fatalf("sink saw %q, want [refusal stop]", got)
+	}
+	// Without a sink on the context nothing is reported and nothing breaks.
+	for _, err := range recorder.Stream(context.Background(), llm.CompletionRequest{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// refusalStreamProvider streams what Anthropic sends for a refusal before any
+// output: message_start, then message_delta with stop_reason "refusal" and no
+// content blocks at all.
+type refusalStreamProvider struct{ completeProvider }
+
+func (refusalStreamProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		if !yield(llm.StreamEvent{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 41}}, nil) {
+			return
+		}
+		if !yield(llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "refusal", Usage: llm.Usage{InputTokens: 41}}, nil) {
+			return
+		}
+		yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+	}
+}
+
 type meteredStreamProvider struct{ completeProvider }
 
 func (meteredStreamProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
@@ -83,6 +151,9 @@ func (meteredStreamProvider) Stream(context.Context, llm.CompletionRequest) iter
 }
 
 func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
+	// Previously skipped as timing-sensitive (BaaRai/ARTEX#9). The recorder now
+	// decides the status at the point the consumer stops, so the result no
+	// longer depends on when the deferred finish runs.
 	dsn := os.Getenv("ARTEX_PG_DSN")
 	if dsn == "" {
 		t.Skip("requires isolated ARTEX_PG_DSN")
@@ -92,7 +163,9 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pg.Close()
-	for _, early := range []bool{false, true} {
+	// full: read to the end. cancel: cancel ctx, then stop reading.
+	// abandon: stop reading before message_stop with ctx still live.
+	for _, mode := range []string{"full", "cancel", "abandon"} {
 		profile := "btw-metering-" + uuid.NewString()
 		ctx, cancel := context.WithCancel(transcript.WithSessionID(t.Context(), "exp0-btw-test"))
 		recorder := Wrap(meteredStreamProvider{}, pg, "fixture", profile, "", "", func() bool { return false })
@@ -100,8 +173,10 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if early && event.Type == llm.SEMessageDelta {
-				cancel()
+			if mode != "full" && event.Type == llm.SEMessageDelta {
+				if mode == "cancel" {
+					cancel()
+				}
 				break // Consumer exits before the provider can return a cancellation event.
 			}
 		}
@@ -115,11 +190,11 @@ FROM llm_usage WHERE profile_name=$1`, profile).Scan(&count, &input, &output, &w
 			t.Fatal(err)
 		}
 		wantStatus := "ok"
-		if early {
+		if mode != "full" {
 			wantStatus = "error"
 		}
 		if count != 1 || input != 23 || output != 5 || worker != "btw" || status != wantStatus {
-			t.Fatalf("early=%v: count=%d usage=%d/%d worker=%q status=%q", early, count, input, output, worker, status)
+			t.Fatalf("mode=%s: count=%d usage=%d/%d worker=%q status=%q", mode, count, input, output, worker, status)
 		}
 	}
 }

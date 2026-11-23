@@ -2,7 +2,9 @@ package db
 
 import (
 	"bytes"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,33 @@ import (
 // ErrIntentStateConflict marks a failed compare-and-set transition. Callers use
 // it to distinguish an expected control race (HTTP 409) from a storage failure.
 var ErrIntentStateConflict = errors.New("intent state changed concurrently")
+
+// ErrIntentClaimLost marks a heartbeat or a result write rejected by the claim
+// fence: the caller's unclaim token is no longer the intent's current one (its
+// claim expired and another worker took the intent over, or it was already
+// settled). Nothing was written; the caller must stop working on that intent.
+var ErrIntentClaimLost = errors.New("intent claim lost")
+
+// IntentClaimTTL is how long an intent claim stays valid without a heartbeat. A
+// running intent whose last_heartbeat_at is older than this (per the database
+// clock) is considered abandoned — its worker crashed or its process is gone —
+// and may be taken over; a younger claim is live and is never taken over. It is
+// six heartbeat intervals, so a live worker loses its claim only after five
+// consecutive missed heartbeats (about 75s of lost database connectivity).
+const IntentClaimTTL = 90 * time.Second
+
+// IntentClaimHeartbeatInterval is how often a busy worker renews its claim, and
+// how often the engine looks for expired claims to take over.
+const IntentClaimHeartbeatInterval = 15 * time.Second
+
+// newUnclaimToken returns a fresh random claim token (128 bits, hex).
+func newUnclaimToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
 
 // utf8Clean makes a string safe for a PostgreSQL text column. It (1) replaces
 // invalid UTF-8 byte sequences with U+FFFD and (2) strips NUL (0x00) bytes.
@@ -76,7 +105,7 @@ type Node struct {
 	Origin        string          `json:"origin,omitempty"`
 	Owner         string          `json:"owner,omitempty"`
 	BlockedReason string          `json:"blocked_reason,omitempty"`
-	DeleteReason  string          `json:"delete_reason,omitempty"` // 仅意图假删除(state='deleted')时非空
+	DeleteReason  string          `json:"delete_reason,omitempty"` // non-empty only when an intent is soft-deleted (state='deleted')
 	Anchors       []int64         `json:"anchors,omitempty"`
 	CreatedAt     time.Time       `json:"created_at"`
 	SourceTaskID  int64           `json:"source_task_id,omitempty"`
@@ -201,6 +230,13 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 		return 0, err
 	}
 	defer tx.Rollback()
+	// Validate fact anchors before creating a node. Key-share locks retain the
+	// checked assets through commit, closing the check/insert deletion race.
+	if kind == KindFact && len(anchors) > 0 {
+		if err := checkFactAnchorAssets(tx, anchors); err != nil {
+			return 0, err
+		}
+	}
 	var id int64
 	if err := tx.QueryRow(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
@@ -214,6 +250,40 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		}
 	}
 	return id, tx.Commit()
+}
+
+func checkFactAnchorAssets(tx *sql.Tx, ids []int64) error {
+	rows, err := tx.Query("SELECT id FROM assets WHERE id = ANY($1::bigint[]) ORDER BY id FOR KEY SHARE", ids)
+	if err != nil {
+		return err
+	}
+	found := make(map[int64]bool, len(ids))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		found[id] = true
+	}
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var missing []int64
+	for _, id := range ids {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("asset IDs do not exist: %v; use existing IDs or register the assets first", missing)
+	}
+	return nil
 }
 
 // AddIntent is a convenience: an open intent.
@@ -284,7 +354,7 @@ func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) e
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("目标不存在")
+		return fmt.Errorf("goal does not exist")
 	}
 	return nil
 }
@@ -299,7 +369,7 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("目标不存在")
+		return fmt.Errorf("goal does not exist")
 	}
 	return nil
 }
@@ -309,20 +379,33 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 // is re-claimed. Called on startup: a 'running' intent with no live worker (a
 // backend restart or crashed worker goroutine left it stuck) would otherwise spin
 // forever in the UI. Workers resume from their transcript, so reopening is safe.
+//
+// Only an expired claim is taken over: last_heartbeat_at older than
+// IntentClaimTTL, or NULL (a legacy row claimed before the lease columns
+// existed, whose claimer never heartbeats). A live claim — including one held by
+// another instance on the same database — is left alone. The expiry check and
+// the takeover are one atomic UPDATE on the database clock, and clearing
+// unclaim_token fences the previous claimer out. The engine also calls this
+// periodically, so a claim that was still live at startup is taken over once it
+// expires.
 func (s *ExplorationStore) ResetRunningIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
-WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL, unclaim_token=NULL
+WHERE exploration_id=$1 AND kind='intent' AND state='running'
+  AND (last_heartbeat_at IS NULL OR last_heartbeat_at < now() - $2 * INTERVAL '1 second')`, s.expID, IntentClaimTTL.Seconds())
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
 // ReopenIntent flips ONE not-successfully-finished intent (blocked/exhausted/stopped)
 // back to 'open' so a worker re-claims it (graph writes it already produced stay).
 // The worker resumes from its prior LLM transcript instead of restarting from scratch.
-// done/open/running are left untouched. Returns whether a row changed. Used by "重跑".
+// done/open/running are left untouched. Returns whether a row changed. Used by "rerun".
 func (s *ExplorationStore) ReopenIntent(id int64) (bool, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
 SET state='open', completed_at=NULL, blocked_reason=NULL
@@ -382,10 +465,13 @@ type IntentCleanup struct {
 	Activities int64 `json:"activities"`
 }
 
-// SoftDeleteIntent 假删除一个待领/运行中/已暂停的意图:置 state='deleted' 并把用户填写的
-// 删除原因记入 delete_reason 字段,保留意图节点及其全部产出/血缘(不再像旧实现那样在图上
-// 另挂一条 fact)。返回删除前意图的 summary,供 planner 通知使用。副会话随删除态一并清理。
-// 调用方须先停掉运行中的 worker,避免其后续写入。
+// SoftDeleteIntent soft-deletes an open/running/paused intent: it sets
+// state='deleted' and records the user-provided delete reason in the
+// delete_reason field, keeping the intent node and all its outputs/lineage
+// (unlike the old implementation, which attached a separate fact to the graph).
+// Returns the intent's summary from before deletion, for the planner
+// notification. Side conversations are cleaned up together with the deleted
+// state. The caller must stop any running worker first to avoid later writes.
 func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -411,7 +497,9 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 		WHERE id=$1 AND exploration_id=$2`, id, s.expID, reason); err != nil {
 		return "", err
 	}
-	// 主意图审计轨迹保留,但副问答会话随删除态原子清理(延迟快照会拒绝它)。
+	// The main intent's audit trail is kept, but the side-question session is
+	// atomically cleaned up with the deleted state (the delayed snapshot would
+	// reject it).
 	if _, err := tx.Exec(`DELETE FROM side_question_sessions WHERE intent_id=$1`, id); err != nil {
 		return "", err
 	}
@@ -425,12 +513,19 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 	return summary, tx.Commit()
 }
 
-// CancelIntent 物理删除一个意图,以及"仅由该意图支撑"的全部独占子孙节点——从该意图沿
-// yields/derived_from 向下可达、且所有父节点(所有指向它的边的源)都落在删除集内的节点。
-// goal 与 origin fact 永不删除;还被删除集之外的意图/digest 引用的共享节点也保留,以免破坏
-// 其它分支、产生断链。被删的每个 intent 先做 token rollup(保留不可逆计量)并清理其 activity
-// 与副会话;被删的 finding 先删 findings 表行(node_id FK 为 ON DELETE SET NULL,否则留孤儿)。
-// 边随节点 CASCADE 清理,整个清理保持在一个事务内。调用方须先停掉运行中的 worker 防止其后续写入。
+// CancelIntent physically deletes an intent plus all exclusively-owned
+// descendant nodes "supported only by that intent" — nodes reachable downward
+// from the intent along yields/derived_from whose every parent (the source of
+// every edge pointing at them) falls inside the deletion set. Goals and origin
+// facts are never deleted; shared nodes still referenced by intents/digests
+// outside the deletion set are kept, so other branches are not broken and no
+// dangling links appear. Each deleted intent gets a token rollup first (to
+// preserve irreversible metering) and then has its activity and side sessions
+// cleaned; a deleted finding has its findings-table row removed first (the
+// node_id FK is ON DELETE SET NULL, otherwise it would be orphaned). Edges are
+// CASCADE-cleaned with the nodes, and the whole cleanup stays in one
+// transaction. The caller must stop any running worker first to prevent later
+// writes.
 func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	var out IntentCleanup
 	tx, err := s.db.Begin()
@@ -439,8 +534,9 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	}
 	defer tx.Rollback()
 
-	// 锁定意图行确认存在(幂等:已删则 not found)。状态不校验——真删除对任何状态成立,
-	// running 的 worker 由调用方先停。
+	// Lock the intent row to confirm it exists (idempotent: already deleted → not
+	// found). State is not checked — hard deletion is valid for any state; the
+	// caller stops a running worker first.
 	if err := tx.QueryRow(`SELECT 1 FROM exploration_nodes
 		WHERE id=$1 AND exploration_id=$2 AND kind='intent' FOR UPDATE`, id, s.expID).Scan(new(int)); err != nil {
 		if err == sql.ErrNoRows {
@@ -449,7 +545,8 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		return out, err
 	}
 
-	// 载入全图节点(判 protected)与边(算向下可达 + 父集)。图规模对真实任务很小。
+	// Load the whole graph's nodes (to decide protected) and edges (to compute
+	// downward reachability + the parent sets). The graph is small for real tasks.
 	kind := map[int64]string{}
 	protected := map[int64]bool{}
 	nrows, err := tx.Query(`SELECT id, kind, state FROM exploration_nodes WHERE exploration_id=$1`, s.expID)
@@ -465,7 +562,7 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		}
 		kind[nid] = k
 		if k == KindGoal || (k == KindFact && st == StateOrigin) {
-			protected[nid] = true // 目标与任务根事实永不随意图删除
+			protected[nid] = true // goals and task root facts are never deleted with an intent
 		}
 	}
 	nrows.Close()
@@ -473,8 +570,8 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		return out, err
 	}
 
-	parentsOf := map[int64][]int64{} // dst -> 所有指向它的边的 src(任意 rel,含 covers:被 digest 覆盖的成员因此有 digest 父而被保留)
-	downOf := map[int64][]int64{}    // src -> 沿 yields/derived_from 的向下邻居
+	parentsOf := map[int64][]int64{} // dst -> src of every edge pointing at it (any rel, including covers: members covered by a digest thus have a digest parent and are kept)
+	downOf := map[int64][]int64{}    // src -> downward neighbors along yields/derived_from
 	erows, err := tx.Query(`SELECT src_id, rel, dst_id FROM exploration_edges WHERE exploration_id=$1`, s.expID)
 	if err != nil {
 		return out, err
@@ -496,8 +593,10 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		return out, err
 	}
 
-	// 独占级联:从意图向下扩展,一个节点入删除集当且仅当它未被保护、且它的每个父都已在集内
-	// (即除了经过被删节点外再无来路)。迭代到不动点。
+	// Exclusive cascade: expand downward from the intent; a node joins the
+	// deletion set if and only if it is unprotected and every parent of it is
+	// already in the set (i.e. it has no incoming path except through deleted
+	// nodes). Iterate to a fixed point.
 	del := map[int64]bool{id: true}
 	for changed := true; changed; {
 		changed = false
@@ -521,7 +620,7 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		}
 	}
 
-	// 按类型分桶。
+	// Bucket by kind.
 	var ids, intentIDs, findingIDs []int64
 	for nid := range del {
 		ids = append(ids, nid)
@@ -537,8 +636,9 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		}
 	}
 
-	// 每个被删意图:token rollup(保留不可逆计量)后清 activity。rollup 行 node_id 为 NULL,
-	// 不会被下面按 node_id 的删除命中。
+	// Each deleted intent: token rollup (preserving irreversible metering), then
+	// clear activity. The rollup row's node_id is NULL, so the node_id-based
+	// deletion below does not hit it.
 	for _, iid := range intentIDs {
 		tokenBuckets, err := intentTokenRollup(tx, s.expID, iid)
 		if err != nil {
@@ -561,7 +661,7 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 				exploration_id, worker, kind, summary, metadata,
 				input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at)
 				VALUES ($1,'token-ledger','result',$2,$3,$4,$5,$6,$7,$8)`,
-				s.expID, fmt.Sprintf("已取消意图 #%d 的 Token 计量", iid), metadata,
+				s.expID, fmt.Sprintf("Token metering for cancelled intent #%d", iid), metadata,
 				bucket.Usage.InputTokens, bucket.Usage.OutputTokens,
 				bucket.Usage.CacheReadTokens, bucket.Usage.CacheWriteTokens, bucket.Day); err != nil {
 				return out, err
@@ -572,14 +672,16 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		}
 	}
 
-	// finding 节点删除前先删 findings 表行(否则留 node_id=NULL 的孤儿)。
+	// Delete the findings-table row before deleting the finding node (otherwise a
+	// node_id=NULL orphan is left behind).
 	for _, fid := range findingIDs {
 		if _, err := tx.Exec(`DELETE FROM findings WHERE node_id=$1`, fid); err != nil {
 			return out, err
 		}
 	}
 
-	// 删节点(边随 CASCADE 清理)。逐个删并核对行数,防并发改动。
+	// Delete the nodes (edges are cleaned up via CASCADE). Delete one by one and
+	// verify row counts to guard against concurrent changes.
 	var removed int64
 	for _, nid := range ids {
 		res, err := tx.Exec(`DELETE FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, nid, s.expID)
@@ -849,10 +951,10 @@ type NodeFilter struct {
 }
 
 // NodesPage returns one 1-based page of this exploration's nodes plus the total
-// matching count. The 播报板 reads the graph as a time series, so it pages in SQL
-// rather than pulling the whole graph like Nodes does. Ordering is by id, which
-// is BIGSERIAL and therefore creation order — stable when several nodes share a
-// created_at second.
+// matching count. The broadcast board reads the graph as a time series, so it
+// pages in SQL rather than pulling the whole graph like Nodes does. Ordering is
+// by id, which is BIGSERIAL and therefore creation order — stable when several
+// nodes share a created_at second.
 func (s *ExplorationStore) NodesPage(f NodeFilter, page, size int) ([]*Node, int, error) {
 	if page < 1 {
 		page = 1
@@ -884,7 +986,8 @@ func (s *ExplorationStore) NodesPage(f NodeFilter, page, size int) ([]*Node, int
 		args = append(args, "%"+q+"%")
 		mark := "$" + fmt.Sprint(len(args))
 		ors := []string{"payload::text ILIKE " + mark, "COALESCE(origin,'') ILIKE " + mark}
-		// 纯数字(或 UI 里带 # 前缀的形式,如「#41」)当作节点 id 精确匹配,方便直接定位某个节点。
+		// A bare number (or the "#"-prefixed form the UI shows, e.g. "#41") is
+		// treated as an exact node-id match, making it easy to jump to a node.
 		if idStr := strings.TrimPrefix(q, "#"); idStr != "" {
 			if id, err := strconv.ParseInt(idStr, 10, 64); err == nil {
 				args = append(args, id)
@@ -919,7 +1022,8 @@ func (s *ExplorationStore) NodesPage(f NodeFilter, page, size int) ([]*Node, int
 }
 
 // NodesByIDs loads the given nodes of this exploration in id order. Used to
-// resolve the neighbours of a 播报板 page without fetching the whole graph.
+// resolve the neighbours of a broadcast-board page without fetching the whole
+// graph.
 func (s *ExplorationStore) NodesByIDs(ids []int64) ([]*Node, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -940,8 +1044,8 @@ WHERE exploration_id=$1 AND id IN (`+strings.Join(marks, ",")+`) ORDER BY id`, a
 	return scanNodes(rows)
 }
 
-// EdgesTouching returns every edge with one end among ids — the 播报板 uses it to
-// spell out where a node came from and what it produced.
+// EdgesTouching returns every edge with one end among ids — the broadcast board
+// uses it to spell out where a node came from and what it produced.
 func (s *ExplorationStore) EdgesTouching(ids []int64) ([]Edge, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -1160,8 +1264,10 @@ WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running'))`, s.e
 }
 
 // HasOpenGoal reports whether this exploration still has any goal in state 'open'.
-// false ⇒ 所有目标已 met/abandoned（或本任务无目标）⇒ 进入 goalless（人工直投）分支：
-// planner 停跑，任务是否结束改由 frontier 是否抽干决定。met 与 abandoned 都算"已了结"。
+// false ⇒ all goals are met/abandoned (or the task has no goals) ⇒ enter the
+// goalless (human-dispatched) branch: the planner stops, and whether the task
+// ends is instead decided by whether the frontier is drained. Both met and
+// abandoned count as "settled".
 func (s *ExplorationStore) HasOpenGoal() (bool, error) {
 	var exists bool
 	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM exploration_nodes
@@ -1169,15 +1275,131 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 	return exists, err
 }
 
+// OpenGoalFingerprint returns a stable fingerprint of the open-goal set: the
+// sorted goal ids joined by commas, "" when none. Planner quiet-mode (#79) uses
+// it to tell "the goal set changed since the last planning round" apart from
+// "nothing the plan depends on changed".
+func (s *ExplorationStore) OpenGoalFingerprint() (string, error) {
+	rows, err := s.db.Query(`SELECT id FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='goal' AND state='open' ORDER BY id`, s.expID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return "", err
+		}
+		ids = append(ids, strconv.FormatInt(id, 10))
+	}
+	return strings.Join(ids, ","), rows.Err()
+}
+
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
-WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID)
+	token, err := s.ClaimIntentToken(id, owner)
+	return token != "", err
+}
+
+// ClaimIntentToken is ClaimIntent returning the claim's unclaim token ("" when
+// the intent was not claimable). Every claim gets a fresh random token and
+// starts its lease (last_heartbeat_at) in the same statement; the claimer must
+// present the token to HeartbeatIntentClaim and to the SettleIntentClaim* writes.
+func (s *ExplorationStore) ClaimIntentToken(id int64, owner string) (string, error) {
+	token, err := newUnclaimToken()
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	n, _ := res.RowsAffected()
-	return n == 1, nil
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1, unclaim_token=$4, last_heartbeat_at=now()
+WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID, token)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", nil
+	}
+	return token, nil
+}
+
+// ClaimPausedIntentToken is the paused->running counterpart of ClaimIntentToken
+// (the human-message path, which never goes through 'open'). It applies the same
+// column updates as CompareAndSetIntentState(id, "paused", "running") and starts
+// a claim with a fresh token. Returns "" when the intent is no longer paused.
+func (s *ExplorationStore) ClaimPausedIntentToken(id int64) (string, error) {
+	token, err := newUnclaimToken()
+	if err != nil {
+		return "", err
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='running', blocked_reason=NULL, content_version=content_version+1, completed_at=NULL, unclaim_token=$3, last_heartbeat_at=now()
+WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='paused'`, id, s.expID, token)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", nil
+	}
+	return token, nil
+}
+
+// HeartbeatIntentClaim renews the lease of the claim identified by token. It
+// touches the row only while token is the running intent's current unclaim
+// token; otherwise it returns ErrIntentClaimLost and writes nothing.
+func (s *ExplorationStore) HeartbeatIntentClaim(id int64, token string) error {
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET last_heartbeat_at=now()
+WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='running' AND unclaim_token=$3`, id, s.expID, token)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: heartbeat for intent %d rejected", ErrIntentClaimLost, id)
+	}
+	return nil
+}
+
+// SettleIntentClaim is the fenced write of a worker's intent result: it moves
+// the running intent to state and releases the claim, but only while token is
+// still the intent's current unclaim token. A worker whose claim was taken over
+// gets ErrIntentClaimLost and nothing is written. ErrIntentStateConflict means
+// the claim is still the caller's but the intent left 'running' concurrently.
+func (s *ExplorationStore) SettleIntentClaim(id int64, token, state string) error {
+	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END, unclaim_token=NULL
+WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='running' AND unclaim_token=$4`, state, id, s.expID, token, terminal)
+	return s.settleIntentClaimResult(id, token, res, err)
+}
+
+// SettleIntentClaimBlocked is the fenced counterpart of SetIntentBlockedReason:
+// it settles the running intent as blocked with reason under the same token
+// check as SettleIntentClaim.
+func (s *ExplorationStore) SettleIntentClaimBlocked(id int64, token, reason string) error {
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='blocked', blocked_reason=NULLIF($1,''), completed_at=now(), unclaim_token=NULL
+WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='running' AND unclaim_token=$4`, reason, id, s.expID, token)
+	return s.settleIntentClaimResult(id, token, res, err)
+}
+
+// settleIntentClaimResult turns a fenced settle that matched no row into the
+// explicit rejection: claim lost unless the token is still the current one.
+func (s *ExplorationStore) settleIntentClaimResult(id int64, token string, res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return nil
+	}
+	var current sql.NullString
+	err = s.db.QueryRow(`SELECT unclaim_token FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent'`, id, s.expID).Scan(&current)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if current.Valid && current.String == token {
+		return fmt.Errorf("%w: intent %d is no longer in the running state", ErrIntentStateConflict, id)
+	}
+	return fmt.Errorf("%w: result write for intent %d rejected", ErrIntentClaimLost, id)
 }
 
 // Stats returns node counts grouped by kind (for dashboard).
@@ -1201,14 +1423,24 @@ func (s *ExplorationStore) Stats() (map[string]int, error) {
 
 // --- activity (poll by global id cursor) ---
 
+// queryRower is the subset of *sql.DB and *sql.Tx that AppendActivity needs,
+// so a replay can insert the activity and delete the outbox row together.
+type queryRower interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 // AppendActivity records one worker step and returns its id.
 func (s *ExplorationStore) AppendActivity(a Activity) (int64, error) {
+	return s.appendActivity(s.db, a)
+}
+
+func (s *ExplorationStore) appendActivity(q queryRower, a Activity) (int64, error) {
 	metadata := a.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
 	var id int64
-	err := s.db.QueryRow(`
+	err := q.QueryRow(`
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
@@ -1272,7 +1504,8 @@ func (d *DB) TokenTotalsAll() (map[int64]TokenUsage, error) {
 // LastActivityAll returns the unix time of the most recent activity per
 // exploration (exploration_id → max created_at epoch), one query for all tasks.
 // Persisted (unlike Engine.LastActivity's in-memory map), so it survives restarts
-// and gives终态任务 a stable "ran until" time for computing run duration.
+// and gives terminal-state tasks a stable "ran until" time for computing run
+// duration.
 func (d *DB) LastActivityAll() (map[int64]int64, error) {
 	rows, err := d.Query(`SELECT exploration_id, EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM activity GROUP BY exploration_id`)
 	if err != nil {
@@ -1294,7 +1527,8 @@ func (d *DB) LastActivityAll() (map[int64]int64, error) {
 type GoalCounts struct{ Total, Met int }
 
 // FindingSeverityCounts breaks a task's findings down by severity for the task
-// list (severity 白名单外/为空的记录不计入任一档)。
+// list (records outside the severity whitelist or with an empty severity are
+// not counted in any bucket).
 type FindingSeverityCounts struct{ Critical, High, Medium, Low int }
 
 // TaskListMetrics contains the aggregates rendered in task lists.
@@ -1302,15 +1536,17 @@ type TaskListMetrics struct {
 	Tokens         TokenUsage
 	LastActivity   int64
 	Goals          GoalCounts
-	RunningIntents int                   // kind='intent' 且 state='running' 的条数，即运行中 Worker 数
-	Findings       FindingSeverityCounts // findings 表里该任务的漏洞数（按严重度分档）
+	RunningIntents int                   // number of rows with kind='intent' and state='running', i.e. the number of running Workers
+	Findings       FindingSeverityCounts // this task's vulnerability count in the findings table (bucketed by severity)
 }
 
-// TaskListMetricsAll returns list aggregates for every live task in one query.
-// The lateral lookups use the per-exploration indexes instead of grouping the
-// complete activity history on every poll.
-func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
-	rows, err := d.Query(`
+// taskListMetricsQuery is the select shared by TaskListMetricsAll and
+// TaskListMetrics; each appends its own WHERE on task. The lateral lookups use
+// the per-exploration indexes instead of grouping the complete activity history
+// on every poll. latest_activity orders by the column activity.created_at, so
+// idx_act_latest (exploration_id, created_at DESC) serves the LIMIT 1; ordering
+// by the output alias would sort every activity row of the task.
+const taskListMetricsQuery = `
 		SELECT task.exploration_id,
 		       COALESCE(token_metrics.input_tokens,0),
 		       COALESCE(token_metrics.output_tokens,0),
@@ -1334,10 +1570,10 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 			WHERE exploration_id=task.exploration_id AND kind='result'
 		) token_metrics ON true
 		LEFT JOIN LATERAL (
-			SELECT EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+			SELECT EXTRACT(EPOCH FROM activity.created_at)::bigint AS created_at
 			FROM activity
-			WHERE exploration_id=task.exploration_id
-			ORDER BY created_at DESC
+			WHERE activity.exploration_id=task.exploration_id
+			ORDER BY activity.created_at DESC
 			LIMIT 1
 		) latest_activity ON true
 		LEFT JOIN LATERAL (
@@ -1359,35 +1595,57 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 			FROM findings
 			WHERE task_id=task.id
 		) finding_metrics ON true
-		WHERE task.deleted_at IS NULL`)
+		WHERE task.deleted_at IS NULL`
+
+// scanTaskListMetrics reads one row of taskListMetricsQuery.
+func scanTaskListMetrics(row interface{ Scan(...any) error }) (int64, TaskListMetrics, error) {
+	var explorationID int64
+	var metrics TaskListMetrics
+	err := row.Scan(
+		&explorationID,
+		&metrics.Tokens.InputTokens,
+		&metrics.Tokens.OutputTokens,
+		&metrics.Tokens.CacheReadTokens,
+		&metrics.Tokens.CacheWriteTokens,
+		&metrics.LastActivity,
+		&metrics.Goals.Total,
+		&metrics.Goals.Met,
+		&metrics.RunningIntents,
+		&metrics.Findings.Critical,
+		&metrics.Findings.High,
+		&metrics.Findings.Medium,
+		&metrics.Findings.Low,
+	)
+	return explorationID, metrics, err
+}
+
+// TaskListMetricsAll returns list aggregates for every live task in one query.
+func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
+	rows, err := d.Query(taskListMetricsQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := map[int64]TaskListMetrics{}
 	for rows.Next() {
-		var explorationID int64
-		var metrics TaskListMetrics
-		if err := rows.Scan(
-			&explorationID,
-			&metrics.Tokens.InputTokens,
-			&metrics.Tokens.OutputTokens,
-			&metrics.Tokens.CacheReadTokens,
-			&metrics.Tokens.CacheWriteTokens,
-			&metrics.LastActivity,
-			&metrics.Goals.Total,
-			&metrics.Goals.Met,
-			&metrics.RunningIntents,
-			&metrics.Findings.Critical,
-			&metrics.Findings.High,
-			&metrics.Findings.Medium,
-			&metrics.Findings.Low,
-		); err != nil {
+		explorationID, metrics, err := scanTaskListMetrics(rows)
+		if err != nil {
 			return nil, err
 		}
 		out[explorationID] = metrics
 	}
 	return out, rows.Err()
+}
+
+// TaskListMetrics returns the same aggregates for the one live task of
+// exploration expID, with the same laterals as TaskListMetricsAll. A missing or
+// deleted task gives zero metrics, as a missing key of TaskListMetricsAll does.
+func (d *DB) TaskListMetrics(expID int64) (TaskListMetrics, error) {
+	_, metrics, err := scanTaskListMetrics(d.QueryRow(taskListMetricsQuery+` AND task.exploration_id=$1`, expID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskListMetrics{}, nil
+	}
+	return metrics, err
 }
 
 // GoalCountsAll returns goal totals (total / met) per exploration id, one query
@@ -1510,6 +1768,34 @@ FROM activity WHERE exploration_id=$1 AND id>$2 ORDER BY id LIMIT $3`, s.expID, 
 	return out, cursor, rows.Err()
 }
 
+// ActivityContainingEvidence returns the newest activity recorded for nodeID
+// whose summary or full detail contains one of the given evidence lines (#124
+// row 1). ok is false when no recorded activity carries any of them. The match
+// is literal and case-sensitive: evidence has to quote the recorded output, not
+// paraphrase it. Callers pass only substantive lines, so a command name alone
+// cannot tie a claim to an activity. The activity's timestamp bounds the search
+// for a proxy capture of the same bytes.
+func (s *ExplorationStore) ActivityContainingEvidence(nodeID int64, lines []string) (id int64, createdAt time.Time, ok bool, err error) {
+	if nodeID <= 0 || len(lines) == 0 {
+		return 0, time.Time{}, false, nil
+	}
+	// One query across all lines: the newest matching activity wins, not the
+	// newest match for whichever line came first.
+	err = s.db.QueryRow(`SELECT id, created_at FROM activity a
+WHERE exploration_id=$1 AND node_id=$2
+  AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS line
+              WHERE strpos(COALESCE(a.detail,''), line) > 0
+                 OR strpos(COALESCE(a.summary,''), line) > 0)
+ORDER BY id DESC LIMIT 1`, s.expID, nodeID, lines).Scan(&id, &createdAt)
+	if err == sql.ErrNoRows {
+		return 0, time.Time{}, false, nil
+	}
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return id, createdAt, true, nil
+}
+
 // ActivityListForTerminalIntent is the inherited, incremental-read boundary.
 // The intent state check and activity read happen in one statement so a source
 // intent reopened between API-level checks cannot expose its new in-flight trace.
@@ -1552,7 +1838,8 @@ func (s *ExplorationStore) ActivityListForTerminalIntent(nodeID, sinceID int64, 
 //   - Main == true  → the main-agent session (worker="mainagent") for one segment
 //     (MainSeg; nil/0 = the original segment, which also matches legacy NULL rows).
 //   - Worker != ""  → filter by worker name (Plan = "planner").
-//     Goal Agent 的第 0 轮拆解也以 worker="planner" 落库，故 Plan 会话完整覆盖 Goal+Planner。
+//     The Goal Agent's round-0 decomposition is also persisted with
+//     worker="planner", so the Plan session fully covers Goal+Planner.
 //   - NodeID != nil → a Worker session, filtered by node_id (= intent id).
 //
 // A zero value (all empty) matches the whole task (no session filter).
@@ -1691,8 +1978,8 @@ func (s *ExplorationStore) ActivityMaxID() (int64, error) {
 
 // MainSession is one resettable main-agent conversation segment of a task. Segment 0
 // is the original session (implicit, never stored); further segments are created by
-// "新建会话" to start the main agent on a clean transcript while the task's graph,
-// assets and goal stay shared.
+// "New conversation" to start the main agent on a clean transcript while the
+// task's graph, assets and goal stay shared.
 type MainSession struct {
 	Seq       int       `json:"seq"`
 	CreatedAt time.Time `json:"created_at"`

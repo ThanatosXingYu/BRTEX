@@ -35,7 +35,16 @@ type Capture struct {
 type attempt struct {
 	status int
 	body   strings.Builder
+	full   bool // true once body hit maxAttemptBody; further reads are not stored
 }
+
+// maxAttemptBody is the captured size of one HTTP attempt. The stream still
+// reaches the caller in full; only the in-memory mirror stops.
+const maxAttemptBody = 1 << 20 // 1 MiB
+
+// maxCaptureAttempts is how many HTTP attempts one Capture keeps. Further
+// attempts pass through unread into the mirror.
+const maxCaptureAttempts = 8
 
 // NewCapture returns a context carrying a fresh Capture, plus the Capture itself.
 func NewCapture(ctx context.Context) (context.Context, *Capture) {
@@ -74,8 +83,12 @@ func (c *Capture) TeeResponse(status int, rc io.ReadCloser) io.ReadCloser {
 	if c == nil || rc == nil {
 		return rc
 	}
-	a := &attempt{status: status}
 	c.mu.Lock()
+	if len(c.attempts) >= maxCaptureAttempts {
+		c.mu.Unlock()
+		return rc
+	}
+	a := &attempt{status: status}
 	c.attempts = append(c.attempts, a)
 	c.mu.Unlock()
 	return &teeBody{rc: rc, c: c, a: a}
@@ -153,7 +166,15 @@ func (t *teeBody) Read(p []byte) (int, error) {
 	n, err := t.rc.Read(p)
 	if n > 0 {
 		t.c.mu.Lock()
-		t.a.body.Write(p[:n])
+		if !t.a.full {
+			remain := maxAttemptBody - t.a.body.Len()
+			if n > remain {
+				t.a.body.Write(p[:remain])
+				t.a.full = true
+			} else {
+				t.a.body.Write(p[:n])
+			}
+		}
 		t.c.mu.Unlock()
 	}
 	return n, err

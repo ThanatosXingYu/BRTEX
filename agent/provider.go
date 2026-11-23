@@ -1,10 +1,12 @@
 // Package agent wires real LLM-driven planner and work agents (on top of the
-// agent-core SDK) to the dual SQLite graph. See docs/ARTEX-架构设计.md
+// agent-core SDK) to the dual PostgreSQL graph. See the ARTEX architecture design doc
 // §4.3 (planner) and §4.4 (work agent).
 //
 // Provider configuration is read from the environment so the system runs with
-// any Anthropic- or OpenAI-format endpoint. If no key is configured, FromEnv
-// returns ok=false and the exploration engine stays idle (an LLM is required).
+// any Anthropic-, OpenAI- or Ollama-format endpoint (the last being keyless).
+// If no usable configuration is found — a key for the cloud formats, a base
+// URL for keyless Ollama — FromEnv returns ok=false and the exploration engine
+// stays idle (an LLM is required).
 package agent
 
 import (
@@ -19,14 +21,14 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode"
 
+	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
-	"github.com/ThanatosXingYu/BRTEX/llmrec"
 )
 
 // Config describes the LLM backend resolved from the environment.
@@ -43,59 +45,81 @@ type Config struct {
 	// using the provider (0 = that window unlimited).
 	RatePerSecond float64
 	RatePerMinute float64
-	// ContextWindowK is the model's context window in K tokens (user-configured),
-	// used to size compaction thresholds. 0 = default; see CompactionWindow.
+	// ContextWindowK is the model's context window in K tokens (user-configured).
+	// CompactionWindow applies a 32K floor for compaction math; ContextWindowTokens
+	// does not, so routing and side-question budgets see the real window. 0 = default.
 	ContextWindowK int
-	// ThinkingType 独立控制思考「开关」字段(thinking.type):
-	//   "" = 不发送(默认,兼容不支持该字段的模型); "disabled" = 显式关闭;
-	//   "enabled" = 开启. 与 ReasoningEffort 完全解耦——有些接口没有 thinking 字段、
-	//   只靠强度参数就能激活思考,故两者可各自单独设置.
+	// ThinkingType independently controls the thinking "on/off" field (thinking.type):
+	//   "" = don't send (default, compatible with models that don't support the field);
+	//   "disabled" = explicitly off; "enabled" = on. Fully decoupled from
+	//   ReasoningEffort — some endpoints have no thinking field and activate thinking
+	//   via the effort parameter alone, so the two can be set independently.
 	ThinkingType string
-	// ReasoningEffort 独立控制思考「强度」字段:
-	//   "" = 不发送(默认); "low"/"medium"/"high"/"xhigh"/"max" = 对应强度.
-	//   OpenAI 映射为顶层 reasoning_effort;Anthropic 映射为 output_config.effort.
+	// ReasoningEffort independently controls the thinking "effort" field:
+	//   "" = don't send (default); "low"/"medium"/"high"/"xhigh"/"max" = the effort level.
+	//   Mapped to top-level reasoning_effort for OpenAI, and to output_config.effort
+	//   for Anthropic.
 	ReasoningEffort string
-	// Stream 控制该 profile 是否使用流式(SSE)接口。true(默认)= 流式;false = 真·
-	// 非流式(发 stream:false,一次性拿完整 JSON,走 Provider.Complete)。非流式可绕开
-	// 某些网关糟糕的 SSE 实现(空帧、思考字段丢帧),代价是失去运行中的实时进度/实时
-	// token 计数。映射为 agentcore.Options.NonStreaming = !Stream。
+	// Stream controls whether this profile uses the streaming (SSE) API. true (default)
+	// = streaming; false = true non-streaming (send stream:false, get the full JSON in
+	// one shot, via Provider.Complete). Non-streaming bypasses some gateways' broken
+	// SSE implementations (empty frames, dropped thinking frames), at the cost of
+	// losing live progress / live token counts during the run. Mapped to
+	// agentcore.Options.NonStreaming = !Stream.
 	Stream bool
-	// MaxTokens 是单次回复的输出上限(token)。0 = 不发送该字段,由服务端默认值决定
-	// (历史行为)。与 ContextWindowK 不同:后者是模型总容量,只在本地用来算压缩阈值,
-	// 不出现在请求里;本值随每次请求发出。映射为 agentcore.Options.MaxTokens。
+	// MaxTokens is the per-reply output cap (tokens). 0 = don't send the field and let
+	// the server default decide (historical behavior). Unlike ContextWindowK, which is
+	// the model's total capacity used only locally to size compaction thresholds and
+	// never sent in a request, this value is sent with every request. Mapped to
+	// agentcore.Options.MaxTokens.
 	MaxTokens int
-	// MaxTokensField 选择 MaxTokens 用哪个请求字段名,仅对 format=openai 生效:
-	//   "" = max_tokens(默认); "max_completion_tokens" = 新字段。
-	// OpenAI 推理模型(o 系列/GPT-5)只认后者,收到 max_tokens 会直接报
-	// unsupported_parameter;而多数兼容网关只认前者,故不做自动推断,交由用户按端点选。
+	// MaxTokensField selects which request field carries MaxTokens, only effective for
+	// format=openai:
+	//   "" = max_tokens (default); "max_completion_tokens" = the newer field.
+	// OpenAI reasoning models (o-series/GPT-5) accept only the latter and reject
+	// max_tokens outright with unsupported_parameter, while most compatible gateways
+	// accept only the former — so no auto-detection; the user picks per endpoint.
 	MaxTokensField string
-	// SessionHeaderKey,非空时,让每次 LLM 请求带上一个自定义 HTTP 头,头名为该值、
-	// 头值为【当前会话的 session id】(chat 会话=conv-<id>,worker=exp<x>-worker-i<intent>
-	// 等,见 WorkerSessionID)。用于某些按 session-id 头做提示缓存/粘性路由的网关。
-	// 空 = 不发送。值由 transcript.WithSessionID 挂在请求 context 上,由 RoundTripper
-	// 读取填入,因此同一共享 provider 也能按会话发出不同的头值。
+	// SessionHeaderKey, when non-empty, makes every LLM request carry a custom HTTP
+	// header named by this value, with the [current session's session id] as its value
+	// (chat session = conv-<id>, worker = exp<x>-worker-i<intent>, etc.; see
+	// WorkerSessionID). Used by gateways that do prompt caching / sticky routing keyed
+	// on a session-id header. Empty = don't send. The value is attached to the request
+	// context via transcript.WithSessionID and read by the RoundTripper, so even a
+	// shared provider emits different header values per session.
 	SessionHeaderKey string
-	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
-	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
+	// UserAgent, when non-empty, overrides the User-Agent header on every outbound
+	// LLM request built from this config. Empty = don't set it, leaving the Go/Norma
+	// default UA untouched (the historical behavior). Validated by ValidateUserAgent.
+	UserAgent string
+	// Retry holds the retry parameters resolved for this config (profile override →
+	// global policy → built-in default, resolved server-side). See RetryConfig for
+	// the per-layer semantics; zero values = fully inherit the built-in defaults.
 	Retry RetryConfig
 }
 
-// RetryConfig 是随一个 LLM 配置走的重试参数。每层的「次数」统一语义:
-// 0 = 用内置默认次数;负数 = 关闭该层重试;>0 = 用该值。每层的「间隔」:
-// 0 = 用该层原本的指数退避;>0 = 改用这个固定间隔。
+// RetryConfig holds the retry parameters that travel with one LLM config. The
+// "attempts" of each layer share one semantics: 0 = use the built-in default count;
+// negative = disable this layer's retries; >0 = use this value. The "interval" of
+// each layer: 0 = keep the layer's original exponential backoff; >0 = use this
+// fixed interval instead.
 type RetryConfig struct {
-	// ConnectAttempts/ConnectInterval:SDK 建连重试(连接重置/超时/429/5xx,流开始前),
-	// 直接映射为 llm.Config.MaxRetries / RetryInterval。默认 3 次、0.5s 起指数(封顶 8s)。
+	// ConnectAttempts/ConnectInterval: SDK connection retries (connection reset/
+	// timeout/429/5xx, before the stream starts), mapped directly to
+	// llm.Config.MaxRetries / RetryInterval. Default 3 attempts, exponential from
+	// 0.5s (capped at 8s).
 	ConnectAttempts int
 	ConnectInterval time.Duration
-	// EmptyAttempts/EmptyInterval:SDK 空响应重试(完成但无 content block,仅 openai
-	// 格式),映射为 llm.Config.EmptyResponseRetries / EmptyResponseInterval。
-	// 默认 2 次、同一条指数梯度。
+	// EmptyAttempts/EmptyInterval: SDK empty-response retries (completed but no
+	// content block, openai format only), mapped to llm.Config.EmptyResponseRetries /
+	// EmptyResponseInterval. Default 2 attempts, same exponential ladder.
 	EmptyAttempts int
 	EmptyInterval time.Duration
-	// StreamAttempts/StreamInterval:同 provider 安全窗口重试——本项目在 SDK 之上补的
-	// 一层,只在「还没向调用方交付任何输出」时重放断流/过载/流内 429。SDK 看不到它,
-	// 由 server/task_llm.go 消费。默认 10 次、固定 10s。
+	// StreamAttempts/StreamInterval: same-provider safe-window retries — a layer this
+	// project adds on top of the SDK, replaying a broken/overloaded/in-stream 429 only
+	// when no output has been delivered to the caller yet. Invisible to the SDK;
+	// consumed by server/task_llm.go. Default 2 attempts, exponential from 0.5s
+	// (capped at 4s).
 	StreamAttempts int
 	StreamInterval time.Duration
 }
@@ -109,6 +133,47 @@ const (
 	maxWindowK     = 1000 // cap at 1M tokens (user request)
 )
 
+// FormatOllama marks a LOCAL Ollama server profile. Ollama exposes an
+// OpenAI-compatible Chat Completions endpoint (/v1), so on the wire it speaks
+// llm.FormatOpenAI; the distinct sentinel matters everywhere a profile must be
+// treated as usable WITHOUT an API key — Ollama runs keyless on localhost/LAN.
+// See NeedsAPIKey and NewProvider (which maps it onto FormatOpenAI while
+// forcing our base-URL/key defaults so an empty key never falls back to
+// OpenAI's public endpoint).
+const FormatOllama llm.Format = "ollama"
+
+// DefaultOllamaBaseURL is the base of Ollama's OpenAI-compatible endpoint the
+// provider appends /chat/completions to. Must never end up empty: with an
+// empty BaseURL, the SDK would fall back to OpenAI's public endpoint.
+const DefaultOllamaBaseURL = "http://127.0.0.1:11434/v1"
+
+// ollamaPlaceholderKey is sent as the Bearer token when no key is configured.
+// Ollama ignores authorization, but a concrete value keeps the SDK from
+// falling back to OPENAI_API_KEY (which would silently ship a real cloud key
+// to the local server) and keeps the header stable.
+const ollamaPlaceholderKey = "ollama"
+
+// normalizeOllamaBaseURL maps whatever the operator typed onto the /v1 root the
+// OpenAI-compatible provider expects: it strips a pasted "/chat/completions"
+// suffix, an empty value becomes the local default, and a missing "/v1" is
+// appended so the natural "http://host:11434" also works. Shared by the saved
+// profile path (ConfigFrom) and the environment path (FromEnv): both used to
+// differ, and only the profile path normalized.
+func normalizeOllamaBaseURL(raw string) string {
+	b := strings.TrimRight(strings.TrimSuffix(strings.TrimSpace(raw), "/chat/completions"), "/")
+	if b == "" {
+		return DefaultOllamaBaseURL
+	}
+	if !strings.HasSuffix(b, "/v1") {
+		b += "/v1"
+	}
+	return b
+}
+
+// NeedsAPIKey reports whether this provider format requires an API key to be
+// usable. Ollama (local server) is keyless; every cloud format needs one.
+func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama }
+
 // CompactionWindow returns the model context window in TOKENS for compaction
 // thresholds, resolved from the user-configured size (ContextWindowK). 0/unset →
 // a 200K default; otherwise clamped to [32K, 1M] so compaction stays effective.
@@ -119,6 +184,22 @@ func (c Config) CompactionWindow() int {
 	}
 	if k < minWindowK {
 		k = minWindowK
+	}
+	if k > maxWindowK {
+		k = maxWindowK
+	}
+	return k * 1000
+}
+
+// ContextWindowTokens returns the model's actual configured context window in
+// tokens (0/unset → 200K, capped at 1M) without the 32K compaction-math floor.
+// llmpool pre-filtering and sidequestion budgets use this so an 8K/16K profile
+// is not treated as 32K — that leak lets an oversize request hit the small
+// model, 400, and never fail over (shouldFailover ignores 400s).
+func (c Config) ContextWindowTokens() int {
+	k := c.ContextWindowK
+	if k <= 0 {
+		k = defaultWindowK
 	}
 	if k > maxWindowK {
 		k = maxWindowK
@@ -138,13 +219,15 @@ func compactionConfig(windowTokens int) *compaction.Config {
 
 // FromEnv resolves the LLM provider config:
 //
-//	ARTEX_LLM_PROVIDER = anthropic|openai (default: inferred from keys)
+//	ARTEX_LLM_PROVIDER = anthropic|openai|openai-responses|ollama (default: inferred from keys)
 //	ARTEX_LLM_MODEL    = model id        (default: per provider)
-//	ARTEX_LLM_BASE_URL = endpoint        (optional)
+//	ARTEX_LLM_BASE_URL = endpoint        (optional; ollama defaults to localhost:11434/v1)
 //	ARTEX_LLM_PROXY    = proxy URL        (optional; http/https/socks5)
-//	ANTHROPIC_API_KEY / OPENAI_API_KEY         = credentials
+//	ANTHROPIC_API_KEY / OPENAI_API_KEY         = credentials (unused for ollama)
 func FromEnv() (Config, bool) {
-	prov := os.Getenv("ARTEX_LLM_PROVIDER")
+	// Case- and space-insensitive: "Ollama" used to miss every case below and
+	// fall through to anthropic, sending ANTHROPIC_API_KEY to the Ollama base URL.
+	prov := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_LLM_PROVIDER")))
 	anthKey := os.Getenv("ANTHROPIC_API_KEY")
 	oaiKey := os.Getenv("OPENAI_API_KEY")
 
@@ -163,7 +246,8 @@ func FromEnv() (Config, bool) {
 		BaseURL: os.Getenv("ARTEX_LLM_BASE_URL"),
 		Model:   os.Getenv("ARTEX_LLM_MODEL"),
 		Proxy:   strings.TrimSpace(os.Getenv("ARTEX_LLM_PROXY")),
-		// 默认流式;ARTEX_LLM_STREAM=false/0/off 显式关闭走非流式。
+		// Streaming by default; ARTEX_LLM_STREAM=false/0/off explicitly switches to
+		// non-streaming.
 		Stream: !isFalsy(os.Getenv("ARTEX_LLM_STREAM")),
 	}
 	switch prov {
@@ -179,6 +263,16 @@ func FromEnv() (Config, bool) {
 		if c.Model == "" {
 			c.Model = "gpt-5"
 		}
+	case "ollama":
+		c.Format = FormatOllama
+		// Deliberately NOT inheriting OPENAI_API_KEY: a local Ollama ignores the
+		// bearer token, so the only thing the inheritance could do is ship a real
+		// cloud key to the endpoint. A gateway that does require a key can still
+		// be configured as a saved profile with an explicit one.
+		c.BaseURL = normalizeOllamaBaseURL(c.BaseURL)
+		if c.Model == "" {
+			c.Model = "llama3.2"
+		}
 	default:
 		c.Format = llm.FormatAnthropic
 		c.APIKey = anthKey
@@ -186,24 +280,11 @@ func FromEnv() (Config, bool) {
 			c.Model = "claude-opus-4-8"
 		}
 	}
-	if c.APIKey == "" {
+	// Ollama runs without a key: only the cloud formats gate on one.
+	if c.APIKey == "" && c.NeedsAPIKey() {
 		return Config{}, false
 	}
 	return c, true
-}
-
-// StripInvisible removes invisible Unicode format characters (zero-width
-// spaces, BOM, word joiners, ...) that sneak into pasted URLs and keys.
-// strings.TrimSpace does not treat them as whitespace, and a single stray
-// U+200B breaks url.Parse downstream with "first path segment in URL cannot
-// contain colon".
-func StripInvisible(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.Is(unicode.Cf, r) {
-			return -1
-		}
-		return r
-	}, s)
 }
 
 // ConfigFrom builds a Config from UI-provided strings (provider defaults to
@@ -211,15 +292,14 @@ func StripInvisible(s string) string {
 // is normalized to the API base the provider expects (the provider appends the
 // endpoint path itself), so a full endpoint URL is tolerated.
 func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
-	provider = strings.TrimSpace(StripInvisible(provider))
 	c := Config{
-		Model:   strings.TrimSpace(StripInvisible(model)),
-		BaseURL: strings.TrimRight(strings.TrimSpace(StripInvisible(baseURL)), "/"),
-		APIKey:  strings.TrimSpace(StripInvisible(apiKey)),
-		Proxy:   strings.TrimSpace(StripInvisible(proxy)),
-		Stream:  true, // 默认流式;调用方按 profile 覆盖
+		Model:   strings.TrimSpace(model),
+		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		APIKey:  strings.TrimSpace(apiKey),
+		Proxy:   strings.TrimSpace(proxy),
+		Stream:  true, // streaming by default; the caller overrides per profile
 	}
-	switch provider {
+	switch strings.TrimSpace(provider) {
 	case "openai":
 		c.Format = llm.FormatOpenAI
 		// provider appends "/chat/completions"; tolerate a full endpoint URL.
@@ -233,6 +313,16 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		c.BaseURL = strings.TrimRight(strings.TrimSuffix(c.BaseURL, "/responses"), "/")
 		if c.Model == "" {
 			c.Model = "gpt-5"
+		}
+	case "ollama":
+		c.Format = FormatOllama
+		// Ollama's OpenAI-compatible endpoint lives at /v1 and the provider
+		// appends "/chat/completions". Never leave it empty: an empty BaseURL
+		// would let the SDK fall back to OpenAI's public endpoint with this
+		// profile's request.
+		c.BaseURL = normalizeOllamaBaseURL(c.BaseURL)
+		if c.Model == "" {
+			c.Model = "llama3.2"
 		}
 	default:
 		c.Format = llm.FormatAnthropic
@@ -255,13 +345,16 @@ func isFalsy(s string) bool {
 	return false
 }
 
-// Provider returns the short provider name ("anthropic"/"openai").
+// Provider returns the short provider name
+// ("anthropic"/"openai"/"openai-responses"/"ollama").
 func (c Config) Provider() string {
 	switch c.Format {
 	case llm.FormatOpenAI:
 		return "openai"
 	case llm.FormatOpenAIResponses:
 		return "openai-responses"
+	case FormatOllama:
+		return "ollama"
 	}
 	return "anthropic"
 }
@@ -270,25 +363,45 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
 	}
+	wireFormat := c.Format
+	baseURL := c.BaseURL
+	apiKey := c.APIKey
+	// Ollama speaks OpenAI's Chat Completions on the wire. Bundle the keyless
+	// defaults here so an Ollama config can never leak toward the SDK's env-
+	// driven fallbacks: BaseURL to OpenAI's public endpoint, APIKey to
+	// OPENAI_API_KEY. A local Ollama ignores the placeholder token; a gateway
+	// that requires one carries a real key in the profile.
+	if wireFormat == FormatOllama {
+		wireFormat = llm.FormatOpenAI
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = DefaultOllamaBaseURL
+		}
+		if strings.TrimSpace(apiKey) == "" {
+			apiKey = ollamaPlaceholderKey
+		}
+	}
 	lc := llm.Config{
-		Format:     c.Format,
-		BaseURL:    c.BaseURL,
-		APIKey:     c.APIKey,
+		Format:     wireFormat,
+		BaseURL:    baseURL,
+		APIKey:     apiKey,
 		Model:      c.Model,
 		HTTPClient: client,
 	}
-	// 思考开关与强度两个字段各自透传(空 = 该字段不发送)。二者解耦:
-	// 可只发 thinking.type、只发 effort、都发、或都不发。
+	// The thinking on/off and effort fields are each passed through as-is (empty =
+	// the field is not sent). The two are decoupled: send only thinking.type, only
+	// effort, both, or neither.
 	lc.ThinkingType = c.ThinkingType
 	lc.ReasoningEffort = c.ReasoningEffort
-	// 输出上限的字段名选择(空 = 用 max_tokens)。上限的「值」不在这里:它每轮随
-	// agentcore.Options.MaxTokens 走,provider 只决定把它塞进哪个键。
+	// Field-name selection for the output cap (empty = use max_tokens). The cap's
+	// VALUE is not here: it travels per round with agentcore.Options.MaxTokens; the
+	// provider only decides which key to put it under.
 	lc.MaxTokensField = c.MaxTokensField
-	// 重试参数与 SDK 同语义(次数 0=默认/负=关闭,间隔 0=指数退避/>0=固定),原样透传。
+	// Retry params share the SDK's semantics (attempts: 0=default/negative=off;
+	// interval: 0=exponential backoff/>0=fixed), passed through verbatim.
 	lc.MaxRetries = c.Retry.ConnectAttempts
 	lc.RetryInterval = c.Retry.ConnectInterval
 	lc.EmptyResponseRetries = c.Retry.EmptyAttempts
@@ -323,7 +436,7 @@ func IsQuotaExhaustedMessage(message string) bool {
 		"exceeded your current quota", "billing_hard_limit_reached",
 		"billing hard limit", "billing_not_active", "credit balance", "insufficient credit",
 		"insufficient balance", "balance is too low", "payment required", "status 402",
-		"余额不足", "额度不足", "额度已用尽", "欠费",
+		"insufficient funds", "out of credit", "credit used up", "in arrears",
 	}
 	for _, marker := range markers {
 		if strings.Contains(message, marker) {
@@ -349,6 +462,9 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// userAgent, when non-empty, is set as the User-Agent header on every request.
+	// Empty leaves the default UA untouched. See Config.UserAgent.
+	userAgent string
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -360,6 +476,11 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
+	}
+	// Custom User-Agent: override only when configured, so an empty value keeps the
+	// underlying transport's default UA exactly as before.
+	if t.userAgent != "" {
+		req.Header.Set("User-Agent", t.userAgent)
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
 	// raw wire bodies can be persisted. This is the only layer that still sees
@@ -413,11 +534,11 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
-		transport.Proxy = nil // 留空=直连,不回退 HTTP_PROXY/HTTPS_PROXY 环境变量
+		transport.Proxy = nil // empty = direct; no fallback to the HTTP_PROXY/HTTPS_PROXY env vars
 	} else {
 		proxyURL, err := url.Parse(proxy)
 		if err != nil {
@@ -432,23 +553,47 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), userAgent: strings.TrimSpace(userAgent)}}, nil
+}
+
+// MaxUserAgentLen bounds a custom User-Agent value. Generous for real UA strings
+// while keeping a pathological value out of every outbound request.
+const MaxUserAgentLen = 256
+
+// ValidateUserAgent trims a custom User-Agent and returns the cleaned value. An
+// empty/blank input is valid and means "no override" (keep the default UA). A
+// non-empty value is rejected when it exceeds MaxUserAgentLen or contains any
+// control character (including CR/LF, which would allow header injection).
+func ValidateUserAgent(raw string) (string, error) {
+	ua := strings.TrimSpace(raw)
+	if ua == "" {
+		return "", nil
+	}
+	if len(ua) > MaxUserAgentLen {
+		return "", fmt.Errorf("user agent too long: %d bytes (max %d)", len(ua), MaxUserAgentLen)
+	}
+	for _, r := range ua {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("user agent contains a control character")
+		}
+	}
+	return ua, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a
-// connection test to the server log, so "点击测试" leaves a diagnosable trail of
+// connection test to the server log, so "click test" leaves a diagnosable trail of
 // exactly what the gateway returned — 401 bodies, quota text, empty frames — not
 // just the collapsed ok/err the UI shows. Bodies are clipped to keep a chatty
 // SSE stream from flooding the log.
 func logTestConnection(c Config, capt *llmrec.Capture) {
 	attempts := capt.Attempts()
 	if len(attempts) == 0 {
-		log.Printf("[llm-test] %s / %s @ %s — 未发出任何 HTTP 请求(配置解析或建连即失败)",
+		log.Printf("[llm-test] %s / %s @ %s — no HTTP request was ever sent (config resolution or connection setup failed)",
 			c.Provider(), c.Model, c.BaseURL)
 		return
 	}
 	for i, a := range attempts {
-		log.Printf("[llm-test] %s / %s @ %s — 尝试 %d/%d HTTP %d\n响应体: %s",
+		log.Printf("[llm-test] %s / %s @ %s — attempt %d/%d HTTP %d\nresponse body: %s",
 			c.Provider(), c.Model, c.BaseURL, i+1, len(attempts), a.Status, clipBody(a.Body))
 	}
 }
@@ -457,12 +602,17 @@ func logTestConnection(c Config, capt *llmrec.Capture) {
 // the head of an SSE stream while bounding a runaway response.
 func clipBody(s string) string {
 	s = strings.TrimSpace(s)
+	// One log record per attempt. A body that contains a newline would
+	// otherwise look like a second log line.
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
 	if s == "" {
-		return "(空)"
+		return "(empty)"
 	}
 	const max = 4096
 	if len(s) > max {
-		return s[:max] + fmt.Sprintf("…(截断,共 %d 字节)", len(s))
+		return s[:max] + fmt.Sprintf("…(truncated, %d bytes total)", len(s))
 	}
 	return s
 }
@@ -477,41 +627,51 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	// 抓取原始 wire 报文:连接测试最需要看到的就是网关到底回了什么(状态码+响应体),
-	// 而 norma 把响应解码成 StreamEvent 后这些就没了。quotaAwareTransport 会在
-	// context 里找到这个 Capture 并填入每次 HTTP 尝试的状态码与 body。
+	// Capture the raw wire messages: what a connection test most needs to see is
+	// exactly what the gateway returned (status code + response body), which is gone
+	// once norma decodes the response into StreamEvents. quotaAwareTransport finds
+	// this Capture on the context and fills in each HTTP attempt's status and body.
 	ctx, capt := llmrec.NewCapture(ctx)
 	defer logTestConnection(c, capt)
-	// 连接测试是一条单发路径,不经过 agentcore 的会话循环,因此没人往 context 上挂
-	// session id。对配了 SessionHeaderKey 的端点(如 opencode zen 强制要求
-	// x-opencode-session 头,缺了直接 400 MissingSessionID),这会导致"对话正常、
-	// 点击测试却 400"的落差。这里补挂一个一次性随机 session id,让测试与真实对话走同
-	// 一套发头逻辑;未配 SessionHeaderKey 的端点不读它,无副作用。
+	// A connection test is a one-shot path that bypasses agentcore's session loop, so
+	// nobody attaches a session id to the context. For endpoints configured with a
+	// SessionHeaderKey (e.g. opencode zen mandates the x-opencode-session header and
+	// rejects with 400 MissingSessionID without it), this caused the "conversations
+	// work, but clicking test gives a 400" discrepancy. Here we attach a one-time
+	// random session id so the test uses the exact same header logic as a real
+	// conversation; endpoints without a SessionHeaderKey don't read it, no side
+	// effects.
 	ctx = transcript.WithSessionID(ctx, "conntest-"+transcript.NewSessionID())
 	start := time.Now()
-	// MaxTokens 要给足：推理模型(如 deepseek-v4-pro)在给出答案前会先产出一大段
-	// 思考(实测对一句 "ping" 也能烧 ~2900 token)。若只给 32,模型会一直卡在"思考阶段"
-	// 就撞到输出上限(finish=length)、被截断,连接测试虽仍算通(err=nil)但显示成
-	// "已中断/length/resume" 一团糟。给足预算让它把 OK 干净吐完(finish=stop)。
-	// EscalateMaxTokens 保持 false:不因截断而抬额重试,避免 resume 循环空烧。
+	// MaxTokens must be generous: reasoning models (e.g. deepseek-v4-pro) emit a long
+	// stretch of thinking before answering (measured ~2900 tokens even for a one-word
+	// "ping"). Given only 32, the model stays stuck "thinking" until it hits the
+	// output cap (finish=length) and gets truncated — the connection test still passes
+	// (err=nil) but shows as a messy "interrupted/length/resume". Give it enough
+	// budget to emit OK cleanly (finish=stop).
+	// EscalateMaxTokens stays false: don't raise the cap and retry on truncation, to
+	// avoid burning tokens in a resume loop.
 	reply, err := agentcore.Run(ctx, agentcore.Options{
 		Provider:       prov,
-		SystemPrompt:   []string{"你是连接测试。直接输出两个字符 OK 即可，不要思考、不要解释、不要别的。"},
+		SystemPrompt:   []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
+		Tools:          []actool.CoreTool{}, // not nil: nil means the SDK's unconfined file and shell tools
 		PermissionMode: acperm.ModeBypass,
 		MaxTurns:       1,
 		MaxTokens:      8192,
-		NonStreaming:   !c.Stream, // 用该 profile 的真实收发模式做连接测试
+		NonStreaming:   !c.Stream, // use this profile's real send/receive mode for the connection test
 	}, "ping")
 	lat := time.Since(start)
 	if err != nil {
 		return lat, "", err
 	}
-	// err==nil 还不够：请求通了但模型一个字都不吐的情况真实存在(思考把预算烧光、
-	// 正文被安全策略吞掉、兼容层把 content 丢了)。这种配置在会话里就是"不回话",
-	// 测试却报成功——正是本项要消除的落差。没有可见正文一律判失败。
+	// err==nil is not enough: requests that go through while the model emits nothing
+	// at all really happen (thinking burned the whole budget, the body got swallowed
+	// by a safety policy, a compatibility layer dropped the content). Such a config
+	// means "no replies" in conversations, yet the test would report success — exactly
+	// the discrepancy this check eliminates. No visible body = fail.
 	reply = strings.TrimSpace(reply)
 	if reply == "" {
-		return lat, "", fmt.Errorf("模型无回复内容（请求已通，但未返回任何文本）")
+		return lat, "", fmt.Errorf("the model returned no content (the request went through, but no text was returned)")
 	}
 	return lat, reply, nil
 }

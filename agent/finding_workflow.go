@@ -3,47 +3,161 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-const findingIDGuidance = "\n\n**漏洞编号约定**：finding_id 是独立漏洞记录 ID；finding_node_id 是探索节点 ID。list_findings / list_task_findings / node_detail / get_task_node_detail 的 id 保留为探索节点 ID，应从同一返回的 finding_id 读取独立编号。get_finding_traffic / bind_finding_traffic 用独立 finding_id。旧 update_finding_report 的 finding_id 参数仍传 finding_node_id。不要把 report_finding 第一行的数字用于证据工具，也不要遇到编号错误后猜测其他数字。"
+const findingIDGuidance = "\n\n**Finding ID conventions**: finding_id is the standalone vulnerability record ID; finding_node_id is the exploration node ID. The id returned by list_findings / list_task_findings / node_detail / get_task_node_detail remains the exploration node ID; read the standalone ID from the finding_id in the same response. get_finding_traffic / bind_finding_traffic use the standalone finding_id. The legacy update_finding_report's finding_id parameter still takes finding_node_id. Do not feed the number on the first line of report_finding to the evidence tools, and do not guess other numbers after an ID error."
 
 // The server supplies the persisted setting. A missing setting/host is off.
 // Consulted at assembly and again on writes so an already-running session
 // cannot keep binding after the user switches the feature off.
-var FindingTrafficBindingEnabled func() bool
+// Note: when finding traffic binding is disabled in configuration, findings
+// remain saved and visible but cannot close a goal via prove_goal unless
+// traffic is bound manually later (non-HTTP goals still close via an observed
+// tool_output fact).
+// Guarded by a lock for the same reason as the tool hooks.
+var (
+	findingTrafficBindingMu   sync.RWMutex
+	findingTrafficBindingHook func() bool
+)
+
+// SetFindingTrafficBindingEnabled installs (or, with nil, removes) the hook.
+func SetFindingTrafficBindingEnabled(f func() bool) {
+	findingTrafficBindingMu.Lock()
+	findingTrafficBindingHook = f
+	findingTrafficBindingMu.Unlock()
+}
+
+// FindingTrafficBindingEnabled returns the current hook, or nil when none is set.
+func FindingTrafficBindingEnabled() func() bool {
+	findingTrafficBindingMu.RLock()
+	defer findingTrafficBindingMu.RUnlock()
+	return findingTrafficBindingHook
+}
 
 func findingTrafficBindingEnabled() bool {
-	return FindingTrafficBindingEnabled != nil && FindingTrafficBindingEnabled()
+	f := FindingTrafficBindingEnabled()
+	return f != nil && f()
+}
+
+var (
+	trafficCaptureMu   sync.RWMutex
+	trafficCaptureHook func() bool
+)
+
+// SetTrafficCaptureEnabled installs (or, with nil, removes) the hook that
+// reports whether the server's global traffic capture switch is currently on.
+func SetTrafficCaptureEnabled(f func() bool) {
+	trafficCaptureMu.Lock()
+	trafficCaptureHook = f
+	trafficCaptureMu.Unlock()
+}
+
+// TrafficCaptureEnabled returns the current hook, or nil when none is set.
+func TrafficCaptureEnabled() func() bool {
+	trafficCaptureMu.RLock()
+	defer trafficCaptureMu.RUnlock()
+	return trafficCaptureHook
+}
+
+func trafficCaptureExplicitlyOff() bool {
+	f := TrafficCaptureEnabled()
+	return f != nil && !f()
+}
+
+const (
+	trafficCaptureOffProveGoalNote     = "\nNote: traffic capture is currently OFF on this server, so no HTTP traffic is being recorded and findings cannot be bound to captured traffic to prove HTTP goals. Recorded findings stay visible, and non-HTTP goals can still be proved with an observed tool_output fact; enable traffic capture in System settings to make HTTP findings provable."
+	trafficCaptureOffReportFindingNote = "\nNote: traffic capture is currently OFF on this server, so no HTTP traffic is being recorded. Findings still save with textual/command evidence, but cannot prove goals via prove_goal until traffic capture is enabled in System settings and verified traffic is bound."
+)
+
+func trafficCaptureOffToolNote(toolName string, captureOff bool) string {
+	if !captureOff {
+		return ""
+	}
+	switch toolName {
+	case "prove_goal":
+		return trafficCaptureOffProveGoalNote
+	case "report_finding":
+		return trafficCaptureOffReportFindingNote
+	default:
+		return ""
+	}
+}
+
+// Automatic traffic binding off is a DIFFERENT switch from capture off: capture
+// can be on while binding is off, and then the disabled branch below strips
+// bind_finding_traffic and every traffic parameter from the schemas while the
+// tool descriptions keep promising the binding path. An agent then chases a tool
+// that is not in its toolset (observed: "the tool bind_finding_traffic must be
+// invoked as a tool", a bare Bash true, then grepping the transcripts and the
+// binary). These notes ride on the tool descriptions, exactly like the capture
+// notes above, so the standing guidance stays empty when the feature is off.
+const (
+	findingBindingOffProveGoalNote     = "\nNote: automatic traffic binding is OFF on this server, so a finding cannot be bound to captured traffic here and cannot close an HTTP goal. Recorded findings stay visible; non-HTTP goals still close with an observed tool_output fact. An operator can enable binding (System settings) or bind captured traffic manually on the finding page, after which a bound finding closes the goal."
+	findingBindingOffReportFindingNote = "\nNote: automatic traffic binding is OFF on this server, so report_finding carries no traffic parameters and the bind_finding_traffic tool is not in your toolset. Findings still save with their evidence, but stay unverified and cannot prove a goal. Register a reproducible PoC in evidence as usual; do not guess traffic IDs and do not re-probe only to capture packets."
+	findingBindingOffHintNote          = "\nNote: automatic traffic binding is OFF on this server, so hint traffic parameters are not in this schema. Keep the verified evidence and the known real traffic IDs in the hint text; the receiving task registers the finding and the operator can bind captured traffic later."
+)
+
+func findingBindingOffToolNote(toolName string) string {
+	switch toolName {
+	case "prove_goal":
+		return findingBindingOffProveGoalNote
+	case "report_finding":
+		return findingBindingOffReportFindingNote
+	case "add_hint", "add_task_hint":
+		return findingBindingOffHintNote
+	default:
+		return ""
+	}
 }
 
 // Applied after ToolResolve: user descriptions and prompts remain intact, while
 // all actual reporters (including Planner and custom chat agents) see the same
 // API contract. Disabled/unbound tools are never reintroduced here.
 func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.CoreTool, string) {
+	captureOff := trafficCaptureExplicitlyOff()
 	if !findingTrafficBindingEnabled() {
 		out := make([]actool.CoreTool, 0, len(tools))
 		for _, tool := range tools {
 			if tool.Name() == "bind_finding_traffic" {
 				continue
 			}
-			if agentKey == "reporter" && (tool.Name() == "traffic_search" || tool.Name() == "traffic_get" || tool.Name() == "traffic_blob") {
+			if agentKey == "reporter" && (tool.Name() == "traffic_search" || tool.Name() == "traffic_get" || tool.Name() == "traffic_blob" || tool.Name() == "traffic_messages") {
 				continue
 			}
+			desc := tool.Description()
+			schema := tool.InputSchema()
+			decorated := false
 			switch tool.Name() {
 			case "report_finding", "add_hint", "add_task_hint":
 				// Work on a copy: toggling back on must restore the original schema.
 				raw, _ := json.Marshal(tool.InputSchema())
-				var schema map[string]any
-				if json.Unmarshal(raw, &schema) == nil {
-					stripTrafficParameters(schema)
-					tool = DecorateTool(tool, tool.Description(), schema)
+				var s map[string]any
+				if json.Unmarshal(raw, &s) == nil {
+					stripTrafficParameters(s)
+					schema = s
+					decorated = true
 				}
+			}
+			if note := trafficCaptureOffToolNote(tool.Name(), captureOff); note != "" {
+				desc += note
+				decorated = true
+			}
+			if note := findingBindingOffToolNote(tool.Name()); note != "" {
+				desc += note
+				decorated = true
+			}
+			if decorated {
+				tool = DecorateTool(tool, desc, schema)
 			}
 			out = append(out, tool)
 		}
+		// The standing guidance stays empty: the binding-off notes ride on the
+		// tool descriptions, so a disabled deployment keeps the same contract the
+		// PG test asserts (def.FindingGuidance == "").
 		return out, ""
 	}
 	out := append([]actool.CoreTool(nil), tools...)
@@ -53,11 +167,14 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 		note := ""
 		switch tool.Name() {
 		case "report_finding":
-			note = "\n默认由报告 Agent 在编写报告前核对并绑定流量。上报者在 evidence 中保留验证命令、关键输出、已有的真实流量 ID 及其用途，供报告 Agent 对照执行记录核实；无需为绑定额外查包。兼容显式即时绑定：traffic_refs 或 evidence_hint_id 可提交已核实的引用，后者读取本任务指定 hint 的结构化引用；任一无效则本次上报全部失败。TCP/无包不需要这些可选参数。返回 finding_id 与 finding_node_id 分别表示独立记录和探索节点。"
+			note = "\nBy default the report agent verifies and binds traffic before writing the report. The reporter keeps verification commands, key output, any known real traffic IDs and their purpose in evidence, so the report agent can check them against the execution records; no extra packet capture is needed for binding. Explicit immediate binding is still supported: traffic_refs or evidence_hint_id may submit already-verified references, the latter reading the structured references of the given hint in this task; if either is invalid the whole report fails. A finding without bound traffic stays recorded and visible, but cannot close a goal via prove_goal until verified traffic matching its asset host is bound (non-HTTP goals close via an observed tool_output fact). The returned finding_id and finding_node_id denote the standalone record and the exploration node respectively."
 		case "add_hint", "add_task_hint":
-			note = "\n交接已确认漏洞时，在对应提示的 traffic_refs 中保留已核实流量的 ID、用途、说明和顺序（单条放顶层，批量放对应 hints 元素），并在 text 中说明它证明的具体漏洞。调用方不能只交接文字而丢弃已有流量引用。未核实的候选不能作为证据传递。"
+			note = "\nWhen handing off a confirmed vulnerability, keep the verified traffic's IDs, purpose, notes, and order in the corresponding hint's traffic_refs (top-level for a single hint, inside the corresponding hints element for a batch), and state in text exactly which vulnerability it proves. The caller must not hand off only text while dropping existing traffic references. Unverified candidates must not be passed as evidence."
 		case "get_finding_traffic", "bind_finding_traffic", "list_findings", "list_task_findings", "node_detail", "get_task_node_detail", "update_finding_report":
 			note = findingIDGuidance
+		}
+		if capNote := trafficCaptureOffToolNote(tool.Name(), captureOff); capNote != "" {
+			note += capNote
 		}
 		if note != "" {
 			out[i] = DecorateTool(tool, tool.Description()+note, tool.InputSchema())
@@ -65,16 +182,19 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 	}
 	guidance := ""
 	if has["report_finding"] || has["add_task_hint"] || has["add_hint"] {
-		guidance = "\n\n**流量证据交接（可选）**：自动绑定默认由报告 Agent 在漏洞入库后、编写报告前完成。上报者应在 evidence 保留验证命令、关键输出、已有真实流量 ID 及其用途，任务中带 intent_id，便于报告 Agent 追溯；不必为了绑定额外查包。Auto / Planner 代为上报时不要丢弃执行者已有的引用。add_hint / add_task_hint 可用 traffic_refs 交接；显式即时绑定仍兼容 report_finding 的 traffic_refs / evidence_hint_id。TCP 或无包时正常登记，不能猜测 ID，也不能仅为补包重复探测。"
+		guidance = "\n\n**Traffic evidence handoff (optional)**: automatic binding is done by default by the report agent after the vulnerability is stored and before the report is written. Reporters should keep verification commands, key output, known real traffic IDs and their purpose in evidence, with the intent_id in the task, so the report agent can trace them; no extra packet capture is needed for binding. When Auto / Planner reports on someone's behalf, do not drop the executor's existing references. add_hint / add_task_hint can hand off via traffic_refs; explicit immediate binding via report_finding's traffic_refs / evidence_hint_id is still supported. For TCP or no-capture cases, register normally — do not guess IDs, and do not re-probe just to capture packets."
 		if has["add_task_hint"] && !has["add_hint"] {
-			guidance += "\n平台对话没有任务上下文时，不直接调用 report_finding；通过 add_task_hint 向已有对应任务交接，由任务 Agent 登记，并用 list_task_findings 核对结果。"
+			guidance += "\nWhen a platform conversation has no task context, do not call report_finding directly; hand off via add_task_hint to the existing corresponding task, let the task agent register it, and verify the result with list_task_findings."
 		}
 		if has["prove_goal"] || has["goal_met"] {
-			guidance += "\n判定目标完成前，先完成本次已有证据的上报/交接。不要在证据交接尚未完成时仅因文字漏洞已登记就结束任务、取消 Worker；无包不要求等待或强行抓包。"
+			guidance += "\nBefore judging a goal complete, finish reporting/handing off the evidence at hand. A finding only closes a goal via prove_goal once it has at least one server-verified bound traffic_ref matching its asset host (an unbound finding stays recorded and visible, and non-HTTP goals close via an observed tool_output fact). Do not end the task or cancel Workers while evidence binding is still pending."
 		}
 	}
 	if has["update_finding_report"] && has["bind_finding_traffic"] && has["get_finding_traffic"] {
-		guidance += "\n\n**报告前自动关联流量（已开启）**：你负责为本次触发的漏洞核对并绑定流量，再撰写报告。先从 report_finding 返回 JSON 或 get_task_node_detail / list_task_findings 取得明确的 finding_id 与 finding_node_id。读取漏洞详情、对应意图的执行记录及已有证据清单，优先使用上报者交接的真实 ID。若本次验证为 HTTP 且流量工具可用，用 traffic_search 筛选候选，再用 traffic_get 逐条核实请求/响应确实支持该漏洞；域名和时间只用于筛选，不证明归属。将确认的证据按复现顺序用 bind_finding_traffic(finding_id, traffic_refs) 关联，选择 baseline / proof / verification / supporting 并说明用途。只能操作本次漏洞，不重复创建漏洞或重新探测目标。绑定成功后重新调用 get_finding_traffic 获取最新 version，读取所需正文，再将实际读取的 version 作为 evidence_version 传给 update_finding_report（其 finding_id 参数仍用 finding_node_id）。已有绑定不必重复追加。TCP、未采集、工具不可用或没有确切匹配时，跳过自动绑定，依据文字/命令证据正常写报告并说明原因，不得为凑齐流量而猜测。绑定失败不宣称成功；保留已有证据并在报告说明未绑定原因。"
+		guidance += "\n\n**Auto-link traffic before reporting (enabled)**: you are responsible for verifying and binding traffic for the vulnerability that triggered this run, then writing the report. First obtain the unambiguous finding_id and finding_node_id from the report_finding return JSON or get_task_node_detail / list_task_findings. Read the vulnerability details, the corresponding intent's execution records, and the existing evidence list, preferring the real IDs handed off by the reporter. If this verification is HTTP and the traffic tools are available, use traffic_search to filter candidates, then traffic_get to verify item by item that the request/response truly supports the vulnerability; domains and times are only for filtering and do not prove attribution. Bind the confirmed evidence in reproduction order via bind_finding_traffic(finding_id, traffic_refs), choosing baseline / proof / verification / supporting and stating the purpose. Operate only on this vulnerability — do not recreate vulnerabilities or re-probe the target. After a successful bind, call get_finding_traffic again for the latest version, read the bodies you need, then pass the version you actually read as evidence_version to update_finding_report (whose finding_id parameter still takes finding_node_id). Do not re-append existing bindings. For TCP, no-capture, unavailable tools, or no exact match, skip auto-binding, write the report from textual/command evidence with the reason stated, and never guess to force traffic in. Do not claim success when binding fails; keep the existing evidence and explain in the report why nothing was bound."
+	}
+	if has["update_finding_report"] {
+		guidance += findingVerificationGuidance
 	}
 	if guidance != "" || has["get_finding_traffic"] || has["update_finding_report"] {
 		guidance += findingIDGuidance
@@ -104,7 +224,7 @@ func stripTrafficParameters(schema map[string]any) {
 
 // HintTrafficSchema is shared by the task-local and cross-task hint tools.
 func HintTrafficSchema() map[string]any {
-	return map[string]any{"type": "array", "description": "可选：已核实且对应本提示中具体漏洞的流量引用，保留顺序；交接后 report_finding 可传 evidence_hint_id 携带这些引用。", "items": obj(map[string]any{"traffic_id": str("真实流量 ID"), "role": str("baseline / proof / verification / supporting"), "note": str("该流量支持什么结论")}, "traffic_id")}
+	return map[string]any{"type": "array", "description": "Optional: verified traffic references corresponding to the specific vulnerability in this hint, order preserved; after handoff, report_finding can carry these references via evidence_hint_id.", "items": obj(map[string]any{"traffic_id": str("real traffic ID"), "role": str("baseline / proof / verification / supporting"), "note": str("which conclusion this traffic supports")}, "traffic_id")}
 }
 
 func (t *ToolSet) findingRefsFromHint(hintID int64, explicit []db.TrafficRef) ([]db.TrafficRef, error) {
@@ -116,7 +236,7 @@ func (t *ToolSet) findingRefsFromHint(hintID int64, explicit []db.TrafficRef) ([
 		return nil, err
 	}
 	if n == nil || n.Kind != db.KindHint {
-		return nil, fmt.Errorf("evidence_hint_id=%d 必须是本任务的提示节点（继承提示不可直接用于绑定）", hintID)
+		return nil, fmt.Errorf("evidence_hint_id=%d must be a hint node of this task (inherited hints cannot be bound directly)", hintID)
 	}
 	var payload struct {
 		Refs []db.TrafficRef `json:"traffic_refs"`
@@ -126,3 +246,8 @@ func (t *ToolSet) findingRefsFromHint(hintID int64, explicit []db.TrafficRef) ([
 	}
 	return db.NormalizeTrafficRefs(append(append([]db.TrafficRef{}, explicit...), payload.Refs...))
 }
+
+// findingVerificationGuidance tells the report writer how to declare proof
+// (S1). The server downgrades any finding whose declaration does not hold up,
+// so the agent must never state a level or quote it cannot read in the bound body.
+const findingVerificationGuidance = "\n\n**Verification (S1)**: when you call update_finding_report, also declare poe_level (0-4) and evidence_quotes. poe_level 1 = error, timing or response variation; 2 = structural manipulation (boolean, UNION, parser difference); 3 = actual data extracted; 4 = critical impact (admin credentials, code execution). L3 is the minimum for a verified finding. evidence_quotes must be exact lines copied from a bound proof or verification response body (read it with get_finding_traffic first), never from memory or from the report text; the server checks each quote verbatim after whitespace normalization. If you cannot quote the proof, omit the quotes: the finding then stays unverified, which is acceptable. Do not raise poe_level to get a verified status."

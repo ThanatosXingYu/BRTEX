@@ -18,10 +18,9 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { sidebarItems } from "@/navigation/sidebar/sidebar-items";
 import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
 
+import { CompanySwitcher } from "./company-switcher";
 import { NavMain } from "./nav-main";
 import { NavUser } from "./nav-user";
-import { SidebarSupportCard } from "./sidebar-support-card";
-
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const currentUser = useCurrentUser();
@@ -44,12 +43,16 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             <SidebarMenuButton asChild>
               <Link prefetch={false} href="/function/tasks">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/logo.png" alt="ARTEX" width={40} height={40} className="shrink-0" />
+                <picture className="contents">
+                  <source srcSet="/logo.webp" type="image/webp" />
+                  <img src="/logo.png" alt="ARTEX" width={40} height={40} className="shrink-0" />
+                </picture>
                 <span className="font-semibold text-base">{APP_CONFIG.name}</span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
+        <CompanySwitcher />
       </SidebarHeader>
       <SidebarContent>
         <NavMain items={sidebarItems} />

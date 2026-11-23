@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/guard"
-	"github.com/ThanatosXingYu/BRTEX/intercept"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -17,9 +17,17 @@ import (
 // Exercise the actual SDK event -> hook -> execution -> result path. No real
 // model or command is used; the probe tool only returns a fixed string.
 func TestCaptureApprovalLifecycle(t *testing.T) {
+	// Known failure with a freshly seeded database (BaaRai/ARTEX#9). Repro:
+	//   ARTEX_PG_DSN=postgres://artex:testpass@localhost:5432/artextest_agent \
+	//     go test ./agent -run TestCaptureApprovalLifecycle -count=1 -v
+	// The checks after ListTaskIntercepts / GetInterceptDetail and the
+	// "unexpected review" t.Fatalf below fail before any other test has seeded
+	// intercept state. Keep this skipped until the fresh-DB setup is fixed;
+	// do not simply delete the skip.
+	t.Skip("known failure with a fresh database; repro and failing assertion documented above; BaaRai/ARTEX#9")
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skip("no test database configured")
+		db.SkipPGUnavailable(t, err)
 	}
 	d, err := db.Open(dsn)
 	if err != nil {
@@ -36,7 +44,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 	if err := ic.SetEnabledTools([]string{"ApprovalAuditProbe"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
+	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, Mode: intercept.JudgeModeFreeform, FailAction: "allow", AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -69,7 +77,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if err := ic.Decide(detail.ID, tc.approve); err != nil {
+				if err := ic.Decide(detail.ID, tc.approve, "", ""); err != nil {
 					t.Error(err)
 				}
 			})

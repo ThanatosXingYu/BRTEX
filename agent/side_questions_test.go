@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/sidequestion"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/sidequestion"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -59,7 +59,11 @@ func TestSideActualChatCheckpointToolResultAndTranscriptIsolation(t *testing.T) 
 	for _, streaming := range []bool{false, true} {
 		t.Run(map[bool]string{true: "stream", false: "atomic"}[streaming], func(t *testing.T) {
 			dir := t.TempDir()
-			file := filepath.Join(dir, "asset.txt")
+			// Inside the chat's session working directory: the file tools reach nothing else.
+			file := filepath.Join(dir, "sessions", "conv-987654", "asset.txt")
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
 			if err := os.WriteFile(file, []byte("controlled-homepage-result"), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -104,7 +108,7 @@ func TestSideActualChatCheckpointToolResultAndTranscriptIsolation(t *testing.T) 
 			p.calls = 0
 			p.path = filepath.Join(dir, "nonexistent")
 			answer, err := (sidequestion.SideQuestionService{Provider: bound}).Answer(t.Context(), req, streaming, nil)
-			if err != nil || !answer.ToolUse || p.calls != 1 || !strings.Contains(answer.Text, "不能执行工具") {
+			if err != nil || !answer.ToolUse || p.calls != 1 || !strings.Contains(answer.Text, "cannot execute tool") {
 				t.Fatalf("tool denial %+v %v", answer, err)
 			}
 			after, err := os.ReadFile(store.MainPath("conv-987654"))

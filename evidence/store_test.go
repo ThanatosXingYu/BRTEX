@@ -8,14 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/traffic/rewrite"
 )
 
 func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
@@ -329,5 +336,164 @@ func TestEvidenceGCGraceAndActiveRestore(t *testing.T) {
 	bad.URL = "http://tampered.local/"
 	if err = s.InstallSnapshots(ctx, []db.TrafficEvidenceSnapshot{bad}, archive); err == nil {
 		t.Fatal("accepted tampered snapshot")
+	}
+}
+
+func startRewriteProxy(t *testing.T, dir string) (*traffic.Traffic, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	tr, err := traffic.Open(dir, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = tr.Start() }()
+	t.Cleanup(func() { _ = tr.Close() })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("proxy did not listen on %s: %v", addr, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return tr, "http://" + addr
+}
+
+func TestEvidenceBindingRewrittenExchange(t *testing.T) {
+	dsn := os.Getenv("ARTEX_PG_DSN")
+	if dsn == "" {
+		t.Skip("ARTEX_PG_DSN is required for evidence integration tests")
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pg.Close() })
+	task, err := pg.CreateTask("evidence rewrite "+t.Name(), "rewrite provenance", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pg.DeleteFindingsByTask(task.ID); pg.DeleteTask(task.ID) })
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "upstream response")
+	}))
+	t.Cleanup(target.Close)
+
+	dir := t.TempDir()
+	tr, proxyURL := startRewriteProxy(t, filepath.Join(dir, "traffic"))
+
+	// Rules 5 (request) and 2 (response) apply to /rewritten; rule 9 only matches
+	// /never-matches so it is skipped. Neither applies to /plain.
+	set := rewrite.Compile([]rewrite.Rule{
+		{
+			ID: 5, Name: "req-header", Enabled: true, Phase: rewrite.PhaseRequest,
+			Matchers: rewrite.Matchers{URLRegex: "^/rewritten$"},
+			Actions:  []rewrite.Action{{Type: rewrite.ActionSetHeader, Name: "X-Injected", Value: "yes"}},
+		},
+		{
+			ID: 2, Name: "resp-header", Enabled: true, Phase: rewrite.PhaseResponse,
+			Matchers: rewrite.Matchers{URLRegex: "^/rewritten$"},
+			Actions:  []rewrite.Action{{Type: rewrite.ActionSetHeader, Name: "X-Resp-Tag", Value: "1"}},
+		},
+		{
+			ID: 9, Name: "skipped-rule", Enabled: true, Phase: rewrite.PhaseRequest,
+			Matchers: rewrite.Matchers{URLRegex: "^/never-matches$"},
+			Actions:  []rewrite.Action{{Type: rewrite.ActionSetHeader, Name: "X-Skipped", Value: "1"}},
+		},
+	}, rewrite.Options{})
+	if len(set.LoadErrors()) != 0 {
+		t.Fatalf("rewrite rule load errors: %v", set.LoadErrors())
+	}
+	tr.SetRewriteRules(set)
+
+	pu, err := url.Parse(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(pu)}}
+	for _, path := range []string{"/rewritten", "/plain"} {
+		req, err := http.NewRequest(http.MethodGet, target.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+
+	exchangeID := func(suffix string) string {
+		var id string
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			err := tr.DB().QueryRow(`SELECT id FROM exchanges WHERE url LIKE ?`, "%"+suffix).Scan(&id)
+			if err == nil {
+				return id
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("exchange %s not recorded: %v", suffix, err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	rewrittenID := exchangeID("/rewritten")
+	plainID := exchangeID("/plain")
+
+	store := New(pg, tr, filepath.Join(dir, "evidence"))
+	in := db.RecordFindingInput{
+		TaskID: task.ID, ExplorationID: task.ExplorationID, Worker: "test",
+		VulnClass: "TEST", Name: "Rewrite provenance", Severity: "low", Summary: "proxy rewrite test",
+	}
+	ctx := context.Background()
+	rec, err := store.Record(ctx, in, []db.TrafficRef{
+		{TrafficID: rewrittenID, Role: "proof", Note: "rewritten"},
+		{TrafficID: plainID, Role: "baseline", Note: "plain"},
+	})
+	if err != nil {
+		t.Fatalf("store.Record: %v", err)
+	}
+	if len(rec.Traffic.Bindings) != 2 {
+		t.Fatalf("bindings = %d, want 2", len(rec.Traffic.Bindings))
+	}
+
+	rewSnap := rec.Traffic.Bindings[0].Snapshot
+	if !rewSnap.Rewritten {
+		t.Fatalf("rewritten snapshot has Rewritten=false, want true")
+	}
+	if !slices.Equal(rewSnap.RewriteRuleIDs, []int64{2, 5}) {
+		t.Fatalf("rewritten snapshot rule IDs = %v, want [2 5]", rewSnap.RewriteRuleIDs)
+	}
+	// Content-addressed ID must exclude the rewrite flag and rule IDs.
+	stripped := rewSnap
+	stripped.Rewritten = false
+	stripped.RewriteRuleIDs = nil
+	if gotID := db.TrafficSnapshotID(stripped); gotID != rewSnap.ID {
+		t.Fatalf("snapshot ID depended on rewrite flag: stripped=%s stored=%s", gotID, rewSnap.ID)
+	}
+
+	plainSnap := rec.Traffic.Bindings[1].Snapshot
+	if plainSnap.Rewritten || len(plainSnap.RewriteRuleIDs) != 0 {
+		t.Fatalf("plain snapshot = rewritten:%v ids:%v, want false/empty", plainSnap.Rewritten, plainSnap.RewriteRuleIDs)
+	}
+
+	// Verify RewriteInfo errors fail preparation instead of recording a silent false.
+	if _, err := tr.DB().Exec(`DROP TABLE exchange_rewrites`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.prepare(ctx, []db.TrafficRef{{TrafficID: plainID, Role: "proof"}}); err == nil || !strings.Contains(err.Error(), "rewrite provenance") {
+		t.Fatalf("prepare with broken exchange_rewrites = %v, want rewrite provenance error", err)
 	}
 }

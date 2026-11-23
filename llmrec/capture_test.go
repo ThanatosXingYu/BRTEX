@@ -95,6 +95,30 @@ func TestCaptureRetriedAttemptsAreAllKept(t *testing.T) {
 	}
 }
 
+func TestCaptureCapsAttemptBodyAndCount(t *testing.T) {
+	_, c := NewCapture(context.Background())
+	payload := strings.Repeat("a", maxAttemptBody+4096)
+	body := c.TeeResponse(200, io.NopCloser(strings.NewReader(payload)))
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != len(payload) {
+		t.Fatalf("tee truncated the caller stream: %d want %d", len(got), len(payload))
+	}
+	if n := len(c.RawResponse()); n != maxAttemptBody {
+		t.Fatalf("captured %d bytes, want cap %d", n, maxAttemptBody)
+	}
+
+	for i := 1; i < maxCaptureAttempts+3; i++ {
+		rc := c.TeeResponse(200, io.NopCloser(strings.NewReader("x")))
+		_, _ = io.ReadAll(rc)
+	}
+	if n := len(c.Attempts()); n != maxCaptureAttempts {
+		t.Fatalf("attempts %d, want %d", n, maxCaptureAttempts)
+	}
+}
+
 func TestCaptureEmptyWhenNoHTTPHappened(t *testing.T) {
 	_, c := NewCapture(context.Background())
 	if c.RawRequest() != "" || c.RawResponse() != "" {

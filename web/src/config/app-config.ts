@@ -1,5 +1,7 @@
 import packageJson from "../../package.json";
 
+import { t } from "@/i18n";
+
 const currentYear = new Date().getFullYear();
 
 export const APP_CONFIG = {
@@ -7,7 +9,7 @@ export const APP_CONFIG = {
   version: packageJson.version,
   copyright: `© ${currentYear}, ARTEX.`,
   meta: {
-    title: "ARTEX — 自主渗透测试控制台",
-    description: "LLM 驱动的自主渗透测试系统控制台",
+    title: t("ARTEX — Autonomous Penetration Testing Console"),
+    description: t("Console for the LLM-driven autonomous penetration testing system"),
   },
 };

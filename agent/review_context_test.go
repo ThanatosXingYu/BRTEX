@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/guard"
-	"github.com/ThanatosXingYu/BRTEX/intercept"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/tool"
 )
@@ -19,14 +19,14 @@ import (
 func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skip("no test database configured")
+		db.SkipPGUnavailable(t, err)
 	}
 	d, err := db.Open(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
-	expID, err := d.CreateExploration("只操作隔离测试目录", "验证创建和清理")
+	expID, err := d.CreateExploration("only operate in the isolated test directory", "verify creation and cleanup")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	if err := ic.SetEnabledTools([]string{probeName}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true}); err != nil {
+	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, Mode: intercept.JudgeModeFreeform}); err != nil {
 		t.Fatal(err)
 	}
 	var inputs []intercept.ReviewInput
@@ -79,14 +79,14 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	probe := tool.Build(tool.Spec{Name: probeName, Schema: map[string]any{"type": "object"},
 		Run: func(context.Context, json.RawMessage, *tool.ToolContext) (tool.Result, error) {
 			executions++
-			_, err := ts.AddConstraint("deny", "禁止后续清理", "human")
+			_, err := ts.AddConstraint("deny", "no further cleanup allowed", "human")
 			return tool.Text("Created a new fixture; no existing file overwritten."), err
 		},
 	})
 	workDir := t.TempDir()
 	ctx := intercept.WithTaskContext(t.Context(), taskID, "test-agent", nil)
 	ctx = intercept.WithReviewContext(ctx, "/parent", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: "PARENT_BACKGROUND_SENTINEL"})
-	intentPayload := map[string]any{"summary": "创建并清理", "extra": "FULL_INTENT_SENTINEL"}
+	intentPayload := map[string]any{"summary": "create and clean up", "extra": "FULL_INTENT_SENTINEL"}
 	intentID, err := ts.AddNode("intent", intentPayload, 0, "running", "planner", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +107,7 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 			t.Fatalf("unexpected Worker background: %+v", in)
 		}
 		raw, _ := json.Marshal(in)
-		for _, forbidden := range []string{"创建并清理", "PARENT_BACKGROUND_SENTINEL", `"background"`, "只操作隔离测试目录", "验证创建和清理", "禁止后续清理", "FULL_INTENT_SENTINEL", "全局探索态势", `"task_id"`, `"task"`, `"turn_input"`, `"worker_intent"`, `"history"`, `"history_truncated"`, `"correlation"`, "Created a new fixture"} {
+		for _, forbidden := range []string{"create and clean up", "PARENT_BACKGROUND_SENTINEL", `"background"`, "only operate in the isolated test directory", "verify creation and cleanup", "no further cleanup allowed", "FULL_INTENT_SENTINEL", "Global exploration overview", `"task_id"`, `"task"`, `"turn_input"`, `"worker_intent"`, `"history"`, `"history_truncated"`, `"correlation"`, "Created a new fixture"} {
 			if strings.Contains(string(raw), forbidden) {
 				t.Fatalf("unexpected review data: %s", forbidden)
 			}

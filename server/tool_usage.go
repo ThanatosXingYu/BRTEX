@@ -7,8 +7,8 @@ import (
 
 	actool "github.com/Autumn-27/norma/tool"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 )
 
 type toolUsageRecorder interface {
@@ -31,6 +31,14 @@ func meterTool(t actool.CoreTool, recorder toolUsageRecorder, toolKey, agentKey 
 		return t
 	}
 	return &meteredTool{CoreTool: t, recorder: recorder, toolKey: toolKey, agentKey: agentKey, ri: ri}
+}
+
+// AcceptsRawInput forwards the resolved tool's opt-out of the harness schema
+// check; the embedded interface alone would hide it from the harness's type
+// assertion.
+func (m *meteredTool) AcceptsRawInput() bool {
+	r, ok := m.CoreTool.(interface{ AcceptsRawInput() bool })
+	return ok && r.AcceptsRawInput()
 }
 
 func (m *meteredTool) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {

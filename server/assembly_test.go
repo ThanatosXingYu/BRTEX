@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
 )
 
 // hasSkillTool reports whether the packed tool set contains the Skill meta-tool.
@@ -28,11 +28,11 @@ func hasSkillTool(tools []actool.CoreTool) bool {
 func TestAssembleVisibleSkill(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer pg.Close()
 
@@ -48,8 +48,8 @@ func TestAssembleVisibleSkill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wireAgentAugment(pg, skillDir, nil)
-	t.Cleanup(func() { agent.ToolAugment = nil })
+	wireAgentAugment(pg, skillDir, nil, ExecPrivilege{})
+	t.Cleanup(func() { agent.SetToolAugment(nil) })
 
 	ag, _ := pg.GetAgentByKey("planner")
 	if ag == nil {
@@ -65,7 +65,7 @@ func TestAssembleVisibleSkill(t *testing.T) {
 	t.Cleanup(func() { _ = pg.SetAgentSkillVisibility(ag.ID, orig) })
 
 	// before: skill not visible → no Skill meta-tool
-	extra, _, cleanup := agent.ToolAugment(context.Background(), "planner")
+	extra, _, cleanup := agent.ToolAugment()(context.Background(), "planner")
 	cleanup()
 	if hasSkillTool(extra) {
 		t.Fatalf("expected no Skill meta-tool before the skill is made visible")
@@ -78,7 +78,7 @@ func TestAssembleVisibleSkill(t *testing.T) {
 	t.Cleanup(func() { _ = pg.ToggleSkillVisibility(ag.ID, skillName, false) })
 
 	// after: the Skill meta-tool is packed in
-	extra, _, cleanup = agent.ToolAugment(context.Background(), "planner")
+	extra, _, cleanup = agent.ToolAugment()(context.Background(), "planner")
 	defer cleanup()
 	if !hasSkillTool(extra) {
 		t.Fatalf("expected the Skill meta-tool after making the skill visible")

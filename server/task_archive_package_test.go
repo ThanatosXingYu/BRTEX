@@ -4,12 +4,12 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
-	pgdb "github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/agent"
+	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -17,11 +17,19 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 	dataDir := t.TempDir()
 	taskID := "42"
 	explorationID := int64(73)
-	taskFile := filepath.Join(dataDir, "tasks", taskID, "uploads", "evidence.txt")
+	// The task directory packs whole: the main agent's run directory and a worker's.
+	taskFile := filepath.Join(dataDir, "tasks", taskID, "main", "uploads", "evidence.txt")
+	workerFile := filepath.Join(dataDir, "tasks", taskID, "i7", "notes.txt")
+	// The task's command-output spills are packed with it, and those of another task stay.
+	spillFile := filepath.Join(agent.TaskSpillDir(dataDir, taskID), "output-1-1.txt")
+	unrelatedSpill := filepath.Join(agent.TaskSpillDir(dataDir, "43"), "output-1-2.txt")
 	transcriptFile := filepath.Join(dataDir, "transcripts", "exp73-worker-1.jsonl")
 	unrelatedTranscript := filepath.Join(dataDir, "transcripts", "exp74-worker-1.jsonl")
 	for path, body := range map[string]string{
 		taskFile:            "task evidence",
+		workerFile:          "worker notes",
+		spillFile:           "spilled output",
+		unrelatedSpill:      "leave me hot",
 		transcriptFile:      "transcript",
 		unrelatedTranscript: "leave me hot",
 	} {
@@ -37,8 +45,13 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(taskFile); !os.IsNotExist(err) {
-		t.Fatalf("task file still hot after staging: %v", err)
+	for _, path := range []string{taskFile, workerFile, spillFile, filepath.Dir(spillFile)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("task file %s still hot after staging: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(unrelatedSpill); err != nil {
+		t.Fatalf("the spill of another task was staged: %v", err)
 	}
 	if _, err := os.Stat(transcriptFile); !os.IsNotExist(err) {
 		t.Fatalf("task transcript still hot after staging: %v", err)
@@ -77,14 +90,20 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(extracted, filepath.FromSlash(pgdb.TaskArchiveLLMRecordsPath))); err != nil || !bytes.Equal(got, streamBody) {
 		t.Fatalf("streamed LLM archive payload=%q err=%v", got, err)
 	}
-	installed, err := installTaskArchiveFiles(dataDir, extracted, taskID, 1)
+	// The package holds the run directories under files/tasks/<id>/.
+	for _, rel := range []string{filepath.Join("main", "uploads", "evidence.txt"), filepath.Join("i7", "notes.txt")} {
+		if _, err := os.Stat(filepath.Join(extracted, "files", "tasks", taskID, rel)); err != nil {
+			t.Fatalf("package entry files/tasks/%s/%s: %v", taskID, rel, err)
+		}
+	}
+	installed, err := installTaskArchiveFiles(dataDir, extracted, taskID, 1, ExecPrivilege{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := installed.commit(); err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]string{taskFile: "task evidence", transcriptFile: "transcript"} {
+	for path, want := range map[string]string{taskFile: "task evidence", workerFile: "worker notes", spillFile: "spilled output", transcriptFile: "transcript"} {
 		got, err := os.ReadFile(path)
 		if err != nil || string(got) != want {
 			t.Fatalf("restored %s = %q, %v; want %q", path, got, err, want)
@@ -105,7 +124,7 @@ func TestTaskArchivePackageSkipsSymlink(t *testing.T) {
 	if err := os.WriteFile(regular, []byte("keep me"), archiveFileMode); err != nil {
 		t.Fatal(err)
 	}
-	// 工作目录里出现的符号链接应被跳过，而不是让整个归档失败。
+	// A symlink appearing in the working directory should be skipped instead of failing the whole archive.
 	if err := os.Symlink(regular, filepath.Join(payload, "link.txt")); err != nil {
 		t.Skipf("symlink unsupported on this platform: %v", err)
 	}
@@ -128,152 +147,9 @@ func TestTaskArchivePackageSkipsSymlink(t *testing.T) {
 	}
 }
 
-func TestTaskArchiveStageCopyFallbackOnRenameFailure(t *testing.T) {
-	dataDir := t.TempDir()
-	taskFile := filepath.Join(dataDir, "tasks", "42", "uploads", "evidence.txt")
-	if err := os.MkdirAll(filepath.Dir(taskFile), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(taskFile, []byte("task evidence"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	original := stageRename
-	t.Cleanup(func() { stageRename = original })
-	stageRename = func(_, _ string) error { return errors.New("injected rename failure") }
-
-	stage, err := stageTaskArchiveFiles(dataDir, 1, "42", 73)
-	if err != nil {
-		t.Fatalf("staging should fall back to copy when rename fails: %v", err)
-	}
-	staged := filepath.Join(stage.payload, "files", "tasks", "42", "uploads", "evidence.txt")
-	if got, err := os.ReadFile(staged); err != nil || string(got) != "task evidence" {
-		t.Fatalf("staged copy=%q err=%v", got, err)
-	}
-	raw, err := os.ReadFile(filepath.Join(stage.root, "journal.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var journal archiveStageJournal
-	if err := json.Unmarshal(raw, &journal); err != nil {
-		t.Fatal(err)
-	}
-	copied := false
-	for _, m := range journal.Moves {
-		if m.Copied {
-			copied = true
-		}
-	}
-	if !copied {
-		t.Fatalf("journal did not record the copy fallback: %+v", journal.Moves)
-	}
-	// Rollback restores the live tree from the authoritative copy.
-	recovered := &taskArchiveFileStage{root: stage.root, payload: stage.payload, journal: journal}
-	if err := recovered.rollback(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := os.ReadFile(taskFile); err != nil || string(got) != "task evidence" {
-		t.Fatalf("rollback restore=%q err=%v", got, err)
-	}
-}
-
-// A copied move whose source removal failed (still present in the live tree)
-// must roll back copy-authoritatively: the source may have been partially
-// removed after the copy, so it is replaced by the payload copy.
-func TestTaskArchiveStageRollbackCopiedMoveReplacesSource(t *testing.T) {
-	dataDir := t.TempDir()
-	stage := &taskArchiveFileStage{
-		root:    filepath.Join(taskArchiveRoot(dataDir), ".staging", "7"),
-		payload: filepath.Join(taskArchiveRoot(dataDir), ".staging", "7", "payload"),
-		journal: archiveStageJournal{
-			ArchiveID: 7,
-			TaskID:    "42",
-			Moves: []archiveFileMove{{
-				Source:   filepath.Join(dataDir, "tasks", "42"),
-				Relative: filepath.Join("files", "tasks", "42"),
-				Copied:   true,
-			}},
-		},
-	}
-	stagedFile := filepath.Join(stage.payload, "files", "tasks", "42", "evidence.txt")
-	if err := os.MkdirAll(filepath.Dir(stagedFile), archiveDirMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stagedFile, []byte("copy"), archiveFileMode); err != nil {
-		t.Fatal(err)
-	}
-	liveFile := filepath.Join(dataDir, "tasks", "42", "evidence.txt")
-	if err := os.MkdirAll(filepath.Dir(liveFile), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(liveFile, []byte("live"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := stage.rollback(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := os.ReadFile(liveFile); err != nil || string(got) != "copy" {
-		t.Fatalf("rollback should restore the authoritative copy, got=%q err=%v", got, err)
-	}
-	if _, err := os.Stat(stagedFile); !os.IsNotExist(err) {
-		t.Fatalf("staged copy remains after rollback: %v", err)
-	}
-	if _, err := os.Stat(stage.root); !os.IsNotExist(err) {
-		t.Fatalf("staging root remains after rollback: %v", err)
-	}
-}
-
-// Resuming a staged copy leaves the live source alone and discards stale
-// .copying leftovers from an interrupted fallback.
-func TestTaskArchiveStageResumeSkipsCopiedMoveAndCleansPartial(t *testing.T) {
-	dataDir := t.TempDir()
-	stage := &taskArchiveFileStage{
-		root:    filepath.Join(taskArchiveRoot(dataDir), ".staging", "7"),
-		payload: filepath.Join(taskArchiveRoot(dataDir), ".staging", "7", "payload"),
-		journal: archiveStageJournal{
-			ArchiveID: 7,
-			TaskID:    "42",
-			Moves: []archiveFileMove{{
-				Source:   filepath.Join(dataDir, "tasks", "42"),
-				Relative: filepath.Join("files", "tasks", "42"),
-				Copied:   true,
-			}},
-		},
-	}
-	stagedFile := filepath.Join(stage.payload, "files", "tasks", "42", "evidence.txt")
-	if err := os.MkdirAll(filepath.Dir(stagedFile), archiveDirMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stagedFile, []byte("copy"), archiveFileMode); err != nil {
-		t.Fatal(err)
-	}
-	liveFile := filepath.Join(dataDir, "tasks", "42", "evidence.txt")
-	if err := os.MkdirAll(filepath.Dir(liveFile), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(liveFile, []byte("live"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	partial := filepath.Join(stage.payload, "files", "tasks", "42") + ".copying"
-	if err := os.MkdirAll(partial, archiveDirMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := stage.applyMoves(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(partial); !os.IsNotExist(err) {
-		t.Fatalf("partial copy dir not cleaned on resume: %v", err)
-	}
-	if got, err := os.ReadFile(liveFile); err != nil || string(got) != "live" {
-		t.Fatalf("resume touched the live source: got=%q err=%v", got, err)
-	}
-	if got, err := os.ReadFile(stagedFile); err != nil || string(got) != "copy" {
-		t.Fatalf("staged copy=%q err=%v", got, err)
-	}
-}
-
 func TestTaskArchiveStageJournalRollsBackInterruptedMoves(t *testing.T) {
 	dataDir := t.TempDir()
-	taskFile := filepath.Join(dataDir, "tasks", "42", "evidence.txt")
+	taskFile := filepath.Join(dataDir, "tasks", "42", "main", "evidence.txt")
 	transcriptFile := filepath.Join(dataDir, "transcripts", "exp73-worker.jsonl")
 	for _, path := range []string{taskFile, transcriptFile} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -312,18 +188,18 @@ func TestTaskArchiveStageJournalRollsBackInterruptedMoves(t *testing.T) {
 func TestTaskArchiveRestoreJournalRollsBackInterruptedInstall(t *testing.T) {
 	dataDir := t.TempDir()
 	extracted := filepath.Join(dataDir, "archives", "tasks", ".restore", "11-test")
-	source := filepath.Join(extracted, "files", "tasks", "42", "evidence.txt")
+	source := filepath.Join(extracted, "files", "tasks", "42", "main", "evidence.txt")
 	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(source, []byte("evidence"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := installTaskArchiveFiles(dataDir, extracted, "42", 11)
+	_, err := installTaskArchiveFiles(dataDir, extracted, "42", 11, ExecPrivilege{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	destination := filepath.Join(dataDir, "tasks", "42", "evidence.txt")
+	destination := filepath.Join(dataDir, "tasks", "42", "main", "evidence.txt")
 	if _, err := os.Stat(destination); err != nil {
 		t.Fatal(err)
 	}

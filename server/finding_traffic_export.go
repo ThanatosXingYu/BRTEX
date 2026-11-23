@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/evidence"
-	"github.com/ThanatosXingYu/BRTEX/report"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/evidence"
+	"github.com/Autumn-27/artex/report"
 )
 
 func writeFindingsEvidenceZip(out io.Writer, findings []*db.DBFinding, stage string, now time.Time) error {

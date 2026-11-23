@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 const maxTaskCategoryRequestBytes = 16 << 10
@@ -21,21 +21,21 @@ type taskCategoryRequest struct {
 func decodeTaskCategoryRequest(w http.ResponseWriter, r *http.Request) (*taskCategoryRequest, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxTaskCategoryRequestBytes)
 	var request taskCategoryRequest
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "请求正文过大")
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
 		} else {
 			writeErr(w, http.StatusBadRequest, err.Error())
 		}
 		return nil, false
 	}
 	if request.Name == nil || strings.TrimSpace(*request.Name) == "" {
-		writeErr(w, http.StatusBadRequest, "分类名称不能为空")
+		writeErr(w, http.StatusBadRequest, "category name cannot be empty")
 		return nil, false
 	}
 	if utf8.RuneCountInString(strings.TrimSpace(*request.Name)) > db.MaxTaskCategoryNameRunes {
-		writeErr(w, http.StatusBadRequest, "分类名称最多 80 个字符")
+		writeErr(w, http.StatusBadRequest, "category name must be at most 80 characters")
 		return nil, false
 	}
 	return &request, true
@@ -46,7 +46,7 @@ func writeTaskCategoryError(w http.ResponseWriter, err error) {
 	case errors.Is(err, db.ErrTaskCategoryInvalid):
 		writeErr(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, db.ErrTaskCategoryNameConflict):
-		writeErr(w, http.StatusConflict, "分类名称已存在")
+		writeErr(w, http.StatusConflict, "category name already exists")
 	case errors.Is(err, db.ErrTaskCategoryNotFound), errors.Is(err, db.ErrTaskCategoryTaskNotFound):
 		writeErr(w, http.StatusNotFound, err.Error())
 	default:
@@ -134,7 +134,7 @@ func parseCategoryIDField(w http.ResponseWriter, raw json.RawMessage) (*int64, b
 	}
 	var id int64
 	if err := json.Unmarshal(raw, &id); err != nil || id <= 0 {
-		writeErr(w, http.StatusBadRequest, "任务分类 id 无效")
+		writeErr(w, http.StatusBadRequest, "invalid task category id")
 		return nil, false
 	}
 	return &id, true
@@ -150,7 +150,7 @@ func (s *Server) updateTaskCategory(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		CategoryID json.RawMessage `json:"category_id"`
 	}
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -184,10 +184,10 @@ func (s *Server) updateTasksCategoryBatch(w http.ResponseWriter, r *http.Request
 		TaskIDs    []string        `json:"task_ids"`
 		CategoryID json.RawMessage `json:"category_id"`
 	}
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "请求正文过大")
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
 		} else {
 			writeErr(w, http.StatusBadRequest, err.Error())
 		}
@@ -199,7 +199,7 @@ func (s *Server) updateTasksCategoryBatch(w http.ResponseWriter, r *http.Request
 	}
 	taskIDs := normalizeBatchTaskIDs(request.TaskIDs)
 	if len(taskIDs) == 0 || len(taskIDs) > db.MaxTaskCategoryBatchSize {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("task_ids 数量必须为 1-%d", db.MaxTaskCategoryBatchSize))
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("task_ids count must be 1-%d", db.MaxTaskCategoryBatchSize))
 		return
 	}
 	items := make([]batchCategoryItem, 0, len(taskIDs))

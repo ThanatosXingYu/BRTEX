@@ -16,7 +16,7 @@ func TestInterceptDetails(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 	create := func(t *testing.T, audit *InterceptAudit) int64 {
 		t.Helper()
-		id, err := d.CreateInterceptPending(0, 0, "approval-detail-test", "test", "Write", []byte(`{"path":"report.md"}`), "[模型] 请确认", audit)
+		id, err := d.CreateInterceptPending(0, 0, "approval-detail-test", "test", "Write", []byte(`{"path":"report.md"}`), "[Model] Please confirm", audit)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -49,7 +49,7 @@ func TestInterceptDetails(t *testing.T) {
 		var wg sync.WaitGroup
 		for range 8 {
 			wg.Go(func() {
-				ok, err := d.ResolveIntercept(id, "allowed", "allow", "人工允许执行")
+				ok, err := d.ResolveIntercept(id, "allowed", "allow", "allowed manually", "human")
 				if err != nil {
 					t.Error(err)
 				}
@@ -62,7 +62,7 @@ func TestInterceptDetails(t *testing.T) {
 		if wins.Load() != 1 {
 			t.Fatalf("%d decisions won", wins.Load())
 		}
-		ok, err := d.ResolveIntercept(id, "timeout", "deny", "late timeout")
+		ok, err := d.ResolveIntercept(id, "timeout", "deny", "late timeout", "system")
 		if err != nil || ok {
 			t.Fatal("timeout overwrote decision")
 		}
@@ -90,7 +90,7 @@ func TestInterceptDetails(t *testing.T) {
 	})
 	t.Run("denied output and timeout allow", func(t *testing.T) {
 		id := create(t, &InterceptAudit{RunID: "run", ToolUseID: "call", ExecutionStatus: "not_started"})
-		if _, err := d.ResolveIntercept(id, "denied", "deny", "人工拒绝"); err != nil {
+		if _, err := d.ResolveIntercept(id, "denied", "deny", "denied manually", "human"); err != nil {
 			t.Fatal(err)
 		}
 		if err := d.CompleteIntercept(id, "run", "call", "failed", "Blocked by hook", false); err != nil {
@@ -101,7 +101,7 @@ func TestInterceptDetails(t *testing.T) {
 			t.Fatal("denial presented as executed")
 		}
 		id = create(t, &InterceptAudit{RunID: "run2", ToolUseID: "call2", Correlation: "exact", InitialAction: "ask"})
-		if _, err := d.ResolveIntercept(id, "timeout", "allow", "超时允许"); err != nil {
+		if _, err := d.ResolveIntercept(id, "timeout", "allow", "timeout allow", "system"); err != nil {
 			t.Fatal(err)
 		}
 		if err := d.CompleteIntercept(id, "run2", "call2", "succeeded", "ok", false); err != nil {
@@ -126,6 +126,7 @@ func TestInterceptDetails(t *testing.T) {
 			if legacy {
 				delete(row, "audit")
 				delete(row, "decision_source")
+				delete(row, "decided_by")
 			}
 			archived, _ := json.Marshal([]map[string]any{row})
 			tx, err := d.Begin()
@@ -139,13 +140,14 @@ func TestInterceptDetails(t *testing.T) {
 			if err := restoreInterceptRows(tx, archived); err != nil {
 				t.Fatalf("legacy=%t: %v", legacy, err)
 			}
-			var status, source string
+			var status, source, decidedBy string
 			var auditJSON []byte
-			if err := tx.QueryRow(`SELECT status, decision_source, audit FROM intercept_pending WHERE id=$1`, id).Scan(&status, &source, &auditJSON); err != nil {
+			if err := tx.QueryRow(`SELECT status, decision_source, decided_by, audit FROM intercept_pending WHERE id=$1`, id).Scan(&status, &source, &decidedBy, &auditJSON); err != nil {
 				t.Fatal(err)
 			}
-			if status != "timeout" || source != "model" {
-				t.Fatalf("restored %s/%s", status, source)
+			// The restore itself times the request out: a system decision.
+			if status != "timeout" || source != "model" || decidedBy != "system" {
+				t.Fatalf("restored %s/%s/%s", status, source, decidedBy)
 			}
 			if legacy && len(auditJSON) > 0 {
 				t.Fatal("fabricated legacy audit")

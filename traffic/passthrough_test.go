@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/url"
 	"testing"
+	"time"
 
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 )
@@ -64,5 +65,24 @@ func TestMaybePassthroughFlagsHostOnce(t *testing.T) {
 	// port, so it must resolve to the same flagged key → intercept=false (tunnel).
 	if _, tunnel := tr.pass.Load(hostOnly("target.test:443")); !tunnel {
 		t.Fatal("flagged host must be recognized for the CONNECT form with port")
+	}
+	if !tr.tunneling("target.test") {
+		t.Fatal("a fresh passthrough mark must tunnel")
+	}
+}
+
+func TestPassthroughMarkExpires(t *testing.T) {
+	tr := &Traffic{}
+	host := "expired.example"
+	tr.pass.Store(host, time.Now().Add(-time.Second))
+	if tr.tunneling(host) {
+		t.Fatal("expired passthrough mark still tunnels")
+	}
+	if _, ok := tr.pass.Load(host); ok {
+		t.Fatal("expired mark was kept")
+	}
+	tr.pass.Store(host, time.Now().Add(time.Minute))
+	if !tr.tunneling(host) {
+		t.Fatal("fresh passthrough mark should tunnel")
 	}
 }

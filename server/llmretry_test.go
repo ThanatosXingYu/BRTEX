@@ -4,11 +4,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 )
 
-// 没有任何配置时，解析结果必须是全零 —— 也就是使用 SDK 与 task_llm 各自的内置默认。
+// With no configuration at all, the resolved result must be all zeros — i.e. the
+// built-in defaults of the SDK and task_llm, byte-for-byte identical to before the "configurable retries" feature landed.
 func TestResolveRetryUnconfigured(t *testing.T) {
 	got := resolveRetry(db.RetryOverride{}, db.LLMRetryPolicy{})
 	if got != (agent.RetryConfig{}) {
@@ -18,11 +19,8 @@ func TestResolveRetryUnconfigured(t *testing.T) {
 	if retries != sameProviderStreamRetries {
 		t.Fatalf("retries=%d, want %d", retries, sameProviderStreamRetries)
 	}
-	if retries != 10 {
-		t.Fatalf("default stream retries=%d, want 10", retries)
-	}
-	if d := backoff(1); d != 10*time.Second {
-		t.Fatalf("backoff(1)=%v, want 10s (the default interval)", d)
+	if d := backoff(1); d != time.Second {
+		t.Fatalf("backoff(1)=%v, want 1s (the default ladder)", d)
 	}
 }
 

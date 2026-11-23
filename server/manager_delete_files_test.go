@@ -8,16 +8,17 @@ import (
 	"strings"
 	"testing"
 
-	pgdb "github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/traffic"
+	"github.com/Autumn-27/artex/agent"
+	pgdb "github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		pgdb.SkipPGUnavailable(t, err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -119,6 +120,56 @@ func TestDeleteTaskFilesMissingTargetsIsIdempotent(t *testing.T) {
 	}
 }
 
+// Deleting a task removes its command-output spill directory, also when the task
+// has no workspace left, and not the spills of another task or of a chat session. A
+// rollback puts the directory back.
+func TestDeleteTaskFilesRemovesSpillDir(t *testing.T) {
+	dataDir := t.TempDir()
+	spill := agent.TaskSpillDir(dataDir, "77")
+	if spill != filepath.Join(dataDir, "spill", "tasks", "77") {
+		t.Fatalf("task spill directory = %s", spill)
+	}
+	file := filepath.Join("spill", "tasks", "77", "output-1-1.txt")
+	kept := []string{
+		filepath.Join("spill", "tasks", "78", "output-1-2.txt"),
+		filepath.Join("spill", "tasks", "7", "output-1-3.txt"),
+		filepath.Join("spill", "sessions", "conv-77", "output-1-4.txt"),
+	}
+	for _, path := range append([]string{file, filepath.Join("tasks", "77", "main", "notes.txt")}, kept...) {
+		createDeleteFixture(t, dataDir, path, false)
+	}
+
+	stage, err := stageTaskFiles(dataDir, "77", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPathMissing(t, spill)
+	if err := stage.rollback(); err != nil {
+		t.Fatal(err)
+	}
+	assertPathExists(t, filepath.Join(dataDir, file))
+
+	if deleted, err := deleteTaskFiles(dataDir, "77", 12); err != nil || !deleted {
+		t.Fatalf("delete task files: deleted=%v err=%v", deleted, err)
+	}
+	assertPathMissing(t, spill)
+	assertPathMissing(t, filepath.Join(dataDir, "tasks", "77"))
+	for _, path := range kept {
+		assertPathExists(t, filepath.Join(dataDir, path))
+	}
+
+	// A task whose workspace is gone still loses its spills.
+	if deleted, err := deleteTaskFiles(dataDir, "78", 13); err != nil || !deleted {
+		t.Fatalf("delete spill-only task files: deleted=%v err=%v", deleted, err)
+	}
+	assertPathMissing(t, agent.TaskSpillDir(dataDir, "78"))
+	assertPathExists(t, filepath.Join(dataDir, kept[1]))
+	assertPathExists(t, filepath.Join(dataDir, kept[2]))
+	if entries, err := os.ReadDir(filepath.Join(dataDir, ".delete-staging")); err != nil || len(entries) != 0 {
+		t.Fatalf("delete staging holds %v (%v), want it empty", entries, err)
+	}
+}
+
 func TestStageTaskFilesRollbackRestoresWorkspaceAndTranscripts(t *testing.T) {
 	dataDir := t.TempDir()
 	paths := []string{
@@ -174,7 +225,7 @@ func TestManagerDeleteTaskRestoresFilesAndTrafficWhenPostgresDeleteFails(t *test
 	dataDir := t.TempDir()
 	m, err := NewManager(dataDir, "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		pgdb.SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
 

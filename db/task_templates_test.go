@@ -12,9 +12,10 @@ import (
 func TestTaskTemplateCRUDAndNormalizedUniqueness(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanup below.
+	t.Cleanup(func() { d.Close() })
 
 	suffix := time.Now().UnixNano()
 	name := fmt.Sprintf("Template %d", suffix)
@@ -26,7 +27,10 @@ func TestTaskTemplateCRUDAndNormalizedUniqueness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.DeleteTaskTemplate(created.ID) })
+	t.Cleanup(func() {
+		_, err := d.DeleteTaskTemplate(created.ID)
+		cleanupErr(t, "template", err)
+	})
 	if created.Name != name || created.Description != "initial description" || created.Goal != "initial goal" {
 		t.Fatalf("template was not normalized: %+v", created)
 	}
@@ -83,9 +87,10 @@ func TestTaskTemplateCRUDAndNormalizedUniqueness(t *testing.T) {
 func TestTaskTemplateDisjointPatchesCompose(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		SkipPGUnavailable(t, err)
 	}
-	defer d.Close()
+	// Registered FIRST so it runs LAST, after the row cleanup below.
+	t.Cleanup(func() { d.Close() })
 
 	created, err := d.CreateTaskTemplate(TaskTemplateInput{
 		Name:        fmt.Sprintf("Concurrent template %d", time.Now().UnixNano()),
@@ -95,7 +100,10 @@ func TestTaskTemplateDisjointPatchesCompose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.DeleteTaskTemplate(created.ID) })
+	t.Cleanup(func() {
+		_, err := d.DeleteTaskTemplate(created.ID)
+		cleanupErr(t, "template", err)
+	})
 
 	description := "description from concurrent patch"
 	goal := "goal from concurrent patch"

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +31,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic/rewrite"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
@@ -73,6 +75,92 @@ CREATE TABLE IF NOT EXISTS blob_refs (
   PRIMARY KEY (hash, exchange_id)
 );
 CREATE INDEX IF NOT EXISTS idx_blob_refs_ex ON blob_refs(exchange_id);
+
+-- WebSocket messages and SSE events of a stream exchange, in arrival order.
+CREATE TABLE IF NOT EXISTS stream_messages (
+  exchange_id  TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  ts           INTEGER NOT NULL,            -- unix seconds, like exchanges.ts
+  direction    TEXT NOT NULL,               -- 'c2s' | 's2c' | 'meta'
+  kind         INTEGER NOT NULL,            -- WebSocket opcode (1 text, 2 binary), 0 for SSE and meta
+  event        TEXT NOT NULL DEFAULT '',
+  event_id     TEXT NOT NULL DEFAULT '',
+  retry        INTEGER NOT NULL DEFAULT 0,
+  size         INTEGER NOT NULL,            -- original payload size
+  payload      BLOB,                        -- inline payload, or a preview when spilled
+  payload_blob TEXT,                        -- sha256 of the spilled payload
+  truncated    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (exchange_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_stream_messages_ex ON stream_messages(exchange_id, seq);
+
+-- Rewrite-rule trace of an exchange, in order. The exchange row keeps what the
+-- client sent and what the target answered; these rows say what the rules
+-- changed on the way. An exchange is rewritten when it has an 'applied' row.
+CREATE TABLE IF NOT EXISTS exchange_rewrites (
+  exchange_id   TEXT NOT NULL,
+  seq           INTEGER NOT NULL,
+  phase         TEXT NOT NULL,              -- 'request' | 'response'
+  source_kind   TEXT NOT NULL DEFAULT 'rule', -- 'rule' | 'hook'
+  rule_id       INTEGER,                    -- NULL on a global or hook line
+  hook_id       INTEGER,                    -- NULL on a rule or global line
+  hook_version  INTEGER,                    -- NULL on a rule or global line
+  rule_snapshot TEXT,                       -- JSON, no sensitive action value
+  action        TEXT,
+  field         TEXT,                       -- 'method' | 'url' | 'header:<Name>' | 'body' | 'status'
+  outcome       TEXT NOT NULL,              -- 'applied' | 'skipped' | 'error'
+  reason        TEXT NOT NULL DEFAULT '',
+  before_hash   TEXT,
+  after_hash    TEXT,
+  after_inline  BLOB,
+  after_blob    TEXT,
+  PRIMARY KEY (exchange_id, seq)
+);
+
+-- Raw TCP streams relayed through the opt-in SOCKS5 CONNECT listener (P4.1a).
+-- Stored separately from HTTP exchanges: a raw TCP stream never creates a row
+-- in exchanges. Oversized directional payloads spill to _blobs/sha256 and
+-- register their hashes in blob_refs under the stream's tcp-* id.
+CREATE TABLE IF NOT EXISTS raw_tcp_streams (
+  id          TEXT PRIMARY KEY,
+  protocol    TEXT NOT NULL DEFAULT 'tcp',
+  host        TEXT NOT NULL,
+  port        INTEGER NOT NULL,
+  started_at  INTEGER NOT NULL,             -- unix milliseconds
+  ended_at    INTEGER NOT NULL,             -- unix milliseconds
+  duration_ms INTEGER NOT NULL,
+  c2s_bytes   INTEGER NOT NULL DEFAULT 0,
+  s2c_bytes   INTEGER NOT NULL DEFAULT 0,
+  truncated   INTEGER NOT NULL DEFAULT 0,
+  c2s_preview BLOB,
+  c2s_blob    TEXT,
+  s2c_preview BLOB,
+  s2c_blob    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_tcp_host    ON raw_tcp_streams(host);
+CREATE INDEX IF NOT EXISTS idx_raw_tcp_started ON raw_tcp_streams(started_at DESC, id DESC);
+
+-- Raw UDP datagrams relayed through opt-in SOCKS5 UDP ASSOCIATE (P4.1c).
+-- Stored separately from HTTP exchanges: a UDP datagram never creates a row
+-- in exchanges. No fragmentation reassembly is performed: each forwarded
+-- datagram is recorded individually as it arrives. Oversized payloads spill
+-- atomically to _blobs/sha256 and register their hashes in blob_refs under
+-- the datagram's udp-* id.
+CREATE TABLE IF NOT EXISTS raw_udp_datagrams (
+  id             TEXT PRIMARY KEY,
+  association_id TEXT NOT NULL,
+  protocol       TEXT NOT NULL DEFAULT 'udp',
+  host           TEXT NOT NULL,
+  port           INTEGER NOT NULL,
+  direction      TEXT NOT NULL,              -- 'c2s' | 's2c'
+  ts             INTEGER NOT NULL,           -- unix milliseconds
+  size           INTEGER NOT NULL DEFAULT 0, -- datagram payload bytes
+  preview        BLOB,
+  blob           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_assoc ON raw_udp_datagrams(association_id, ts);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_host  ON raw_udp_datagrams(host);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_ts    ON raw_udp_datagrams(ts DESC, id DESC);
 `
 
 // ftsSchema is applied separately from indexSchema: a driver build without FTS5
@@ -90,6 +178,14 @@ const (
 	// maxInlineBody is the cutoff between a body stored inline (SQLite column) and
 	// one spilled to the content-addressed blob store.
 	maxInlineBody = 256 * 1024
+	// maxStreamPayload is how much of one WebSocket message or SSE event is kept.
+	// A longer payload keeps its prefix, with truncated=1 and its original size.
+	maxStreamPayload = 1024 * 1024
+	// maxStreamMessages and maxStreamBytes bound one stream exchange (bytes as
+	// stored, after truncation). Past either, storing stops and a single 'meta'
+	// row records how many messages and bytes were dropped.
+	maxStreamMessages = 10000
+	maxStreamBytes    = 32 * 1024 * 1024
 	// blobPreview is how much of a spilled body stays inline so readers can tell
 	// what it is (JSON shape, SQL dump header, ZIP magic) without fetching it.
 	blobPreview = 8 * 1024
@@ -131,7 +227,11 @@ const (
 // TrafficSearchDescription is persisted into the tool catalog for new and
 // upgraded installations. Keep it in the traffic package so the runtime tool
 // and the catalog migration cannot drift apart.
-const TrafficSearchDescription = "查询记录代理已抓取的目标流量（必须指定 host；支持裸主机、主机:端口或完整 URL，可再按 URL 子串或正文关键词过滤）。指定端口时只返回该服务的流量，避免同一 IP 的不同端口串包。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符）。仅返回极轻量索引(id/method/url/status/resp_len)，不含响应内容；结果非空后必须用 traffic_get 逐条核实请求/响应，再把确实支持当前漏洞的 ID 交给 bind_finding_traffic。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页。"
+const TrafficSearchDescription = "Query the target traffic the recording proxy has captured (host is required; accepts a bare host, host:port, or full URL, optionally filtered further by URL substring or body keyword). When a port is specified, only that service's traffic is returned, avoiding cross-talk between different ports on the same IP. body_contains runs a full-text search over the captured request/response headers and bodies, supporting any substring including Chinese (at least 3 characters). Returns only an ultra-light index (id/method/url/status/resp_len) with no response content; once results are non-empty, use traffic_get to verify the request/response of each one, then hand the IDs that actually support the current vulnerability to bind_finding_traffic. Returns 3 by default, at most 10 per page; use page to paginate when there are more results."
+
+// TrafficGetDescription is the traffic_get description, kept here for the same
+// reason as TrafficSearchDescription.
+const TrafficGetDescription = "Fetch the raw request/response of one captured traffic record by id (truncated when too large). Use together with traffic_search to avoid re-curling. A WebSocket (status 101) or SSE (text/event-stream) record shows only its handshake here; read its messages with traffic_messages. When proxy rewrite rules changed the exchange, the result starts with a REWRITTEN line naming the rule ids, and shows the request as the client sent it and the response as the target sent it. traffic_search searches only these original values: it never finds a value a rewrite rule wrote."
 
 // Traffic runs the recording proxy and owns the file tree + index.
 type Traffic struct {
@@ -163,22 +263,48 @@ type Traffic struct {
 	closeOnce sync.Once
 	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
 	// reason; connections to them are tunneled transparently (fail-open) so the
-	// request still reaches the target — unrecorded — instead of being killed.
-	pass sync.Map // hostname(string) -> struct{}
+	// request still reaches the target, unrecorded, instead of being killed.
+	// The value is the time the mark expires. After that, interception is tried again.
+	pass sync.Map // hostname(string) -> time.Time
 	// upstream is the global egress proxy every captured request is forwarded
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
+	// rewriteRules is the compiled snapshot of the rewrite rules, replaced as a
+	// whole by SetRewriteRules and applied by the sink (rewrite_flow.go).
+	rewriteRules atomic.Pointer[rewrite.Set]
+	// tamperHooks is the compiled snapshot of enabled Go tampering hooks (P4.2),
+	// replaced by SetTamperHooks. Nil when ARTEX_TAMPER_HOOKS_ENABLED is off or
+	// no hooks are enabled.
+	tamperHooks atomic.Pointer[HookSet]
+	// snaps keeps the original of each request a rule rewrote until its
+	// exchange is recorded (rewrite_flow.go). Nil on the zero value.
+	snaps *snapTable
+	// sweeping tracks the snapshot sweeper, which runs until Close. It is kept
+	// apart from reaping, which only ever holds work that finishes on its own.
+	sweeping sync.WaitGroup
+	// socks holds the opt-in SOCKS5 CONNECT listener when started via StartSOCKS5.
+	socksMu sync.Mutex
+	socks   *socks5Server
+	// transparent holds the opt-in Linux transparent TCP listener when started
+	// via StartTransparentTCP (P4.1b).
+	transparentMu sync.Mutex
+	transparent   *transparentServer
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
 func Open(dir, addr string) (*Traffic, error) {
-	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
+	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_ca")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	blobsRoot := filepath.Join(dir, "_blobs")
+	if err := os.MkdirAll(blobsRoot, 0o700); err != nil {
+		return nil, err
+	}
+	tightenBlobPerms(blobsRoot)
 	// busy_timeout is a per-connection setting, so it belongs in the DSN rather
 	// than in a one-off Exec: the pool opens connections on demand, and an Exec
 	// only configures whichever one happened to serve it — leaving every other
@@ -195,7 +321,7 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), snaps: newSnapTable()}
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
@@ -210,6 +336,14 @@ func Open(dir, addr string) (*Traffic, error) {
 		db.Close()
 		return nil, err
 	}
+	// go-mitmproxy writes the CA private key with os.Create (0666 less the umask),
+	// readable by every local user, the agents' executor included. Only the proxy
+	// in this process needs it. The certificate beside it (CACertPath) stays
+	// readable: the agents' tools trust it.
+	if err := os.Chmod(filepath.Join(dir, "_ca", "mitmproxy-ca.pem"), 0o600); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("restrict the MITM CA key: %w", err)
+	}
 	// Upstream selection. By default (no global egress proxy set) targets are
 	// dialed DIRECTLY: go-mitmproxy's own default upstream uses
 	// http.ProxyFromEnvironment, so an HTTP_PROXY/HTTPS_PROXY in the environment
@@ -223,11 +357,11 @@ func Open(dir, addr string) (*Traffic, error) {
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
 	p.SetShouldInterceptRule(func(req *http.Request) bool {
-		_, tunnel := t.pass.Load(hostOnly(req.Host))
-		return !tunnel
+		return !t.tunneling(hostOnly(req.Host))
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
+	t.sweeping.Go(t.sweepSnapshots) // stops on t.closed; Close waits for it
 	return t, nil
 }
 
@@ -278,16 +412,73 @@ func (t *Traffic) initIndex() error {
 	}
 	t.incrementalVacuum = mode == autoVacuumIncremental
 	if !t.incrementalVacuum {
-		log.Printf("[traffic] 索引库未启用增量回收（auto_vacuum=%d）：删除流量不会缩小 index.sqlite，需要执行一次存储压缩来转换", mode)
+		log.Printf("[traffic] index database does not have incremental vacuum enabled (auto_vacuum=%d): deleting traffic will not shrink index.sqlite; run one storage compaction to convert it", mode)
 	}
 	if _, err := conn.ExecContext(ctx, indexSchema); err != nil {
 		return err
 	}
+	if err := ensureExchangeRewritesHookColumns(ctx, conn); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
-		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
+		log.Printf("[traffic] full-text index unavailable; body search will be disabled (metadata search is unaffected): %v", err)
 		return nil
 	}
 	t.fts = true
+	return nil
+}
+
+// SetTamperHooks atomically swaps the compiled tampering-hook snapshot used by
+// the capture proxy. Passing nil disables hook execution (baseline fast path).
+func (t *Traffic) SetTamperHooks(hs *HookSet) {
+	if t == nil {
+		return
+	}
+	t.tamperHooks.Store(hs)
+}
+
+// TamperHooks returns the currently active HookSet, or nil when disabled.
+func (t *Traffic) TamperHooks() *HookSet {
+	if t == nil {
+		return nil
+	}
+	return t.tamperHooks.Load()
+}
+
+func ensureExchangeRewritesHookColumns(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `PRAGMA table_info(exchange_rewrites)`)
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"source_kind", `ALTER TABLE exchange_rewrites ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'rule'`},
+		{"hook_id", `ALTER TABLE exchange_rewrites ADD COLUMN hook_id INTEGER`},
+		{"hook_version", `ALTER TABLE exchange_rewrites ADD COLUMN hook_version INTEGER`},
+	} {
+		if existing[col.name] {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -327,6 +518,14 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	return nil
 }
 
+// SetRewriteRules publishes a compiled snapshot of the rewrite rules. The swap
+// is atomic; nil clears the rules. A flow already rewritten keeps the snapshot
+// its request saw for its response as well.
+func (t *Traffic) SetRewriteRules(s *rewrite.Set) { t.rewriteRules.Store(s) }
+
+// RewriteRules returns the snapshot last published, nil when there is none.
+func (t *Traffic) RewriteRules() *rewrite.Set { return t.rewriteRules.Load() }
+
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
 // user:pass), returning the parsed URL. Exposed so callers can validate a global
 // proxy before persisting it even when the traffic proxy itself is disabled.
@@ -334,17 +533,17 @@ func ValidateProxyURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("解析代理地址 %q: %w", raw, err)
+		return nil, fmt.Errorf("parse proxy address %q: %w", raw, err)
 	}
 	switch u.Scheme {
 	case "http", "https", "socks5":
 	case "":
-		return nil, fmt.Errorf("代理 %q 缺少协议(用 http://、https:// 或 socks5://)", raw)
+		return nil, fmt.Errorf("proxy %q is missing a scheme (use http://, https://, or socks5://)", raw)
 	default:
-		return nil, fmt.Errorf("不支持的代理协议 %q(用 http、https 或 socks5)", u.Scheme)
+		return nil, fmt.Errorf("unsupported proxy scheme %q (use http, https, or socks5)", u.Scheme)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("代理 %q 缺少主机地址", raw)
+		return nil, fmt.Errorf("proxy %q is missing a host", raw)
 	}
 	return u, nil
 }
@@ -367,7 +566,22 @@ func (t *Traffic) Close() error {
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
+	t.socksMu.Lock()
+	srv := t.socks
+	t.socks = nil
+	t.socksMu.Unlock()
+	if srv != nil {
+		_ = srv.Close()
+	}
+	t.transparentMu.Lock()
+	tsrv := t.transparent
+	t.transparent = nil
+	t.transparentMu.Unlock()
+	if tsrv != nil {
+		_ = tsrv.Close()
+	}
 	t.reaping.Wait()
+	t.sweeping.Wait()
 	return t.db.Close()
 }
 
@@ -383,24 +597,15 @@ func (t *Traffic) stopping() bool {
 }
 func (t *Traffic) DB() *sql.DB { return t.db }
 
-// sink is the go-mitmproxy addon that records completed exchanges.
+// sink is the go-mitmproxy addon that records completed exchanges, and paces
+// the requests of client connections marked for pacing (see pace.go).
 type sink struct {
 	mproxy.BaseAddon
-	t *Traffic
+	t       *Traffic
+	paced   sync.Map // ClientConn.Id of a marked connection -> struct{}
+	streams sync.Map // *mproxy.Flow of a live WebSocket/SSE stream -> *streamState (stream.go)
+	bypass  sync.Map // flowKey of a replay flow bypassing rewrite rules -> struct{}
 }
-
-func (s *sink) Response(f *mproxy.Flow) {
-	if f.Request == nil || f.Response == nil {
-		return
-	}
-	s.t.record(f)
-}
-
-// RequestError fires when a request through an established MITM tunnel fails. If
-// the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
-// errors) — not a plain target-unreachable error — we flag the host for
-// transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
 
 // maybePassthrough marks a host to be tunneled transparently on the next
 // connection, but only for errors the proxy itself caused — a target that is
@@ -413,9 +618,34 @@ func (t *Traffic) maybePassthrough(f *mproxy.Flow, err error) {
 	if host == "" {
 		return
 	}
-	if _, loaded := t.pass.LoadOrStore(host, struct{}{}); !loaded {
-		log.Printf("[traffic] 与 %s 的 MITM 出错，改为透传（该 host 后续直连目标、不再记录，但请求照常）：%v", host, err)
+	if t.tunneling(host) {
+		return
 	}
+	until := time.Now().Add(passthroughTTL)
+	if _, loaded := t.pass.LoadOrStore(host, until); !loaded {
+		log.Printf("[traffic] MITM with %s failed, falling back to passthrough for %s (this request failed; the host connects straight to the target and is not recorded until then; the first request after the window fails again if interception still cannot handle it): %v", host, passthroughTTL, err)
+	}
+}
+
+// passthroughTTL is how long a host stays tunneled after a proxy-caused MITM
+// failure. A host whose interception always fails pays one lost request per
+// window: one per host per minute, where a mark that never expired cost one
+// per process. The window is what lets a stale bypass end.
+const passthroughTTL = time.Minute
+
+// tunneling reports whether host is inside an unexpired passthrough mark.
+// An expired mark is removed so the next connection tries interception again.
+func (t *Traffic) tunneling(host string) bool {
+	v, ok := t.pass.Load(host)
+	if !ok {
+		return false
+	}
+	until, ok := v.(time.Time)
+	if !ok || !time.Now().Before(until) {
+		t.pass.CompareAndDelete(host, v)
+		return false
+	}
+	return true
 }
 
 // proxyCausedErr reports whether err indicates the interception layer (not the
@@ -434,53 +664,121 @@ func proxyCausedErr(err error) bool {
 // full-text index. Nothing is written to a per-request directory — only bodies
 // above maxInlineBody spill to the content-addressed blob store.
 func (t *Traffic) record(f *mproxy.Flow) {
+	t.recordViews(flowRequestView(f.Request), flowResponseView(f.Response), nil)
+}
+
+// requestView is the request an exchange records: what the client sent, which
+// is not the flow's request once a rule rewrote it.
+type requestView struct {
+	method string
+	url    *url.URL // nil when the original request is unavailable and Raw() is nil
+	proto  string
+	header http.Header
+	// rawHost is the client's Host header (Raw().Host), "" when unknown.
+	rawHost string
+	body    []byte
+	// unavailable marks a request rewritten by a rule whose original was not
+	// kept: only its method, URL and Host are known.
+	unavailable bool
+}
+
+// responseView is the response an exchange records: what the target answered.
+type responseView struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+func flowRequestView(r *mproxy.Request) requestView {
+	v := requestView{method: r.Method, url: r.URL, proto: r.Proto, header: r.Header, body: r.Body}
+	if raw := r.Raw(); raw != nil {
+		v.rawHost = raw.Host
+	}
+	return v
+}
+
+func flowResponseView(r *mproxy.Response) responseView {
+	return responseView{status: r.StatusCode, header: r.Header, body: r.Body}
+}
+
+// unavailableMarker stands for the headers and body of a request whose
+// original was not kept (see rewrite_flow.go).
+const unavailableMarker = "[original request unavailable]\n"
+
+// recordViews writes one exchange from explicit views, with its rewrite trace,
+// in one transaction: the exchange row, its bodies, blob references, the trace
+// and the full-text index of the views only. A failure rolls everything back,
+// so there is never a rewritten exchange without its trace. Without trace
+// lines this is exactly what record always wrote.
+func (t *Traffic) recordViews(rq requestView, rs responseView, lines []rewrite.TraceLine) {
 	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
 	// can run under the same lock without racing a concurrent record.
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
-	host := f.Request.URL.Hostname()
-	method := f.Request.Method
-	tmpl := db.TemplatePath(f.Request.URL.EscapedPath())
-	n := t.seq.Add(1)
+	var host, tmpl, url, uri string
+	if rq.url != nil {
+		host = rq.url.Hostname()
+		tmpl = db.TemplatePath(rq.url.EscapedPath())
+		url = rq.url.String()
+		uri = rq.url.RequestURI()
+	}
+	method := rq.method
 	now := time.Now()
-	id := fmt.Sprintf("%d-%04d", now.Unix(), n%10000)
+	id := t.newExchangeID(now)
 
-	ct := f.Response.Header.Get("Content-Type")
-	url := f.Request.URL.String()
-	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
-	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
+	ct := rs.header.Get("Content-Type")
+	reqHead := requestHead(rq, uri)
+	respHead := fmt.Sprintf("HTTP %d\n%s", rs.status, headerLines(rs.header))
 	// Bodies are spilled before the transaction opens: blob writes are filesystem
 	// work and must not sit inside the SQLite write lock.
-	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
+	reqB := t.spill(rq.body, rq.header.Get("Content-Type"))
+	respB := t.spill(rs.body, ct)
+	trace := t.spillTrace(lines)
+
+	// A rewritten exchange is logged by host, step and rule ids only: its URL
+	// and the error text may carry a value a rule wrote.
+	rewritten, ruleIDs := appliedRules(lines)
+	fail := func(step string, err error) {
+		if rewritten {
+			log.Printf("[traffic] failed to record a rewritten exchange of %s (%s; rules %v)", host, step, ruleIDs)
+			return
+		}
+		log.Printf("[traffic] failed to record %s (%s): %v", url, step, err)
+	}
 
 	tx, err := t.db.Begin()
 	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（开启事务）：%v", url, err)
+		fail("beginning transaction", err)
 		return
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
+	// An id can repeat (seconds plus a rolling counter); the trace of the
+	// exchange it replaces must not stay attached to this one.
+	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id=?`, id); err != nil {
+		fail("clearing rewrite trace", err)
+		return
+	}
 	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
 	// row whose bodies still live in the old on-disk tree (see Get).
 	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
 VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
-		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
+		id, now.Unix(), host, method, tmpl, url, rs.status, ct,
+		len(rq.body), len(rs.body))
 	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
+		fail("writing index", err)
 		return
 	}
 	rowid, err := res.LastInsertId()
 	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（取 rowid）：%v", url, err)
+		fail("fetching rowid", err)
 		return
 	}
 
 	if _, err := tx.Exec(`INSERT OR REPLACE INTO exchange_bodies(id,req_head,req_body,req_blob,resp_head,resp_body,resp_blob)
 VALUES(?,?,?,?,?,?,?)`,
 		id, reqHead, reqB.inline, nullIfEmpty(reqB.hash), respHead, respB.inline, nullIfEmpty(respB.hash)); err != nil {
-		log.Printf("[traffic] 记录 %s 失败（写正文）：%v", url, err)
+		fail("writing body", err)
 		return
 	}
 
@@ -489,24 +787,55 @@ VALUES(?,?,?,?,?,?,?)`,
 			continue
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, id); err != nil {
-			log.Printf("[traffic] 记录 %s 失败（登记 blob 引用）：%v", url, err)
+			fail("registering blob reference", err)
 			return
 		}
 	}
 
+	if err := writeTrace(tx, id, lines, trace); err != nil {
+		var re *recordError
+		errors.As(err, &re)
+		fail(re.step, re.err)
+		return
+	}
+
 	if t.fts {
 		// The index is fed from memory, so a body that spilled to _blobs is still
-		// fully searchable even though only its preview is stored inline.
+		// fully searchable even though only its preview is stored inline. Only the
+		// recorded views are indexed, never a value a rule wrote.
 		idx := strings.Join([]string{url, reqHead, reqB.index, respHead, respB.index}, "\n")
 		if _, err := tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, idx); err != nil {
-			log.Printf("[traffic] 记录 %s 失败（写全文索引）：%v", url, err)
+			fail("writing full-text index", err)
 			return
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("[traffic] 记录 %s 失败（提交）：%v", url, err)
+		fail("committing", err)
 	}
+}
+
+// appliedRules reports whether a trace rewrote its exchange, with the ids of
+// the rules that did, in order of first appearance.
+func appliedRules(lines []rewrite.TraceLine) (bool, []int64) {
+	rewritten := false
+	var ids []int64
+	for _, l := range lines {
+		if l.Outcome != rewrite.OutcomeApplied {
+			continue
+		}
+		rewritten = true
+		if l.RuleID != 0 && !slices.Contains(ids, l.RuleID) {
+			ids = append(ids, l.RuleID)
+		}
+	}
+	return rewritten, ids
+}
+
+// newExchangeID names a recorded exchange: unix seconds plus a rolling sequence.
+func (t *Traffic) newExchangeID(now time.Time) string {
+	n := t.seq.Add(1)
+	return fmt.Sprintf("%d-%04d", now.Unix(), n%10000)
 }
 
 // storedBody is one body after the inline/spill decision: inline is what goes in
@@ -523,7 +852,45 @@ type storedBody struct {
 // reader can identify them without fetching the blob. Either way, text bodies
 // are handed to the full-text index in full (up to maxIndexBody) — indexing is
 // independent of where the bytes end up.
+// tightenBlobPerms restricts existing spilled blob directories to 0700 and
+// regular blob files to 0600 on startup so pre-existing 0755/0644 artifacts
+// from earlier versions do not stay world-readable.
+func tightenBlobPerms(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if info.Mode().Perm() != 0o700 {
+				if err := os.Chmod(path, 0o700); err != nil {
+					log.Printf("[traffic] failed to restrict blob directory %s: %v", path, err)
+				}
+			}
+			return nil
+		}
+		if info.Mode().IsRegular() && info.Mode().Perm() != 0o600 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				log.Printf("[traffic] failed to restrict blob %s: %v", path, err)
+			}
+		}
+		return nil
+	})
+}
+
 func (t *Traffic) spill(body []byte, contentType string) storedBody {
+	return t.spillAt(body, contentType, maxInlineBody)
+}
+
+// spillAt is spill with the inline threshold as a parameter: bodies up to
+// maxInline stay inline. Stream messages use a much lower one (maxStreamInline).
+func (t *Traffic) spillAt(body []byte, contentType string, maxInline int) storedBody {
 	if len(body) == 0 {
 		return storedBody{}
 	}
@@ -534,7 +901,7 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 		}
 		return string(clipBytes(body, maxIndexBody))
 	}
-	if len(body) <= maxInlineBody {
+	if len(body) <= maxInline {
 		return storedBody{inline: body, index: indexText()}
 	}
 
@@ -543,16 +910,21 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 	// One bucket level (256 buckets) is enough to keep any single directory small;
 	// the store only ever holds bodies above maxInlineBody, deduplicated by hash.
 	blobDir := filepath.Join(t.dir, "_blobs", "sha256", h[:2])
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
-		log.Printf("[traffic] 创建 blob 目录失败：%v", err)
+	if err := os.MkdirAll(blobDir, 0o700); err != nil {
+		log.Printf("[traffic] failed to create blob directory: %v", err)
 		return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
+	}
+	if err := os.Chmod(blobDir, 0o700); err != nil {
+		log.Printf("[traffic] failed to restrict blob directory: %v", err)
 	}
 	blobPath := filepath.Join(blobDir, h+".bin")
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
-			log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
+		if err := os.WriteFile(blobPath, body, 0o600); err != nil {
+			log.Printf("[traffic] failed to write blob %s: %v", h, err)
 			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 		}
+	} else if err := os.Chmod(blobPath, 0o600); err != nil {
+		log.Printf("[traffic] failed to restrict blob %s: %v", h, err)
 	}
 	sb := storedBody{hash: h, index: indexText()}
 	if text {
@@ -647,15 +1019,35 @@ func headerLines(h map[string][]string) string {
 	return b.String()
 }
 
-// requestHeaderLines restores the HTTP Host header, which net/http stores on
-// Request.Host rather than in Header. Keeping it in request.http makes the raw
-// capture complete and directly replayable.
+// requestHeaderLines is requestHeaderLinesOf for a flow's request.
 func requestHeaderLines(req *mproxy.Request) string {
-	headers := req.Header.Clone()
+	v := flowRequestView(req)
+	return requestHeaderLinesOf(v.header, req.URL.Host, v.rawHost)
+}
+
+// requestHead is the head an exchange records for a request view: request
+// line and headers, or only the Host when the original request is unavailable.
+func requestHead(rq requestView, target string) string {
+	urlHost := ""
+	if rq.url != nil {
+		urlHost = rq.url.Host
+	}
+	if rq.unavailable {
+		return fmt.Sprintf("%s %s %s\n%s%s", rq.method, target, rq.proto, requestHeaderLinesOf(nil, urlHost, rq.rawHost), unavailableMarker)
+	}
+	return fmt.Sprintf("%s %s %s\n%s", rq.method, target, rq.proto, requestHeaderLinesOf(rq.header, urlHost, rq.rawHost))
+}
+
+// requestHeaderLinesOf restores the HTTP Host header, which net/http stores on
+// Request.Host rather than in Header. Keeping it in request.http makes the raw
+// capture complete and directly replayable. rawHost is the client's Host
+// header (Raw().Host); urlHost stands in when it is empty.
+func requestHeaderLinesOf(header http.Header, urlHost, rawHost string) string {
+	headers := header.Clone()
 	headers.Del("Host")
-	host := req.URL.Host
-	if raw := req.Raw(); raw != nil && strings.TrimSpace(raw.Host) != "" {
-		host = raw.Host
+	host := urlHost
+	if strings.TrimSpace(rawHost) != "" {
+		host = rawHost
 	}
 	var b strings.Builder
 	if host = strings.TrimSpace(host); host != "" {
@@ -689,7 +1081,7 @@ func (t *Traffic) blobPath(hash string) (string, error) {
 	// Validated as pure hex before touching the filesystem, so a crafted hash can
 	// never traverse out of the blob directory.
 	if !blobHashRe.MatchString(hash) {
-		return "", fmt.Errorf("非法的 blob hash")
+		return "", fmt.Errorf("invalid blob hash")
 	}
 	for _, p := range []string{
 		filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash+".bin"),
@@ -699,7 +1091,7 @@ func (t *Traffic) blobPath(hash string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("blob %s 不存在", hash)
+	return "", fmt.Errorf("blob %s does not exist", hash)
 }
 
 // Blob opens a spilled body for streaming; the caller must close the file.
@@ -731,14 +1123,9 @@ func (t *Traffic) BlobRange(hash string, offset, length int64) (data []byte, tot
 		return nil, 0, err
 	}
 	defer f.Close()
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= size {
+	offset, length, empty := clampBlobRange(offset, length, size)
+	if empty {
 		return nil, size, nil
-	}
-	if length <= 0 || offset+length > size {
-		length = size - offset
 	}
 	buf := make([]byte, length)
 	n, err := f.ReadAt(buf, offset)
@@ -748,7 +1135,24 @@ func (t *Traffic) BlobRange(hash string, offset, length int64) (data []byte, tot
 	return buf[:n], size, nil
 }
 
-// ExchangeMeta is one row of the index (returned by Search).
+// clampBlobRange returns a safe (offset, length) for a blob of size bytes.
+// length > size-offset is used instead of offset+length > size so a huge
+// length cannot wrap int64 and skip the cap.
+func clampBlobRange(offset, length, size int64) (off, n int64, empty bool) {
+	if offset < 0 {
+		offset = 0
+	}
+	if size <= 0 || offset >= size {
+		return offset, 0, true
+	}
+	remain := size - offset
+	if length <= 0 || length > remain {
+		length = remain
+	}
+	return offset, length, false
+}
+
+// ExchangeMeta is one row of the index (returned by Search and Page).
 type ExchangeMeta struct {
 	ID          string `json:"id"`
 	TS          int64  `json:"ts"`
@@ -760,14 +1164,17 @@ type ExchangeMeta struct {
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
 	Path        string `json:"path"`
+	Rewritten   bool   `json:"rewritten"`
 }
+
+const rewrittenExistsSQL = `EXISTS(SELECT 1 FROM exchange_rewrites r WHERE r.exchange_id=exchanges.id AND r.outcome='applied')`
 
 // Search returns paged exchange metadata (never bodies).
 func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges`
+	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,` + rewrittenExistsSQL + ` FROM exchanges`
 	args := []any{}
 	if host != "" {
 		q += ` WHERE host=?`
@@ -783,12 +1190,57 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.Rewritten); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// ResponseContaining reports the newest capture recorded in [fromTS,toTS]
+// (unix seconds) whose response side contains one of lines. Request-side matches
+// are ignored after the index lookup: what classifies a fact is what came back
+// from the target. ok is false when no capture matches, when this build has no
+// full-text index, or when the store is unavailable; callers keep the
+// activity-only classification in that case.
+func (t *Traffic) ResponseContaining(lines []string, fromTS, toTS int64) (id string, ok bool, err error) {
+	if t == nil || len(lines) == 0 {
+		return "", false, nil
+	}
+	for _, line := range lines {
+		cond, arg, hasFTS := t.ftsFilter(line)
+		if !hasFTS {
+			return "", false, nil
+		}
+		rows, qerr := t.db.Query(`SELECT id FROM exchanges
+WHERE ts>=? AND ts<=? AND `+cond+`
+ORDER BY ts DESC LIMIT 8`, fromTS, toTS, arg)
+		if qerr != nil {
+			return "", false, qerr
+		}
+		ids := make([]string, 0, 8)
+		for rows.Next() {
+			var cand string
+			if serr := rows.Scan(&cand); serr != nil {
+				rows.Close()
+				return "", false, serr
+			}
+			ids = append(ids, cand)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return "", false, err
+		}
+		for _, cand := range ids {
+			_, resp, gerr := t.Get(cand)
+			if gerr != nil || !strings.Contains(resp, line) {
+				continue
+			}
+			return cand, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // ftsFilter builds the SQL condition restricting rows to those whose indexed
@@ -810,21 +1262,43 @@ func ftsQuote(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
+const (
+	RewriteFilterAll       = "all"
+	RewriteFilterRewritten = "rewritten"
+	RewriteFilterOriginal  = "original"
+)
+
 // PageQuery bundles the optional filters and sort order for Page. Every filter
 // is combined with AND; an empty string skips that filter, and RespMin/RespMax
 // of -1 skip the response-size bounds. An empty Sort/Order defaults to
 // newest-first by timestamp.
 type PageQuery struct {
-	Host    string // host substring
-	Method  string // exact method (case-insensitive)
-	Query   string // broad search box: metadata columns OR captured text
-	Body    string // content box: captured request/response text only (full-text)
-	Path    string // url_template substring — the vulnerability's path
-	Status  string // exact code ("404") or class bucket ("4xx")
-	RespMin int64  // minimum resp_len, or -1 when unset
-	RespMax int64  // maximum resp_len, or -1 when unset
-	Sort    string // ts | status | resp_len (default ts)
-	Order   string // asc | desc (default desc)
+	Host      string   // host substring
+	Hosts     []string // exact host allowlist (company scope); empty = no filter
+	MatchNone bool     // force an empty result (a company that owns no host yet)
+	Method    string   // exact method (case-insensitive)
+	Query     string   // broad search box: metadata columns OR captured text
+	Body      string   // content box: captured request/response text only (full-text)
+	Path      string   // url_template substring — the vulnerability's path
+	Status    string   // exact code ("404") or class bucket ("4xx")
+	Rewritten string   // all (default) | rewritten (or true) | original (or false)
+	RespMin   int64    // minimum resp_len, or -1 when unset
+	RespMax   int64    // maximum resp_len, or -1 when unset
+	Sort      string   // ts | status | resp_len (default ts)
+	Order     string   // asc | desc (default desc)
+}
+
+// rewriteFilterSQL turns a rewritten filter token into a SQL condition over
+// exchange_rewrites. Empty, "all", or unrecognized values default to no filter.
+func rewriteFilterSQL(s string) (cond string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case RewriteFilterRewritten, "true", "1":
+		return rewrittenExistsSQL, true
+	case RewriteFilterOriginal, "false", "0":
+		return "NOT " + rewrittenExistsSQL, true
+	default:
+		return "", false
+	}
 }
 
 // sortColumns whitelists the columns Page may order by, so the caller-supplied
@@ -849,22 +1323,10 @@ func statusFilter(s string) (cond string, args []any, ok bool) {
 	return "", nil, false
 }
 
-// Page returns one page of exchange metadata for the traffic list, filtered by
-// the criteria in f (all optional, combined with AND) and ordered by the
-// requested column. Query is the broad search box (metadata columns OR, when the
-// term is long enough for the trigram index, captured request/response text);
-// Body narrows to exchanges whose captured text matches, via that same index.
-// Also returns the total number of rows matching the filter (for the UI's
-// pagination). Bodies are never included in the rows.
-func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
-	if size <= 0 || size > 500 {
-		size = 100
-	}
-	if page < 0 {
-		page = 0
-	}
-	where := ""
-	var args []any
+// pageWhere builds the SQL WHERE clause and bound arguments for PageQuery.
+// Page and ExportHAR share this so list queries and HAR exports honor the exact
+// same filter semantics.
+func (t *Traffic) pageWhere(f PageQuery) (where string, args []any) {
 	add := func(cond string, vs ...any) {
 		if where == "" {
 			where = " WHERE "
@@ -877,6 +1339,18 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	if h := strings.TrimSpace(f.Host); h != "" {
 		add("host LIKE ?", "%"+h+"%")
 	}
+	if f.MatchNone {
+		add("1=0")
+	}
+	if len(f.Hosts) > 0 {
+		placeholders := make([]string, len(f.Hosts))
+		args2 := make([]any, len(f.Hosts))
+		for i, h := range f.Hosts {
+			placeholders[i] = "?"
+			args2[i] = h
+		}
+		add("host IN ("+strings.Join(placeholders, ",")+")", args2...)
+	}
 	if m := strings.TrimSpace(f.Method); m != "" {
 		add("method=?", strings.ToUpper(m))
 	}
@@ -885,6 +1359,9 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	if cond, sargs, ok := statusFilter(f.Status); ok {
 		add(cond, sargs...)
+	}
+	if cond, ok := rewriteFilterSQL(f.Rewritten); ok {
+		add(cond)
 	}
 	if f.RespMin >= 0 {
 		add("resp_len>=?", f.RespMin)
@@ -912,6 +1389,24 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 			add(cond, arg)
 		}
 	}
+	return where, args
+}
+
+// Page returns one page of exchange metadata for the traffic list, filtered by
+// the criteria in f (all optional, combined with AND) and ordered by the
+// requested column. Query is the broad search box (metadata columns OR, when the
+// term is long enough for the trigram index, captured request/response text);
+// Body narrows to exchanges whose captured text matches, via that same index.
+// Also returns the total number of rows matching the filter (for the UI's
+// pagination). Bodies are never included in the rows.
+func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
+	if size <= 0 || size > 500 {
+		size = 100
+	}
+	if page < 0 {
+		page = 0
+	}
+	where, args := t.pageWhere(f)
 	if err = t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -925,7 +1420,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	// id embeds capture timestamp + sequence, so a trailing id DESC makes the order
 	// total and pagination stable even when the sort column has many ties.
-	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges` +
+	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,` + rewrittenExistsSQL + ` FROM exchanges` +
 		where + ` ORDER BY ` + col + ` ` + dir + `, id DESC LIMIT ? OFFSET ?`
 	qargs := append(append([]any{}, args...), size, page*size)
 	rs, err := t.db.Query(sel, qargs...)
@@ -935,7 +1430,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	defer rs.Close()
 	for rs.Next() {
 		var m ExchangeMeta
-		if err := rs.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rs.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.Rewritten); err != nil {
 			return nil, 0, err
 		}
 		rows = append(rows, m)
@@ -967,7 +1462,7 @@ FROM exchange_bodies b JOIN exchanges e ON e.id=b.id WHERE b.id=?`, id).
 		return "", "", err
 	}
 	if strings.TrimSpace(rel) == "" {
-		return "", "", fmt.Errorf("exchange %s 无正文记录", id)
+		return "", "", fmt.Errorf("exchange %s has no body record", id)
 	}
 	rb, _ := os.ReadFile(filepath.Join(t.dir, rel, "request.http"))
 	pb, _ := os.ReadFile(filepath.Join(t.dir, rel, "response.http"))
@@ -1054,7 +1549,7 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 		return 0, errors.Join(err, restoreTrees(stageDir, moves))
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, errors.Join(fmt.Errorf("提交流量索引删除: %w", err), restoreTrees(stageDir, moves))
+		return 0, errors.Join(fmt.Errorf("commit traffic index deletion: %w", err), restoreTrees(stageDir, moves))
 	}
 	t.reapStage(stageDir)
 	if n > 0 {
@@ -1103,7 +1598,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 		return 0, 0, errors.Join(err, restoreTrees(stageDir, moves))
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, 0, errors.Join(fmt.Errorf("提交流量索引删除: %w", err), restoreTrees(stageDir, moves))
+		return 0, 0, errors.Join(fmt.Errorf("commit traffic index deletion: %w", err), restoreTrees(stageDir, moves))
 	}
 	t.reapStage(stageDir)
 	if err := t.gcBlobs(); err != nil {
@@ -1112,7 +1607,7 @@ func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
 	if err := t.compactIndex(); err != nil {
 		// The deletion is already durable; compaction is disk space, not
 		// correctness, so it must not turn a completed purge into a failed one.
-		log.Printf("[traffic] 压实索引失败：%v", err)
+		log.Printf("[traffic] failed to compact index: %v", err)
 		return deleted, 0, nil
 	}
 	return deleted, before - t.indexBytes(), nil
@@ -1154,14 +1649,14 @@ func (t *Traffic) compactIndex() error {
 		// A full merge, not the bounded one reclaim uses: with the index emptied
 		// there is nothing left to merge, so this only discards the tombstones.
 		if _, err := conn.ExecContext(ctx, `INSERT INTO ex_fts(ex_fts) VALUES('optimize')`); err != nil {
-			return fmt.Errorf("合并全文索引: %w", err)
+			return fmt.Errorf("merge full-text index: %w", err)
 		}
 	}
 	if _, err := conn.ExecContext(ctx, `PRAGMA auto_vacuum=incremental`); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
-		return fmt.Errorf("压实索引: %w", err)
+		return fmt.Errorf("compact index: %w", err)
 	}
 	var mode int
 	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
@@ -1171,7 +1666,7 @@ func (t *Traffic) compactIndex() error {
 	// space on their own instead of waiting for another purge.
 	t.incrementalVacuum = mode == autoVacuumIncremental
 	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return fmt.Errorf("截断 WAL: %w", err)
+		return fmt.Errorf("truncate WAL: %w", err)
 	}
 	return nil
 }
@@ -1183,18 +1678,24 @@ func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, err
 	if t.fts {
 		// ex_fts is contentless and addressed by rowid, hence the rowid sub-select.
 		if _, err := tx.Exec(`DELETE FROM ex_fts WHERE rowid IN (SELECT rowid FROM exchanges WHERE `+where+`)`, args...); err != nil {
-			return 0, fmt.Errorf("删除全文索引: %w", err)
+			return 0, fmt.Errorf("delete full-text index: %w", err)
 		}
 	}
 	if _, err := tx.Exec(`DELETE FROM exchange_bodies WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
-		return 0, fmt.Errorf("删除正文: %w", err)
+		return 0, fmt.Errorf("delete bodies: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM stream_messages WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("delete stream messages: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("delete rewrite trace: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
-		return 0, fmt.Errorf("删除 blob 引用: %w", err)
+		return 0, fmt.Errorf("delete blob references: %w", err)
 	}
 	res, err := tx.Exec(`DELETE FROM exchanges WHERE `+where, args...)
 	if err != nil {
-		return 0, fmt.Errorf("删除索引行: %w", err)
+		return 0, fmt.Errorf("delete index rows: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
@@ -1265,24 +1766,24 @@ func (t *Traffic) stageTreesForArchive(dirs, hosts []string, archiveID, taskID i
 			if os.IsNotExist(err) {
 				continue
 			}
-			return stageDir, moves, fmt.Errorf("检查历史流量目录 %s: %w", source, err)
+			return stageDir, moves, fmt.Errorf("inspect legacy traffic directory %s: %w", source, err)
 		}
 		planned = append(planned, stagedTrafficPath{source: source})
 	}
-	// 归档路径即使一个历史 host 目录都没有(新装机的流量只落在 SQLite + _blobs)
-	// 也必须留下 journal：崩溃点若落在 PostgreSQL 提交与 SQLite 提交之间，重启后
-	// SQLite 事务被回滚，只有这份 journal 能让恢复流程补做 host 行的删除。少了它，
-	// 已转冷任务的独占流量会永久留在热库里。
+	// The archive path must leave a journal behind even when there is not a single legacy host directory (a fresh install's traffic lands only in SQLite + _blobs):
+	// if the crash lands between the PostgreSQL commit and the SQLite commit, the SQLite transaction is rolled back on restart,
+	// and only this journal lets recovery finish deleting the host rows. Without it,
+	// traffic exclusively owned by already-cold tasks would stay in the hot store forever.
 	uniqueHosts := uniqueArchiveHosts(hosts)
 	if len(planned) == 0 && len(uniqueHosts) == 0 {
 		return "", nil, nil
 	}
 	parent := filepath.Join(t.dir, "_delete_staging")
 	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return "", nil, fmt.Errorf("创建流量暂存目录: %w", err)
+		return "", nil, fmt.Errorf("create traffic staging directory: %w", err)
 	}
 	if stageDir, err = os.MkdirTemp(parent, "hosts-"); err != nil {
-		return "", nil, fmt.Errorf("创建流量暂存目录: %w", err)
+		return "", nil, fmt.Errorf("create traffic staging directory: %w", err)
 	}
 	journal := hostDeleteStageJournal{Version: 1, ArchiveID: archiveID, TaskID: taskID, Hosts: uniqueHosts}
 	for i := range planned {
@@ -1296,7 +1797,7 @@ func (t *Traffic) stageTreesForArchive(dirs, hosts []string, archiveID, taskID i
 	for _, move := range planned {
 		source, staged := move.source, move.staged
 		if err := os.Rename(source, staged); err != nil {
-			return stageDir, moves, fmt.Errorf("移出历史流量目录 %s: %w", source, err)
+			return stageDir, moves, fmt.Errorf("move out legacy traffic directory %s: %w", source, err)
 		}
 		moves = append(moves, stagedTrafficPath{source: source, staged: staged})
 	}
@@ -1360,7 +1861,7 @@ func (t *Traffic) reapStage(stageDir string) {
 	}
 	t.reaping.Go(func() {
 		if err := os.RemoveAll(stageDir); err != nil {
-			log.Printf("[traffic] 清理历史流量目录 %s 失败：%v", stageDir, err)
+			log.Printf("[traffic] failed to clean up legacy traffic directory %s: %v", stageDir, err)
 		}
 	})
 }
@@ -1426,7 +1927,7 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 	stage := &HostDeleteStage{traffic: t}
 	fail := func(cause error) (*HostDeleteStage, error) {
 		if rollbackErr := stage.rollbackLocked(); rollbackErr != nil {
-			return nil, errors.Join(cause, fmt.Errorf("回滚流量删除: %w", rollbackErr))
+			return nil, errors.Join(cause, fmt.Errorf("roll back traffic deletion: %w", rollbackErr))
 		}
 		return nil, cause
 	}
@@ -1510,17 +2011,17 @@ func (t *Traffic) RecoverHostDeleteStages(archiveCommitted func(int64, int64) (b
 		}
 		var journal hostDeleteStageJournal
 		if err := json.Unmarshal(raw, &journal); err != nil {
-			errs = append(errs, fmt.Errorf("读取流量暂存日志 %s: %w", stageDir, err))
+			errs = append(errs, fmt.Errorf("read traffic staging journal %s: %w", stageDir, err))
 			continue
 		}
 		if journal.Version != 1 {
-			errs = append(errs, fmt.Errorf("流量暂存日志 %s 的版本 %d 不受支持", stageDir, journal.Version))
+			errs = append(errs, fmt.Errorf("traffic staging journal %s has unsupported version %d", stageDir, journal.Version))
 			continue
 		}
 		moves := make([]stagedTrafficPath, 0, len(journal.Moves))
 		for _, move := range journal.Moves {
 			if !pathWithin(t.dir, move.Source) || !pathWithin(stageDir, move.Staged) {
-				errs = append(errs, fmt.Errorf("流量暂存日志包含越界路径: %s", stageDir))
+				errs = append(errs, fmt.Errorf("traffic staging journal contains an out-of-bounds path: %s", stageDir))
 				moves = nil
 				break
 			}
@@ -1538,7 +2039,7 @@ func (t *Traffic) RecoverHostDeleteStages(archiveCommitted func(int64, int64) (b
 		committed := false
 		if journal.ArchiveID > 0 {
 			if archiveCommitted == nil {
-				errs = append(errs, fmt.Errorf("流量归档 %d 无状态解析器", journal.ArchiveID))
+				errs = append(errs, fmt.Errorf("no state resolver for traffic archive %d", journal.ArchiveID))
 				continue
 			}
 			committed, err = archiveCommitted(journal.ArchiveID, journal.TaskID)
@@ -1633,7 +2134,7 @@ func (s *HostDeleteStage) rollbackLocked() error {
 	var errs []error
 	if s.tx != nil {
 		if err := s.tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			errs = append(errs, fmt.Errorf("回滚流量索引: %w", err))
+			errs = append(errs, fmt.Errorf("roll back traffic index: %w", err))
 		}
 	}
 	if err := restoreTrees(s.stageDir, s.moves); err != nil {
@@ -1656,7 +2157,7 @@ func (s *HostDeleteStage) Commit() error {
 		restoreErr := restoreTrees(s.stageDir, s.moves)
 		s.done = true
 		s.traffic.wmu.Unlock()
-		return errors.Join(fmt.Errorf("提交流量索引删除: %w", err), restoreErr)
+		return errors.Join(fmt.Errorf("commit traffic index deletion: %w", err), restoreErr)
 	}
 	// Unlinking the staged trees is what used to hold the write lock for hours;
 	// it now runs in the background, while collection below only needs them to be
@@ -1665,7 +2166,7 @@ func (s *HostDeleteStage) Commit() error {
 	s.traffic.reclaim()
 	var errs []error
 	if err := s.traffic.gcBlobs(); err != nil {
-		errs = append(errs, fmt.Errorf("回收流量 blob: %w", err))
+		errs = append(errs, fmt.Errorf("reclaim traffic blob: %w", err))
 	}
 	s.done = true
 	s.traffic.wmu.Unlock()
@@ -1714,7 +2215,7 @@ func (t *Traffic) reclaim() {
 		ctx := context.Background()
 		conn, err := t.db.Conn(ctx)
 		if err != nil {
-			log.Printf("[traffic] 回收索引空间失败（获取连接）：%v", err)
+			log.Printf("[traffic] failed to reclaim index space (getting a connection): %v", err)
 			return
 		}
 		defer conn.Close()
@@ -1725,7 +2226,7 @@ func (t *Traffic) reclaim() {
 			progressed, err := t.reclaimChunk(ctx, conn, &merges)
 			t.wmu.Unlock()
 			if err != nil {
-				log.Printf("[traffic] 回收索引空间失败：%v", err)
+				log.Printf("[traffic] failed to reclaim index space: %v", err)
 				return
 			}
 			if !progressed {
@@ -1735,11 +2236,11 @@ func (t *Traffic) reclaim() {
 				return // shutdown must not wait out the remaining budget
 			}
 			if step+1 >= reclaimMaxSteps {
-				log.Printf("[traffic] 索引空间回收未做完（已用满 %d 步上限），下次删除时继续", reclaimMaxSteps)
+				log.Printf("[traffic] index space reclamation unfinished (used up the %d-step limit); will continue on the next deletion", reclaimMaxSteps)
 				return
 			}
 			if time.Now().After(deadline) {
-				log.Printf("[traffic] 索引空间回收未做完（已用满 %s 预算），下次删除时继续", reclaimBudget)
+				log.Printf("[traffic] index space reclamation unfinished (used up the %s budget); will continue on the next deletion", reclaimBudget)
 				return
 			}
 		}
@@ -1749,7 +2250,7 @@ func (t *Traffic) reclaim() {
 		t.wmu.Lock()
 		defer t.wmu.Unlock()
 		if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			log.Printf("[traffic] 截断 WAL 失败：%v", err)
+			log.Printf("[traffic] failed to truncate WAL: %v", err)
 		}
 	})
 }
@@ -1762,7 +2263,7 @@ func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int)
 	if t.fts && *merges > 0 {
 		// A negative rank is fts5's page budget for one incremental merge.
 		if _, err := conn.ExecContext(ctx, `INSERT INTO ex_fts(ex_fts, rank) VALUES('merge', ?)`, -reclaimMergePages); err != nil {
-			return false, fmt.Errorf("合并全文索引: %w", err)
+			return false, fmt.Errorf("merge full-text index: %w", err)
 		}
 		*merges--
 		progressed = true
@@ -1782,7 +2283,7 @@ func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int)
 	}
 	// The budget is a constant and PRAGMA arguments cannot be bound as parameters.
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, reclaimChunkPages)); err != nil {
-		return false, fmt.Errorf("回收索引空闲页: %w", err)
+		return false, fmt.Errorf("reclaim free index pages: %w", err)
 	}
 	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&after); err != nil {
 		return false, err
@@ -1934,9 +2435,9 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 		cond, arg, ok := t.ftsFilter(b)
 		if !ok {
 			if !t.fts {
-				return nil, fmt.Errorf("当前实例未启用全文索引，无法按正文搜索")
+				return nil, fmt.Errorf("the current instance has no full-text index; body search is unavailable")
 			}
-			return nil, fmt.Errorf("正文搜索关键词至少需要 %d 个字符（当前 %d 个）", minTrigram, utf8.RuneCountInString(b))
+			return nil, fmt.Errorf("body search keyword needs at least %d characters (currently %d)", minTrigram, utf8.RuneCountInString(b))
 		}
 		q += ` AND ` + cond
 		args = append(args, arg)
@@ -1966,12 +2467,12 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 func normalizeSearchHost(raw string) (host, port string, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", "", errors.New("host 为必填参数")
+		return "", "", errors.New("host is a required parameter")
 	}
 	if strings.Contains(raw, "://") {
 		u, parseErr := url.Parse(raw)
 		if parseErr != nil || u.Host == "" {
-			return "", "", fmt.Errorf("无法解析 host：%q", raw)
+			return "", "", fmt.Errorf("cannot parse host: %q", raw)
 		}
 		host, port = u.Hostname(), u.Port()
 	} else if h, p, splitErr := net.SplitHostPort(raw); splitErr == nil {
@@ -1983,12 +2484,12 @@ func normalizeSearchHost(raw string) (host, port string, err error) {
 	}
 	host = strings.Trim(strings.TrimSpace(host), "[]")
 	if host == "" {
-		return "", "", fmt.Errorf("无法解析 host：%q", raw)
+		return "", "", fmt.Errorf("cannot parse host: %q", raw)
 	}
 	if port != "" {
 		p, parseErr := strconv.Atoi(port)
 		if parseErr != nil || p < 1 || p > 65535 {
-			return "", "", fmt.Errorf("端口无效：%q", port)
+			return "", "", fmt.Errorf("invalid port: %q", port)
 		}
 		port = strconv.Itoa(p)
 	}
@@ -2009,11 +2510,11 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"host":          map[string]any{"type": "string", "description": "按主机过滤（必填；如 '107.172.96.177'、'107.172.96.177:8082' 或 'http://107.172.96.177:8082/path'）"},
-				"contains":      map[string]any{"type": "string", "description": "URL 子串过滤（可选，如 'api' / 'login'）"},
-				"body_contains": map[string]any{"type": "string", "description": "正文全文搜索（可选，至少 3 个字符），匹配请求/响应的头与正文，如 'password' / 'root:x:0' / '内网测试'"},
-				"limit":         map[string]any{"type": "integer", "description": "每页条数，默认 3，最大 10"},
-				"page":          map[string]any{"type": "integer", "description": "页码，从 0 开始，默认 0（按 ts 倒序分页）"},
+				"host":          map[string]any{"type": "string", "description": "Filter by host (required; e.g. '107.172.96.177', '107.172.96.177:8082', or 'http://107.172.96.177:8082/path')"},
+				"contains":      map[string]any{"type": "string", "description": "URL substring filter (optional, e.g. 'api' / 'login')"},
+				"body_contains": map[string]any{"type": "string", "description": "Full-text body search (optional, at least 3 characters); matches request/response headers and bodies, e.g. 'password' / 'root:x:0' / 'internal test'"},
+				"limit":         map[string]any{"type": "integer", "description": "Page size, default 3, max 10"},
+				"page":          map[string]any{"type": "integer", "description": "Page number starting at 0, default 0 (paginated by ts descending)"},
 			},
 			"required": []any{"host"},
 		},
@@ -2028,16 +2529,16 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Host) == "" {
-				return actool.Errorf("host 为必填参数：请指定裸主机、主机:端口或完整 URL，避免全库扫描。"), nil
+				return actool.Errorf("host is a required parameter: specify a bare host, host:port, or full URL to avoid a full-database scan."), nil
 			}
 			rows, err := t.query(a.Host, a.Contains, a.BodyContains, a.Page, a.Limit)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if len(rows) == 0 {
-				return actool.Text("无匹配流量。"), nil
+				return actool.Text("No matching traffic."), nil
 			}
-			// 精简为最小索引：仅保留定位所需字段 + 响应码/长度，不带任何响应内容。
+			// Trimmed to a minimal index: only the fields needed to locate records + status/length, with no response content.
 			type liteRow struct {
 				ID      string `json:"id"`
 				Method  string `json:"method"`
@@ -2056,10 +2557,10 @@ func (t *Traffic) Tools() []actool.CoreTool {
 
 	get := actool.Build(actool.Spec{
 		Name:        "traffic_get",
-		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。配合 traffic_search 用，避免重复 curl。",
+		Description: TrafficGetDescription,
 		Schema: map[string]any{
 			"type":       "object",
-			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "traffic_search 返回的 id"}},
+			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "the id returned by traffic_search"}},
 			"required":   []any{"id"},
 		},
 		ReadOnly:    ro,
@@ -2071,19 +2572,27 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text("=== REQUEST ===\n" + clip(req, 2500) + "\n\n=== RESPONSE ===\n" + clip(resp, 4000)), nil
+			rewritten, ruleIDs, err := t.RewriteInfo(a.ID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			head := ""
+			if rewritten {
+				head = fmt.Sprintf("=== REWRITTEN === rewrite rules %v changed this exchange in the proxy. Shown below: the request as the client sent it and the response as the target sent it, not the rewritten values.\n\n", ruleIDs)
+			}
+			return actool.Text(head + "=== REQUEST ===\n" + clip(req, 2500) + "\n\n=== RESPONSE ===\n" + clip(resp, 4000)), nil
 		},
 	})
 
 	blob := actool.Build(actool.Spec{
 		Name:        "traffic_blob",
-		Description: "分段读取超大请求/响应体的原文。traffic_get 里显示为 '…[truncated] @blob sha256:<hash>' 的部分即存放于此，把该 hash 传进来即可取完整内容。单次最多返回 8KB，用 offset 继续往后读（返回结果会给出总长度）。适合翻阅备份文件、源码泄露、大 JSON 导出等超过内联阈值的响应。",
+		Description: "Read oversized request/response bodies in segments. Anything traffic_get shows as '…[truncated] @blob sha256:<hash>' lives here; pass that hash in to fetch the full content. Returns at most 8KB per call; use offset to keep reading further (the result reports the total length). Suited to browsing backup files, source-code leaks, large JSON exports, and other responses beyond the inline threshold.",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"hash":   map[string]any{"type": "string", "description": "traffic_get 中 @blob sha256: 后面的 64 位十六进制值"},
-				"offset": map[string]any{"type": "integer", "description": "起始字节偏移，默认 0"},
-				"length": map[string]any{"type": "integer", "description": "本次读取字节数，默认且最大 8192"},
+				"hash":   map[string]any{"type": "string", "description": "the 64-character hex value after @blob sha256: in traffic_get"},
+				"offset": map[string]any{"type": "integer", "description": "starting byte offset, default 0"},
+				"length": map[string]any{"type": "integer", "description": "bytes to read this call, default and max 8192"},
 			},
 			"required": []any{"hash"},
 		},
@@ -2104,17 +2613,86 @@ func (t *Traffic) Tools() []actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			if len(data) == 0 {
-				return actool.Text(fmt.Sprintf("偏移 %d 已超出内容长度（总长 %d 字节）。", a.Offset, total)), nil
+				return actool.Text(fmt.Sprintf("Offset %d is beyond the content length (total %d bytes).", a.Offset, total)), nil
 			}
-			head := fmt.Sprintf("[offset=%d 本次=%d 总长=%d]\n", a.Offset, len(data), total)
+			head := fmt.Sprintf("[offset=%d chunk=%d total=%d]\n", a.Offset, len(data), total)
 			if isBinaryBody("", data) {
-				return actool.Text(head + "二进制内容，以十六进制展示前 512 字节：\n" + hex.EncodeToString(clipBytes(data, 512))), nil
+				return actool.Text(head + "Binary content; first 512 bytes shown as hex:\n" + hex.EncodeToString(clipBytes(data, 512))), nil
 			}
 			return actool.Text(head + truncateUTF8(data, len(data))), nil
 		},
 	})
 
-	return []actool.CoreTool{search, get, blob}
+	messages := actool.Build(actool.Spec{
+		Name:        "traffic_messages",
+		Description: "List the messages of one captured WebSocket or SSE (Server-Sent Events) record in order: direction (c2s client→server, s2c server→client), type (text/binary/event, or meta when the recorder dropped messages past its limits), size and a preview of at most 1KB (binary as hex). A payload stored as a blob carries its hash; read the rest with traffic_blob. Set direction to c2s or s2c to list only one side of the conversation (the meta row is kept). Returns 20 messages by default, at most 50; use offset to page.",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":        map[string]any{"type": "string", "description": "the record id from traffic_search (a WebSocket status-101 or SSE record)"},
+				"direction": map[string]any{"type": "string", "enum": []any{"c2s", "s2c"}, "description": "only messages in this direction: c2s (client→server) or s2c (server→client); omit for both"},
+				"offset":    map[string]any{"type": "integer", "description": "number of messages to skip within the (filtered) list, default 0"},
+				"limit":     map[string]any{"type": "integer", "description": "messages to return, default 20, max 50"},
+			},
+			"required": []any{"id"},
+		},
+		ReadOnly:    ro,
+		Permissions: allow,
+		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+			var a struct {
+				ID        string
+				Direction string
+				Offset    int
+				Limit     int
+			}
+			_ = json.Unmarshal(in, &a)
+			if strings.TrimSpace(a.ID) == "" {
+				return actool.Errorf("id is a required parameter"), nil
+			}
+			if a.Limit <= 0 {
+				a.Limit = 20
+			}
+			if a.Limit > 50 {
+				a.Limit = 50
+			}
+			if a.Offset < 0 {
+				a.Offset = 0
+			}
+			a.Direction = strings.ToLower(strings.TrimSpace(a.Direction))
+			msgs, total, err := t.StreamMessagesByDirection(a.ID, a.Direction, a.Offset, a.Limit)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if total == 0 {
+				if a.Direction != "" {
+					return actool.Text(fmt.Sprintf("No %s stream messages recorded for this id (not a WebSocket/SSE record, or no message was sent in that direction).", a.Direction)), nil
+				}
+				return actool.Text("No stream messages recorded for this id (not a WebSocket/SSE record, or no message was exchanged)."), nil
+			}
+			type liteMsg struct {
+				Seq       int64  `json:"seq"`
+				Direction string `json:"direction"`
+				Type      string `json:"type"`
+				Event     string `json:"event,omitempty"`
+				Size      int    `json:"size"`
+				Preview   string `json:"preview"`
+				Blob      string `json:"blob,omitempty"`
+				Truncated bool   `json:"truncated,omitempty"`
+			}
+			lite := make([]liteMsg, 0, len(msgs))
+			for _, m := range msgs {
+				l := liteMsg{Seq: m.Seq, Direction: m.Direction, Type: m.Type, Event: m.Event, Size: m.Size, Preview: streamToolPreview(m), Truncated: m.Truncated}
+				if m.Blob != "" {
+					l.Blob = "@blob sha256:" + m.Blob
+				}
+				lite = append(lite, l)
+			}
+			b, _ := json.Marshal(lite)
+			return actool.Text(fmt.Sprintf("[messages %d-%d of %d]\n", a.Offset+1, a.Offset+len(msgs), total) + string(b)), nil
+		},
+	})
+
+	return []actool.CoreTool{search, get, blob, messages}
 }
 
 // SeedToolMetas returns the traffic tools built on a ZERO receiver, for seeding the
@@ -2126,5 +2704,5 @@ func clip(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + fmt.Sprintf("\n... [截断，共 %d 字节；完整在流量文件树] ...", len(s))
+	return s[:max] + fmt.Sprintf("\n... [truncated, %d bytes total; full content in the traffic file tree] ...", len(s))
 }

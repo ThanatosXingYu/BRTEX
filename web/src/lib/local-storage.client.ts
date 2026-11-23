@@ -17,3 +17,11 @@ export function getLocalStorageValue(key: string): string | null {
     return null;
   }
 }
+
+export function removeLocalStorageValue(key: string) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Storage unavailable (private mode, blocked site data): nothing to remove.
+  }
+}

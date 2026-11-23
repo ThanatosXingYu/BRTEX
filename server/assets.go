@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 // companyScopeInputs accepts both the new [{kind,value}] contract and the
@@ -23,7 +23,7 @@ func decodeCompanyMutationRequest(w http.ResponseWriter, r *http.Request, value 
 	if err := json.NewDecoder(r.Body).Decode(value); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			writeErr(w, http.StatusRequestEntityTooLarge, "请求正文过大")
+			writeErr(w, http.StatusRequestEntityTooLarge, "Request body too large")
 		} else {
 			writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		}
@@ -68,6 +68,33 @@ func (s *Server) companyStore() *db.CompanyStore {
 		return nil
 	}
 	return s.m.pg.Companies()
+}
+
+// companyHosts lists the hosts a company owns, for the views that filter on a
+// host string instead of an asset id (traffic). Empty for "all companies" and
+// for a company that owns no host yet.
+func (s *Server) companyHosts(id int64) ([]string, error) {
+	if id <= 0 || s.m.pg == nil {
+		return nil, nil
+	}
+	rows, err := s.m.pg.Query(`
+		SELECT DISTINCT COALESCE(NULLIF(domain, ''), NULLIF(ip, ''))
+		FROM assets
+		WHERE company_id = $1
+		  AND COALESCE(NULLIF(domain, ''), NULLIF(ip, '')) IS NOT NULL`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var host string
+		if err := rows.Scan(&host); err != nil {
+			return nil, err
+		}
+		out = append(out, host)
+	}
+	return out, rows.Err()
 }
 
 // =====================================================================
@@ -118,7 +145,7 @@ func (s *Server) createCompany(w http.ResponseWriter, r *http.Request) {
 	id, added, skipped, invalid, scopeErrs, err := cs.CreateCompanyWithScope(req.Name, req.Logo, req.Scope, "api")
 	if err != nil {
 		if errors.Is(err, db.ErrCompanyNameConflict) {
-			writeErr(w, http.StatusConflict, "企业名称已存在")
+			writeErr(w, http.StatusConflict, "Company name already exists")
 			return
 		}
 		var validationErr *db.CompanyScopeValidationError
@@ -347,11 +374,14 @@ func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// task_id scopes the DSL search to a task's assets (the task detail
-		// "测试资产" search); 0 means the global asset view.
+		// "test assets" search); 0 means the global asset view. company_id
+		// narrows it to one company (the sidebar switcher). Both are applied as
+		// SQL clauses next to the compiled DSL, never pasted into the DSL text.
 		taskID, _ := strconv.ParseInt(q.Get("task_id"), 10, 64)
-		total, err = as.CountDSL(dsl, typ, taskID)
+		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
+		total, err = as.CountDSLForCompany(dsl, typ, taskID, companyID)
 		if err == nil && offset < total {
-			assets, err = as.QueryDSL(dsl, typ, taskID, limit, offset)
+			assets, err = as.QueryDSLForCompany(dsl, typ, taskID, companyID, limit, offset)
 		}
 	} else {
 		companyID, _ := strconv.ParseInt(q.Get("company_id"), 10, 64)
@@ -542,7 +572,7 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if req.TaskID > 0 {
-			_ = as.SetTaskAssetSource(req.TaskID, id, "api", "通过资产 API 登记", nil)
+			_ = as.SetTaskAssetSource(req.TaskID, id, "api", "registered via the asset API", nil)
 		}
 		results = append(results, result{Index: i, ID: id, Type: a.Type})
 	}

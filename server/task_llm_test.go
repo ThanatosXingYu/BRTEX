@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 )
@@ -117,7 +117,7 @@ func TestIsQuotaExhaustedError(t *testing.T) {
 		`billing_hard_limit_reached`,
 		`billing_not_active`,
 		`HTTP status 402 Payment Required`,
-		`账户余额不足，请充值`,
+		`insufficient balance, please top up`,
 		`credit balance is too low`,
 	}
 	for _, message := range positive {
@@ -184,6 +184,18 @@ func TestApplyTaskArchiveBlocker(t *testing.T) {
 	if !strings.Contains(string(raw), `"archive_blocked_by_task_id":"11"`) {
 		t.Fatalf("archive blocker missing from payload: %s", raw)
 	}
+
+	byID := taskDTO(&Task{ID: "7"}, "paused")
+	applyTaskArchiveBlockerID(&byID, 12)
+	if byID.ArchiveBlockedBy != "12" {
+		t.Fatalf("archive blocker by id=%q, want 12", byID.ArchiveBlockedBy)
+	}
+	none := taskDTO(&Task{ID: "7"}, "paused")
+	applyTaskArchiveBlockerID(&none, 0)
+	if none.ArchiveBlockedBy != "" {
+		t.Fatalf("no blocker set %q", none.ArchiveBlockedBy)
+	}
+	applyTaskArchiveBlockerID(nil, 12) // must not panic
 }
 
 func TestTaskLLMStateSnapshotIsConcurrentAndDetached(t *testing.T) {
@@ -246,7 +258,7 @@ func TestTaskLLMStreamRetriesPreStreamQuotaOnNextProfile(t *testing.T) {
 	active := int64(11)
 	transitions := 0
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			if active == 11 {
 				return taskLLMSelection{profileID: 11, provider: first}, nil
 			}
@@ -288,7 +300,7 @@ func TestTaskLLMStreamRetriesAfterNonContentStartEvent(t *testing.T) {
 	}}
 	active := int64(11)
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			if active == 11 {
 				return taskLLMSelection{profileID: 11, provider: first}, nil
 			}
@@ -319,7 +331,7 @@ func TestTaskLLMStreamRetriesStalePreStreamFailureAgainstReplacementChain(t *tes
 	second := &scriptedLLMProvider{events: []llm.StreamEvent{{Type: llm.SETextDelta, Text: "replacement"}}}
 	current := first
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			profileID := int64(11)
 			if current == second {
 				profileID = 22
@@ -350,10 +362,11 @@ func TestTaskLLMStreamDoesNotSwitchForOrdinaryErrors(t *testing.T) {
 	}
 	for _, message := range tests {
 		t.Run(message, func(t *testing.T) {
+			resetLLMFailStreaksForTest() // package-global streaks must not leak across subtests
 			provider := &scriptedLLMProvider{err: errors.New(message)}
 			exhausted := 0
 			hooks := taskLLMStreamHooks{
-				current: func() (taskLLMSelection, error) {
+				current: func(ctx context.Context) (taskLLMSelection, error) {
 					return taskLLMSelection{profileID: 11, provider: provider}, nil
 				},
 				exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
@@ -382,7 +395,7 @@ func TestTaskLLMStreamAdvancesAfterMidStreamQuotaWithoutReplay(t *testing.T) {
 	second := &scriptedLLMProvider{events: []llm.StreamEvent{{Type: llm.SETextDelta, Text: "next-call"}}}
 	active := int64(11)
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			if active == 11 {
 				return taskLLMSelection{profileID: 11, provider: first}, nil
 			}
@@ -418,7 +431,7 @@ func TestTaskLLMStreamMarkFailureAfterToolStartSkipsWorkerReplay(t *testing.T) {
 		err:    quota,
 	}
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			return taskLLMSelection{profileID: 11, provider: provider}, nil
 		},
 		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
@@ -467,7 +480,7 @@ func TestTaskLLMStreamRetriesTransientPreCommitOnSameProvider(t *testing.T) {
 	}
 	exhausted := 0
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			return taskLLMSelection{profileID: 11, provider: provider}, nil
 		},
 		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
@@ -499,7 +512,7 @@ func TestTaskLLMStreamSurfacesTransientAfterRetriesExhausted(t *testing.T) {
 		failErr:   errors.New("dial tcp: connection reset by peer"),
 	}
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			return taskLLMSelection{profileID: 11, provider: provider}, nil
 		},
 		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
@@ -524,7 +537,7 @@ func TestTaskLLMStreamDoesNotRetryDeterministicRejection(t *testing.T) {
 		failErr:   errors.New("anthropic: status 400: messages.1: invalid request"),
 	}
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			return taskLLMSelection{profileID: 11, provider: provider}, nil
 		},
 		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
@@ -620,7 +633,7 @@ func TestTaskLLMStreamStopsWhenChainExhausted(t *testing.T) {
 	provider := &scriptedLLMProvider{err: errors.New("billing_not_active")}
 	transitions := 0
 	hooks := taskLLMStreamHooks{
-		current: func() (taskLLMSelection, error) {
+		current: func(ctx context.Context) (taskLLMSelection, error) {
 			return taskLLMSelection{profileID: 11, provider: provider}, nil
 		},
 		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
@@ -641,9 +654,9 @@ func TestTaskLLMStreamStopsWhenChainExhausted(t *testing.T) {
 func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
-	defer m.Close()
+	t.Cleanup(func() { _ = m.Close() })
 
 	profileID, err := m.pg.SaveProfile(&db.LLMProfile{
 		Name:   fmt.Sprintf("delete-quota-fallback-%d", time.Now().UnixNano()),

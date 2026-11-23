@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { t } from "@/i18n";
 import { api } from "@/lib/api";
 
 export function ChangePasswordDialog({
@@ -41,37 +42,44 @@ export function ChangePasswordDialog({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!oldPassword || !newPassword) {
-      toast.error("请填写当前密码和新密码");
+      toast.error(t("Fill in the current password and the new password"));
       return;
     }
     if (newPassword !== confirmPassword) {
-      toast.error("两次输入的新密码不一致");
+      toast.error(t("The two new passwords do not match"));
       return;
     }
     setSaving(true);
     api
       .changePassword(oldPassword, newPassword)
       .then(() => {
-        toast.success("密码已修改");
+        toast.success(t("Password changed"));
         onOpenChange(false);
       })
-      .catch((err) => toast.error(`修改失败：${(err as Error).message}`))
+      .catch((err) => toast.error(t("Change failed: {error}", { error: (err as Error).message })))
       .finally(() => setSaving(false));
   }
+
+  // The username stays bold; it is placed through a placeholder so the sentence is translated whole.
+  const [descBefore, descAfter = ""] = t(
+    "The username is fixed as {username}. Enter the current password to verify; login tokens issued before the change stay valid until they expire.",
+  ).split("{username}");
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <form onSubmit={submit}>
           <DialogHeader>
-            <DialogTitle>修改密码</DialogTitle>
+            <DialogTitle>{t("Change password")}</DialogTitle>
             <DialogDescription>
-              用户名固定为 <b>ARTEX</b>。需先输入当前密码验证；修改后已签发的登录 token 仍有效直至过期。
+              {descBefore}
+              <b>ARTEX</b>
+              {descAfter}
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 py-4">
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cp-old">当前密码</Label>
+              <Label htmlFor="cp-old">{t("Current password")}</Label>
               <Input
                 id="cp-old"
                 type="password"
@@ -82,7 +90,7 @@ export function ChangePasswordDialog({
               />
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cp-new">新密码</Label>
+              <Label htmlFor="cp-new">{t("New password")}</Label>
               <Input
                 id="cp-new"
                 type="password"
@@ -93,7 +101,7 @@ export function ChangePasswordDialog({
               />
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label htmlFor="cp-confirm">确认新密码</Label>
+              <Label htmlFor="cp-confirm">{t("Confirm new password")}</Label>
               <Input
                 id="cp-confirm"
                 type="password"
@@ -106,10 +114,10 @@ export function ChangePasswordDialog({
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
-              取消
+              {t("Cancel")}
             </Button>
             <Button type="submit" disabled={saving}>
-              {saving ? "修改中…" : "确认修改"}
+              {saving ? t("Changing…") : t("Confirm change")}
             </Button>
           </DialogFooter>
         </form>

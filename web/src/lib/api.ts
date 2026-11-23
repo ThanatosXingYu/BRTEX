@@ -3,6 +3,7 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -16,6 +17,8 @@ import type {
   Asset,
   AssetInterceptRule,
   AssetInterceptRuleInput,
+  TaskCredential,
+  TaskCredentialInput,
   Audit,
   BatchCategoryItem,
   BatchControlItem,
@@ -41,6 +44,7 @@ import type {
   FindingGroupsPage,
   FindingQuery,
   FindingRetest,
+  FindingReportState,
   FindingStats,
   FindingStatus,
   FindingsPage,
@@ -79,6 +83,12 @@ import type {
   SSProject,
   SSTask,
   Stats,
+  TamperDryRunRequest,
+  TamperDryRunResult,
+  TamperHook,
+  TamperHookInput,
+  TamperHooksListResp,
+  TamperHookVersion,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -98,17 +108,36 @@ import type {
   TrafficDetail,
   TrafficEvidenceRef,
   TrafficEvidenceRole,
+  TrafficHARExportMeta,
+  TrafficHARImportResult,
   TrafficHost,
+  TrafficReplayRequest,
+  TrafficReplayResult,
   TrafficResp,
-  UpdateCheck,
+  TrafficStreamPage,
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
 
+// Combined file data per attachment upload; matches maxChatUpload in server/chatupload.go.
+const MAX_CHAT_UPLOAD_BYTES = 512 * 1024 * 1024;
+
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem("artex_token");
+}
+
+// ApiError is what http() throws for a non-2xx response: the message is the
+// server's {error} (or "METHOD path: status"), and status lets callers tell
+// failures apart.
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -128,7 +157,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       document.cookie = "artex_token=; path=/; max-age=0";
       window.location.href = "/login";
     }
-    throw new Error("未授权");
+    throw new Error(t("Unauthorized"));
   }
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
@@ -141,7 +170,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    throw new ApiError(message, r.status);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -162,28 +191,30 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// A same-origin stream sends the artex_token cookie. The query token is added only
+// when base is non-empty, which is the dev connection to :8787: that origin cannot
+// send the cookie.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
-  return `# ARTEX 渗透测试报告 — Acme Corp
+  return `# ARTEX Penetration Test Report — Acme Corp
 
-## 概览
-- 范围：acme.com（含 www / admin / api / shop / vpn 子域）
-- 已确认发现：6 项（高危 3 · 中危 3 · 低危 2）
-- 引擎模式：exploring
+## Overview
+- Scope: acme.com (incl. www / admin / api / shop / vpn subdomains)
+- Confirmed findings: 6 (High 3 · Medium 3 · Low 2)
+- Engine mode: exploring
 
-## 关键发现
-1. **[高] 后台默认口令** admin.acme.com admin/admin123 → 可完全接管后台。
-2. **[高] SQL 注入** www.acme.com/search?q= → 可读取 acme_prod 库。
-3. **[高] IDOR** api.acme.com/v1/orders?id= → 可越权读取他人订单（含手机号/地址）。
-4. **[中] 反射型 XSS**、**暴露 .git 源码**、**登录无速率限制**。
+## Key findings
+1. **[High] Default admin credentials** admin.acme.com admin/admin123 → full backend takeover.
+2. **[High] SQL injection** www.acme.com/search?q= → can read the acme_prod database.
+3. **[High] IDOR** api.acme.com/v1/orders?id= → can read other users' orders without authorization (incl. phone numbers/addresses).
+4. **[Medium] Reflected XSS**, **exposed .git source**, **login without rate limiting**.
 
-## 建议
-- 后台强制改密 + 启用 MFA、封禁默认口令。
-- search 接口参数化查询、输出编码。
-- API 增加对象级授权校验（IDOR）、更换强 JWT 密钥。
+## Recommendations
+- Enforce admin password changes + enable MFA and ban default credentials.
+- Parameterize search endpoint queries and encode output.
+- Add object-level authorization checks to the API (IDOR) and rotate to a strong JWT secret.
 
-> （demo）本报告由 mock 数据生成，仅用于界面演示。`;
+> (demo) This report is generated from mock data for UI demonstration only.`;
 }
 
 export function sseUrl(path: string): string {
@@ -192,6 +223,9 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
+  if (!base) {
+    return path;
+  }
   const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
   return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
@@ -211,17 +245,20 @@ const del = <T>(p: string, body?: unknown) =>
 const arr = <T>(x: T[] | null | undefined): T[] => x ?? [];
 const tq = (task?: string, sep: "?" | "&" = "?") => (task ? `${sep}task=${encodeURIComponent(task)}` : "");
 
-// findingFilterParams 把发现页的筛选条件序列化成 query string。列表 / 分组 /
-// 资产树 / 导出共用同一份,新增筛选项只改这里(后端也只解析这一份)。
+// findingFilterParams serializes the findings page filters into a query string. List /
+// groups / asset tree / export all share this one copy; add new filters only here (the backend parses only this one too).
 function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSearchParams {
   const p = new URLSearchParams();
   if (q.severity && q.severity !== "all") p.set("severity", q.severity);
   if (q.status && q.status !== "all") p.set("status", q.status);
+  if (q.reportState && q.reportState !== "all") p.set("report_state", q.reportState);
+  if (q.verificationStatus && q.verificationStatus !== "all") p.set("verification_status", q.verificationStatus);
   if (q.vulnclass && q.vulnclass !== "all") p.set("vulnclass", q.vulnclass);
   if (q.task && q.task !== "all") p.set("task_id", q.task);
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.company) p.set("company", q.company);
   return p;
 }
 
@@ -229,23 +266,28 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
   const query = new URLSearchParams({ page: String(page), size: String(size) });
   if (filter.status) query.set("status", filter.status);
   if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  if (filter.decided_by) query.set("decided_by", filter.decided_by);
   return query.toString();
 }
 
 export const api = {
-  // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
-  health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+  // Backend application version (injected via ldflags at release, default "dev").
+  health: () => get<{ ok: boolean; service: string; version: string; latest_version?: string }>("/health"),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
-  initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
+  initPassword: (password: string, setupToken: string) =>
+    post<{ token: string }>("/auth/init", { password, setup_token: setupToken }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
 
   // ---- tasks ----
-  tasks: () =>
-    get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
+  tasks: (companyId: number | null = null) =>
+    get<{ tasks: Task[]; active: string }>(`/tasks${companyId ? `?company=${companyId}` : ""}`).then((r) => ({
+      tasks: arr(r.tasks),
+      active: r.active ?? "",
+    })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   createTask: (input: {
     name?: string;
@@ -253,6 +295,7 @@ export const api = {
     description: string;
     goal: string;
     llmProfileIds?: number[];
+    llmRotate?: boolean;
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
@@ -260,6 +303,7 @@ export const api = {
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    credentials?: TaskCredentialInput[];
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -267,24 +311,30 @@ export const api = {
       description: input.description,
       goal: input.goal,
       llm_profile_ids: input.llmProfileIds ?? [],
+      llm_rotate: input.llmRotate ?? false,
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
       seed_first_intent: input.seedFirstIntent ?? false,
-      plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
-      coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
-      intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = the backend normalizes to the default 600 (10min)
+      coverage_enabled: input.coverageEnabled ?? true, // on by default; false disables the asset coverage feature
+      intercept_rules: input.interceptRules ?? [], // task-level asset interception rules
+      credentials: input.credentials ?? [], // test accounts declared at creation; an empty password = the agent generates and records it (#3)
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
+  taskCredentials: (id: string) => get<TaskCredential[]>(`/tasks/${id}/credentials`).then((r) => arr(r)),
+  addTaskCredential: (id: string, input: TaskCredentialInput) =>
+    post<TaskCredential>(`/tasks/${id}/credentials`, input),
+  deleteTaskCredential: (id: string, cid: number) => del(`/tasks/${id}/credentials/${cid}`),
   renameTaskCategory: (id: number, name: string) => patch<TaskCategory>(`/task-categories/${id}`, { name }),
   deleteTaskCategory: (id: number) => del<{ deleted: number }>(`/task-categories/${id}`),
   updateTaskCategory: (taskId: string, categoryId?: number) =>
     patch<Task>(`/tasks/${taskId}/category`, { category_id: categoryId ?? null }),
-  // categoryId 省略/undefined = 移出分类（后端收到 null）
+  // omitting categoryId / undefined = move out of the category (the backend receives null)
   updateTasksCategory: (taskIds: string[], categoryId?: number) =>
     post<{ items: BatchCategoryItem[]; category: TaskCategory | null }>("/tasks/category/batch", {
       task_ids: taskIds,
@@ -299,10 +349,11 @@ export const api = {
     input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
-  updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
+  updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number, llmRotate?: boolean) =>
     put<{
       id: string;
       llm_profile_ids: number[];
+      llm_rotate: boolean;
       active_llm_profile_id?: number;
       llm_failover_state: string;
       reopened_intents: number;
@@ -310,6 +361,7 @@ export const api = {
     }>(`/tasks/${id}/llm`, {
       llm_profile_ids: llmProfileIds,
       active_llm_profile_id: activeLLMProfileId ?? null,
+      llm_rotate: llmRotate,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
   controlTask: (id: string, action: "pause" | "resume") =>
@@ -342,7 +394,7 @@ export const api = {
     intentId: string,
     action: "pause" | "resume" | "cancel",
     reason?: string,
-    // cancel 专用:soft(默认,假删除,意图置 deleted + 记删除原因)| hard(真删除,级联移除独占子孙)。
+    // cancel only: soft (default, soft delete, intent set to deleted + deletion reason recorded) | hard (real delete, cascades to exclusive descendants).
     mode?: "soft" | "hard",
   ) =>
     post<{
@@ -358,58 +410,61 @@ export const api = {
       request_id: string;
     }>(`/tasks/${taskId}/intents/${intentId}/messages`, { message, request_id: requestId }),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),
-  // 重跑一条没跑成功的意图(blocked/exhausted/stopped)：置回 open，worker 会重新认领、从头再跑。
+  // Rerun an intent that did not succeed (blocked/exhausted/stopped): set back to open, and a worker re-claims and reruns it from scratch.
   rerunIntent: (taskId: string, intentId: string) =>
     post<{ id: string; reopened: number }>(`/tasks/${taskId}/intents/${intentId}/rerun`),
-  // 批量重跑本任务全部 blocked 意图（一次网络/LLM 断连导致多条 blocked 时一键全部重试）。
+  // Batch-rerun every blocked intent of this task (one-click retry all when a single network/LLM outage blocked several).
   rerunBlocked: (taskId: string) => post<{ id: string; reopened: number }>(`/tasks/${taskId}/intents/rerun-blocked`),
   setActive: (id: string) => post<{ active: string }>("/active", { id }),
   // ---- stats ----
   stats: (task?: string) => get<Stats>(`/stats${tq(task)}`),
-  // 资产测试覆盖度(粗估，供参考)：范围内资产被 fact 碰过的占比 + 按类型的 总数/已测。
+  // Asset test coverage (rough estimate, for reference): share of in-scope assets touched by facts + total/tested per type.
   taskCoverage: (id: string) =>
     get<{
-      enabled: boolean; // 资产覆盖度功能是否开启；false 时其余字段为零值
+      enabled: boolean; // whether the asset coverage feature is on; when false the other fields are zero values
       scope_rows: number;
       denominator: number;
       tested: number;
       pct: number | null;
       by_type: { type: string; total: number; tested: number }[];
+      // coverage ledger (absent when the feature is off): gaps = open items; an unexamined class is never clean
+      gaps?: { kind: string; surface?: string; risk_area: string }[];
+      completeness?: { complete: boolean; state: string; caveat: string };
     }>(`/tasks/${id}/coverage`),
-  // 资产覆盖图：范围内全部资产 + 连接用的根域名/公司节点，含 tested/in_scope。
+  // Asset coverage graph: every in-scope asset + root-domain/company nodes used for connection, with tested/in_scope.
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
-  // 全局 llm_usage 聚合（仪表盘新版 token 视图）：按 profile 总量 + 按天分桶。
+  // Global llm_usage aggregate (the dashboard's new token view): totals per profile + daily buckets.
   usageStats: (days = 365) => get<UsageStats>(`/tokens/usage?days=${days}`),
-  // ---- 目标管理（总览）----
-  // 本任务全部目标（text/vulnclass/state）。
+  // ---- Goal management (overview) ----
+  // All goals of this task (text/vulnclass/state).
   taskGoals: (id: string) =>
     get<{ goals: TaskGoal[] | null }>(`/tasks/${id}/goals`).then((response) => ({ goals: arr(response.goals) })),
-  // 人工新增目标：写入图谱并通知 planner、复活任务。
+  // Manually add a goal: write it into the graph, notify the planner, revive the task.
   addGoal: (id: string, text: string, vulnclass?: string) =>
     post<TaskGoal>(`/tasks/${id}/goals`, { text, vulnclass: vulnclass ?? "" }),
-  // 人工修改目标文本（及 vulnclass）：通知 planner「由 old 变为 new」、复活任务。
+  // Manually edit goal text (and vulnclass): notify the planner it changed "from old to new", revive the task.
   updateGoal: (id: string, goalId: string, text: string, vulnclass?: string) =>
     patch<TaskGoal>(`/tasks/${id}/goals/${goalId}`, { text, vulnclass: vulnclass ?? "" }),
-  // 人工删除目标（硬删除）：通知 planner，删除不复活任务。
+  // Manually delete a goal (hard delete): notify the planner; deleting does not revive the task.
   deleteGoal: (id: string, goalId: string) => del<{ ok: boolean }>(`/tasks/${id}/goals/${goalId}`),
 
-  // ---- 操作约束管理（总览）----
-  // 本任务全部操作约束（allow/deny）。
+  // ---- Operation constraints management (overview) ----
+  // All operation constraints of this task (allow/deny).
   taskConstraints: (id: string) =>
     get<{ constraints: TaskConstraint[] | null }>(`/tasks/${id}/constraints`).then((response) => ({
       constraints: arr(response.constraints),
     })),
-  // 新增约束（不通知 planner，下一轮规划自然读到）。
+  // Add a constraint (no planner notification; the next planning round reads it naturally).
   addConstraint: (id: string, text: string, kind: TaskConstraint["kind"]) =>
     post<TaskConstraint>(`/tasks/${id}/constraints`, { text, kind }),
-  // 修改约束（文本 + allow/deny）。
+  // Edit a constraint (text + allow/deny).
   updateConstraint: (id: string, constraintId: string, text: string, kind: TaskConstraint["kind"]) =>
     patch<TaskConstraint>(`/tasks/${id}/constraints/${constraintId}`, { text, kind }),
-  // 删除约束。
+  // Delete a constraint.
   deleteConstraint: (id: string, constraintId: string) =>
     del<{ ok: boolean }>(`/tasks/${id}/constraints/${constraintId}`),
 
-  // ---- 任务级资产拦截/允许规则（总览）----
+  // ---- Task-level asset interception/allow rules (overview) ----
   taskInterceptRules: (id: string) =>
     get<{ rules: AssetInterceptRule[] | null }>(`/tasks/${id}/intercept-rules`).then((r) => arr(r.rules)),
   createTaskInterceptRule: (id: string, rule: AssetInterceptRuleInput) =>
@@ -421,14 +476,14 @@ export const api = {
   toggleTaskInterceptRule: (id: string, ruleId: number, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/tasks/${id}/intercept-rules/${ruleId}/toggle`, { enabled }),
 
-  // 本任务测试范围列表（含继承自来源任务的范围）。
+  // Test scope list of this task (including scopes inherited from source tasks).
   taskScope: (id: string) => get<{ scope: TaskScopeRow[] }>(`/tasks/${id}/scope`),
-  // 手动新增一条测试范围（kind=company/root_domain/subdomain/ip/cidr）。
+  // Manually add one test scope row (kind=company/root_domain/subdomain/ip/cidr).
   addTaskScope: (id: string, kind: string, value: string, reason?: string) =>
     post<TaskScopeRow>(`/tasks/${id}/scope`, { kind, value, reason }),
-  // 删除本任务的一条测试范围。
+  // Delete one test scope row of this task.
   deleteTaskScope: (id: string, scopeId: number) => del<{ ok: boolean }>(`/tasks/${id}/scope/${scopeId}`),
-  // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
+  // Intents / facts / findings of an asset within this task (for the coverage graph node drawer).
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
 
   // ---- workspace file manager (workDir) ----
@@ -448,19 +503,19 @@ export const api = {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
-    if (!r.ok) throw new Error(`上传失败: ${r.status}`);
+    if (!r.ok) throw new Error(t("Upload failed: {error}", { error: r.status }));
     return r.json() as Promise<{ uploaded: number }>;
   },
   workspaceDownload: async (path: string) => {
     let blob: Blob;
     if (MOCK) {
-      blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
+      blob = new Blob([`(demo) Sample download content of ${path}.`], { type: "text/plain" });
     } else {
       const token = getToken();
       const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
-      if (!r.ok) throw new Error(`下载失败: ${r.status}`);
+      if (!r.ok) throw new Error(t("Download failed: {error}", { error: r.status }));
       blob = await r.blob();
     }
     const objUrl = URL.createObjectURL(blob);
@@ -475,13 +530,13 @@ export const api = {
 
   // ---- assets ----
   // Server-side paginated: pass limit/offset, get back the page + full match total.
-  assets: (type = "", limit = 50, offset = 0) =>
-    get<{ count: number; total: number; assets: Asset[] }>(`/assets?type=${type}&limit=${limit}&offset=${offset}`).then(
-      (r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 }),
-    ),
-  searchAssets: (dsl: string, type = "", limit = 50, offset = 0) =>
+  assets: (type = "", limit = 50, offset = 0, companyId: number | null = null) =>
     get<{ count: number; total: number; assets: Asset[] }>(
-      `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}`,
+      `/assets?type=${type}&limit=${limit}&offset=${offset}${companyId ? `&company_id=${companyId}` : ""}`,
+    ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
+  searchAssets: (dsl: string, type = "", limit = 50, offset = 0, companyId: number | null = null) =>
+    get<{ count: number; total: number; assets: Asset[] }>(
+      `/assets?dsl=${encodeURIComponent(dsl)}${type ? `&type=${encodeURIComponent(type)}` : ""}&limit=${limit}&offset=${offset}${companyId ? `&company_id=${companyId}` : ""}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
@@ -509,7 +564,7 @@ export const api = {
   taskIntentAssets: (taskId: string) =>
     get<{ assets: IntentAsset[] }>(`/tasks/${taskId}/intent-assets`).then((r) => arr(r.assets)),
 
-  // ---- companies (企业 + 资产范围；归属唯一来源) ----
+  // ---- companies (company + asset scope; the single source of ownership) ----
   companies: () => get<Company[]>("/companies").then(arr),
   createCompany: (name: string, scope: CompanyScopeRule[]) =>
     post<{ id: number; created: boolean; scope_added?: number; scope_invalid?: number; scope_errors?: string[] }>(
@@ -538,7 +593,13 @@ export const api = {
 
   // ---- exploration (per task) ----
   frontier: (task?: string) => get<TaskNode[]>(`/exploration/frontier${tq(task)}`).then(arr),
-  findings: (task?: string) => get<Finding[]>(`/exploration/findings${tq(task)}`).then(arr),
+  findings: (task?: string, company?: string) => {
+    const p = new URLSearchParams();
+    if (task) p.set("task", task);
+    if (company) p.set("company", company);
+    const qs = p.toString();
+    return get<Finding[]>(`/exploration/findings${qs ? `?${qs}` : ""}`).then(arr);
+  },
   findingsPage: (q: FindingQuery) => {
     const p = findingFilterParams(q);
     p.set("page", String(q.page));
@@ -551,13 +612,14 @@ export const api = {
     p.set("limit", String(q.pageSize));
     return get<FindingGroupsPage>(`/exploration/findings/groups?${p.toString()}`);
   },
-  // findingAssetTree 取「按资产」视图的左侧树:只含有发现的资产及其祖先,
-  // 节点带子树聚合计数。不分页——树是导航结构,一次取完。
+  // findingAssetTree fetches the left-side tree of the "by asset" view: only assets with
+  // findings and their ancestors, nodes carrying subtree aggregate counts. Not paginated — the tree is a navigation structure, fetched in one go.
   findingAssetTree: (q: Omit<FindingQuery, "page" | "pageSize">) =>
     get<FindingAssetTree>(`/exploration/findings/asset-tree?${findingFilterParams(q).toString()}`),
-  findingStats: () => get<FindingStats>("/exploration/findings/stats"),
-  // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
-  // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
+  findingStats: (company?: string) =>
+    get<FindingStats>(`/exploration/findings/stats${company ? `?company=${encodeURIComponent(company)}` : ""}`),
+  // exportFindings triggers the findings page export and downloads the file. scope=selected
+  // sends ids (a finding_id list); scope=filtered sends the current filters (the FindingQuery filter fields); scope=all ignores filters.
   exportFindings: async (opts: {
     format: "md-single" | "md-zip" | "csv" | "json";
     scope: "filtered" | "all" | "selected";
@@ -574,9 +636,9 @@ export const api = {
     const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`export: ${r.status}`);
+    if (!r.ok) throw new Error(t("Export failed: {error}", { error: r.status }));
     const blob = await r.blob();
-    // 文件名优先取后端 Content-Disposition,取不到则用默认名。
+    // Prefer the backend's Content-Disposition for the filename; fall back to a default name.
     const disp = r.headers.get("Content-Disposition") ?? "";
     const m = disp.match(/filename="?([^"]+)"?/);
     const filename = m?.[1] ?? `findings-export`;
@@ -649,8 +711,8 @@ export const api = {
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: "下载失败" }));
-      throw new Error(error.error ?? "下载失败");
+      const error = await response.json().catch(() => ({ error: t("Download failed") }));
+      throw new Error(error.error ?? t("Download failed"));
     }
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
@@ -660,16 +722,30 @@ export const api = {
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   },
-  // 漏洞链路:该漏洞节点回溯到任务初始节点的子图(节点 + 关系)。
+  // Vulnerability lineage: the subgraph (nodes + edges) from the vulnerability node back to the task's initial node.
   findingLineage: (id: string) => get<{ nodes: TaskNode[]; edges: Edge[] }>(`/exploration/findings/${id}/lineage`),
   setFindingStatus: (id: string, status: FindingStatus) => patch<Finding>(`/exploration/findings/${id}`, { status }),
+  setFindingReportState: (id: string, report_state: FindingReportState) =>
+    patch<Finding>(`/exploration/findings/${id}`, { report_state }),
+  // Bulk triage: one transaction server-side, with a per-id result. Unknown ids
+  // come back as found=false instead of failing the whole batch.
+  bulkSetFindingStatus: (ids: string[], status: FindingStatus) =>
+    post<{ updated: number; missing: number; results: { id: number; found: boolean; changed: boolean }[] }>(
+      "/exploration/findings/bulk-status",
+      { ids: ids.map(Number), status },
+    ),
+  bulkSetFindingReportState: (ids: string[], report_state: FindingReportState) =>
+    post<{ updated: number; missing: number; results: { id: number; found: boolean; changed: boolean }[] }>(
+      "/exploration/findings/bulk-report-state",
+      { ids: ids.map(Number), report_state },
+    ),
   setFindingSeverity: (id: string, severity: Severity) => patch<Finding>(`/exploration/findings/${id}`, { severity }),
-  // 一次保存漏洞的名称/类别/严重等级(发现列表行内编辑用),只传出现的字段。
+  // Save a vulnerability's name/class/severity in one call (inline edit in the findings list); only present fields are sent.
   updateFinding: (
     id: string,
-    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus },
+    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus; report_state?: FindingReportState },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
-  // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
+  // Delete a vulnerability: removes the findings record + the source exploration node (gone from the findings list, the task findings tab, and the exploration graph together).
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
@@ -698,7 +774,7 @@ export const api = {
       .then(arr)
       .catch(() => [] as ConvTokenSummary[]),
   explorationGraph: (task?: string) => get<{ nodes: TaskNode[]; edges: Edge[] }>(`/exploration/graph${tq(task)}`),
-  // 播报板:服务端按创建顺序分页的探索节点(默认最新在前)。
+  // Broadcast board: exploration nodes paginated by creation order on the server (newest first by default).
   explorationNodes: (task: string, query: ExplorationNodeQuery = {}) => {
     const q = new URLSearchParams();
     if (task) q.set("task", task);
@@ -783,10 +859,12 @@ export const api = {
       body?: string;
       path?: string;
       status?: string;
+      rewritten?: string;
       respMin?: string;
       respMax?: string;
       sort?: string;
       order?: string;
+      company?: number | null;
     } = {},
   ) =>
     get<TrafficResp>(
@@ -797,12 +875,109 @@ export const api = {
         (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
         (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
         (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.rewritten && opts.rewritten !== "all" ? `&rewritten=${encodeURIComponent(opts.rewritten)}` : "") +
         (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
         (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
-        (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
+        (opts.order ? `&order=${encodeURIComponent(opts.order)}` : "") +
+        (opts.company ? `&company=${opts.company}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
+  // One page of a WebSocket/SSE exchange's messages, in order.
+  trafficStream: (id: string, offset = 0, limit = 50) =>
+    get<TrafficStreamPage>(`/traffic/stream?exchange=${encodeURIComponent(id)}&offset=${offset}&limit=${limit}`),
+  // Raw bytes of one stored blob (a full message payload or an oversized body).
+  // The JSON-only `get` cannot carry binary, hence the direct fetch.
+  trafficBlob: async (hash: string) => {
+    if (MOCK) throw new Error(t("Blob download is not available in mock mode"));
+    const token = getToken();
+    const r = await fetch(`/api/traffic/blob?hash=${encodeURIComponent(hash)}`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
+    if (!r.ok) throw new Error(t("Blob download failed: {error}", { error: r.status }));
+    return new Uint8Array(await r.arrayBuffer());
+  },
+  // Re-sends an edited request through the proxy (bypasses capture rewrite rules
+  // unless req.apply_rules is true). Errors carry the HTTP status (ApiError):
+  // 413 body too large, 502 proxy/upstream, 503 capture off, 504 timeout.
+  trafficReplay: async (req: TrafficReplayRequest) => {
+    if (MOCK) throw new Error(t("Replay is not available in mock mode"));
+    return post<TrafficReplayResult>(`/traffic/replay`, {
+      ...req,
+      apply_rules: Boolean(req.apply_rules),
+    });
+  },
+  // Imports a raw HAR 1.2 JSON document into the traffic store.
+  trafficImportHAR: async (rawJSON: string): Promise<TrafficHARImportResult> => {
+    if (MOCK) throw new Error(t("HAR import is not available in mock mode"));
+    return http<TrafficHARImportResult>(`/traffic/import/har`, {
+      method: "POST",
+      body: rawJSON,
+    });
+  },
+  // Exports filtered traffic as a HAR 1.2 file download and returns truncation metadata.
+  trafficExportHAR: async (
+    opts: {
+      host?: string;
+      method?: string;
+      q?: string;
+      body?: string;
+      path?: string;
+      status?: string;
+      rewritten?: string;
+      respMin?: string;
+      respMax?: string;
+    } = {},
+  ): Promise<TrafficHARExportMeta> => {
+    if (MOCK) throw new Error(t("HAR export is not available in mock mode"));
+    const qs = new URLSearchParams();
+    if (opts.host) qs.set("host", opts.host);
+    if (opts.method && opts.method !== "all") qs.set("method", opts.method);
+    if (opts.q) qs.set("q", opts.q);
+    if (opts.body) qs.set("body", opts.body);
+    if (opts.path) qs.set("path", opts.path);
+    if (opts.status && opts.status !== "all") qs.set("status", opts.status);
+    if (opts.rewritten && opts.rewritten !== "all") qs.set("rewritten", opts.rewritten);
+    if (opts.respMin) qs.set("resp_min", opts.respMin);
+    if (opts.respMax) qs.set("resp_max", opts.respMax);
+    const suffix = qs.toString();
+    const token = getToken();
+    const r = await fetch(`/api/traffic/export/har${suffix ? `?${suffix}` : ""}`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
+    if (r.status === 401) {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("artex_token");
+        document.cookie = "artex_token=; path=/; max-age=0";
+        window.location.href = "/login";
+      }
+      throw new Error(t("Unauthorized"));
+    }
+    if (!r.ok) {
+      let msg = String(r.status);
+      try {
+        const payload = (await r.json()) as { error?: unknown };
+        if (typeof payload.error === "string" && payload.error.trim()) msg = payload.error.trim();
+      } catch {
+        // Keep status fallback.
+      }
+      throw new ApiError(t("HAR export failed: {error}", { error: msg }), r.status);
+    }
+    const blob = await r.blob();
+    const exported = Number(r.headers.get("X-ARTEX-HAR-Exported") ?? "0") || 0;
+    const matched = Number(r.headers.get("X-ARTEX-HAR-Matched") ?? "0") || 0;
+    const truncated = r.headers.get("X-ARTEX-HAR-Truncated") === "true";
+    const truncatedReason = r.headers.get("X-ARTEX-HAR-Truncated-Reason") ?? undefined;
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = "artex-traffic.har";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+    return { exported, matched, truncated, truncatedReason };
+  },
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
@@ -810,20 +985,32 @@ export const api = {
   // index handed back to the filesystem. Evidence bound to findings is kept.
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
 
+  // ---- capture-proxy constrained Go tampering hooks (P4.2, admin-only) ----
+  trafficHooks: () => get<TamperHooksListResp>(`/traffic/hooks`),
+  createTrafficHook: (body: TamperHookInput) => post<TamperHook>(`/traffic/hooks`, { ...body, enabled: false }),
+  updateTrafficHook: (id: number, body: TamperHookInput) => put<TamperHook>(`/traffic/hooks/${id}`, body),
+  deleteTrafficHook: (id: number) => del<{ deleted: boolean }>(`/traffic/hooks/${id}`),
+  toggleTrafficHook: (id: number, enabled: boolean) => post<TamperHook>(`/traffic/hooks/${id}/toggle`, { enabled }),
+  trafficHookVersions: (id: number) => get<{ versions: TamperHookVersion[] }>(`/traffic/hooks/${id}/versions`),
+  rollbackTrafficHook: (id: number, version: number) => post<TamperHook>(`/traffic/hooks/${id}/rollback`, { version }),
+  dryRunTrafficHook: (body: TamperDryRunRequest) => post<TamperDryRunResult>(`/traffic/hooks/dry-run`, body),
+
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+  noiseStatus: () => get<import("@/lib/types").NoiseStatus>(`/settings/noise`),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;
     web_search_proxy?: string;
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
+    keenable_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
 
-  // ---- 漏洞 IM 推送 ----
-  // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
-  // 不塞进扁平的 settings 键值里。
+  // ---- Vulnerability IM push ----
+  // Channels are multi-instance resources (several bots of the same kind, each with its own
+  // filter rules), so they form their own group instead of the flat settings key/value store.
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
   notifyChannels: () =>
     get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
@@ -836,7 +1023,7 @@ export const api = {
     filter?: NotificationFilter;
     rate_per_min?: number;
   }) => post<{ id: number }>(`/notify/channels`, payload),
-  // PATCH 语义：只提交要改的字段。config 里的掩码值原样回传即表示「保持原值」。
+  // PATCH semantics: submit only the fields to change. Passing a masked config value back as-is means "keep the current value".
   notifyUpdateChannel: (
     id: number,
     payload: {
@@ -850,7 +1037,7 @@ export const api = {
     },
   ) => patch<{ id: number }>(`/notify/channels/${id}`, payload),
   notifyDeleteChannel: (id: number) => del<{ ok: boolean }>(`/notify/channels/${id}`),
-  // 同步发一条测试消息；失败时后端会把渠道的原始错误回传，供排查配置。
+  // Send a test message synchronously; on failure the backend returns the channel's raw error for configuration troubleshooting.
   notifyTestChannel: (id: number) => post<{ ok: boolean; latency_ms: number }>(`/notify/channels/${id}/test`),
   notifyDeliveries: (q: { channelId?: number; state?: string; page?: number; pageSize?: number } = {}) => {
     const p = new URLSearchParams();
@@ -869,7 +1056,7 @@ export const api = {
     const r = await fetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`report: ${r.status}`);
+    if (!r.ok) throw new Error(t("Report failed: {error}", { error: r.status }));
     return r.text();
   },
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
@@ -880,8 +1067,12 @@ export const api = {
   chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
     post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
-  // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
+  // Option 1, file upload: lands in the session/task working directory uploads/, returning a relative path the agent can Read.
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {
+    const totalSize = files.reduce((total, file) => total + file.size, 0);
+    if (totalSize > MAX_CHAT_UPLOAD_BYTES) {
+      throw new Error(t("Files exceed the 512 MiB upload limit (combined size)."));
+    }
     if (MOCK)
       return {
         attachments: files.map((f) => ({
@@ -899,7 +1090,7 @@ export const api = {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
-    if (!r.ok) throw new Error(`上传失败: ${r.status} ${await r.text()}`);
+    if (!r.ok) throw new Error(t("Upload failed: {error}", { error: `${r.status} ${await r.text()}` }));
     return r.json() as Promise<{ attachments: ChatAttachment[] }>;
   },
   stopChat: (taskId: string) => post<{ status: string }>(`/tasks/${taskId}/chat/stop`, {}),
@@ -939,10 +1130,11 @@ export const api = {
     thinking_type = "",
     reasoning_effort = "",
     profile_id?: number,
-    streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
-    session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
+    streaming = true, // test with the profile's real streaming mode so "streaming works, non-streaming does not" never leaks into conversations
+    session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
+    user_agent = "", // non-empty = the test overrides the User-Agent header with this value
   ) =>
-    // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
+    // reply = the model's actual reply (truncated); the backend marks a profile that replies with nothing as failed
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
       provider,
       model,
@@ -954,6 +1146,7 @@ export const api = {
       profile_id,
       streaming,
       session_header_key,
+      user_agent,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -967,23 +1160,24 @@ export const api = {
     rate_per_second?: number;
     rate_per_minute?: number;
     context_window_k?: number;
-    thinking_type?: string; // ""(不发送)|"disabled"|"enabled"
-    reasoning_effort?: string; // ""(不发送)|"low"|"medium"|"high"|"xhigh"|"max"
-    priority?: number; // 轮询顺位，越大越先用
-    pool_exclude?: boolean; // true=不作为故障转移目标
-    streaming?: boolean; // true(默认)=流式 | false=非流式
-    max_tokens?: number; // 单次回复输出上限；0=不发送，由服务端默认值决定
-    max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
-    session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
-    retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
+    thinking_type?: string; // ""(not sent)|"disabled"|"enabled"
+    reasoning_effort?: string; // ""(not sent)|"low"|"medium"|"high"|"xhigh"|"max"
+    priority?: number; // pool order position; higher is used first
+    pool_exclude?: boolean; // true = not a failover target
+    streaming?: boolean; // true (default) = streaming | false = non-streaming
+    max_tokens?: number; // output cap per reply; 0 = not sent, the server default decides
+    max_tokens_field?: string; // ""=max_tokens (default) | "max_completion_tokens" (openai format only)
+    session_header_key?: string; // non-empty = send this HTTP header on every request, value = the current session id; "" = not sent
+    user_agent?: string; // non-empty = override the User-Agent header on every request; "" = keep the default UA
+    retry?: LLMRetryOverride; // this profile's retry override; all zeros = follow the global retry policy
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
-  // 轮询链的实际顺序 + 各配置的熔断状态。
+  // The pool chain's actual order + each profile's breaker state.
   llmPool: () => get<LLMPoolStatus>("/llm/pool"),
-  // 清除熔断，让下一次调用立刻重试该配置；不传 id = 全部清除。
+  // Clear the breaker so the next call retries this profile immediately; no id = clear all.
   resetLLMPool: (id?: string) => post<LLMPoolStatus>("/llm/pool/reset", { id: id ? Number(id) : 0 }),
-  // 全局重试策略（五层各自的次数+间隔）。全 0 = 全部走内置默认。
+  // Global retry policy (count + interval for each of the five layers). All zeros = built-in defaults everywhere.
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
   fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
@@ -1038,13 +1232,13 @@ export const api = {
   saveAgentPrompt: (key: string, template: string, note = "") =>
     put<{ version: number }>(`/agents/${key}/prompt`, { template, note }),
   resetAgentPrompt: (key: string) => post<{ version: number }>(`/agents/${key}/prompt/reset`, {}),
-  // 收尾提示词(超时/步数耗尽的 settlement 提示);prompt 空串=清除覆盖、用内置默认;
-  // max_turns 省略则不动、传 0=用内置默认轮数
+  // Wrap-up prompt (the settlement prompt for timeout/step exhaustion); an empty prompt
+  // clears the override and uses the built-in default; omitting max_turns leaves it untouched, passing 0 uses the built-in default turn count
   saveAgentWrapup: (key: string, prompt: string, maxTurns?: number) =>
     put<{ ok: boolean }>(`/agents/${key}/wrapup`, { prompt, max_turns: maxTurns }),
   resetAgentWrapup: (key: string) =>
     post<{ ok: boolean; wrapup_default: string; wrapup_max_turns_default: number }>(`/agents/${key}/wrapup/reset`, {}),
-  // 任务级超时收尾词(仅 worker/planner);prompt 空=清除、用内置默认
+  // Task-level timeout wrap-up prompt (worker/planner only); an empty prompt clears the override and uses the built-in default
   saveAgentTaskTimeoutWrapup: (key: string, prompt: string, maxTurns?: number) =>
     put<{ ok: boolean }>(`/agents/${key}/wrapup/task-timeout`, { prompt, max_turns: maxTurns }),
   resetAgentTaskTimeoutWrapup: (key: string) =>
@@ -1052,7 +1246,7 @@ export const api = {
       `/agents/${key}/wrapup/task-timeout/reset`,
       {},
     ),
-  // P3 triggers (仅自定义 agent)
+  // P3 triggers (custom agents only)
   agentTriggers: (key: string) =>
     get<{ triggers: AgentTrigger[] }>(`/agents/${key}/triggers`).then((r) => arr(r.triggers)),
   createTrigger: (key: string, t: Omit<AgentTrigger, "id" | "agent_key" | "last_fire">) =>
@@ -1063,7 +1257,7 @@ export const api = {
   saveAgentConfig: (
     key: string,
     patch: {
-      llm_profile_id?: number | null; // number=绑定；null=解绑(跟随任务/全局)；缺省=不动
+      llm_profile_id?: number | null; // number = bound; null = unbound (follow task/global); omitted = untouched
       max_turns?: number;
       run_seconds?: number;
       web_search?: boolean;
@@ -1083,12 +1277,12 @@ export const api = {
   setAgentVisibility: (key: string, mcp: number[], skill: string[]) =>
     put<{ ok: boolean }>(`/agents/${key}/visibility`, { mcp, skill }),
 
-  // ---- tools (内置工具目录) ----
+  // ---- tools (built-in tool catalog) ----
   tools: () => get<{ tools: Tool[] }>("/tools").then((r) => arr(r.tools)),
   saveTool: (key: string, patch: Pick<Tool, "description" | "schema" | "agents" | "enabled">) =>
     put<{ ok: boolean }>(`/tools/${key}`, patch),
   resetTool: (key: string) => post<{ ok: boolean }>(`/tools/${key}/reset`, {}),
-  // custom tools (自定义工具)
+  // custom tools
   createCustomTool: (
     t: Pick<Tool, "key" | "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => post<{ key: string }>("/tools/custom", t),
@@ -1097,7 +1291,7 @@ export const api = {
     t: Pick<Tool, "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => put<{ ok: boolean }>(`/tools/custom/${key}`, t),
   deleteCustomTool: (key: string) => del<{ deleted: string }>(`/tools/custom/${key}`),
-  testCustomTool: (body: { kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
+  testCustomTool: (body: { key?: string; kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
     post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
   detectPython: () => post<{ python_interpreter: string }>("/settings/python/detect", {}),
 
@@ -1108,7 +1302,7 @@ export const api = {
   mcpTools: (id: number) => get<{ tools: MCPTool[] }>(`/mcp/${id}/tools`).then((r) => arr(r.tools)),
   refreshMcpServer: (id: number) => post<{ tools: MCPTool[] }>(`/mcp/${id}/refresh`, {}).then((r) => arr(r.tools)),
 
-  // ---- 资产同步 (ScopeSentry 数据源) ----
+  // ---- asset sync (ScopeSentry data source) ----
   ssStatus: () =>
     get<{ exists: boolean; configured: boolean; enabled: boolean; reachable: boolean; url?: string; tools: string[] }>(
       "/sync/scopesentry/status",
@@ -1137,7 +1331,7 @@ export const api = {
       errors: string[] | null;
     }>("/sync/scopesentry/sync", body),
 
-  // ---- skills (文件系统) ----
+  // ---- skills (file system) ----
   skills: () => get<{ skills: SkillItem[] }>("/skills").then((r) => arr(r.skills)),
   createSkill: (s: {
     name: string;
@@ -1148,7 +1342,7 @@ export const api = {
     instructions?: string;
   }) => post<{ name: string }>("/skills", s),
   // uploadSkill installs a skill from a .zip (multipart). Surfaces the backend
-  // error text (e.g. 已存在 / 缺少 SKILL.md) so the UI can show a precise message.
+  // error text (e.g. already exists / missing SKILL.md) so the UI can show a precise message.
   uploadSkill: async (file: File, overwrite = false): Promise<{ name: string; files: number }> => {
     if (MOCK) return { name: file.name.replace(/\.zip$/i, ""), files: 1 };
     const fd = new FormData();
@@ -1160,7 +1354,7 @@ export const api = {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body?.error || `上传失败(${r.status})`);
+    if (!r.ok) throw new Error(body?.error || t("Upload failed ({status})", { status: r.status }));
     return body;
   },
   deleteSkill: (name: string) => del<{ deleted: string }>(`/skills/${name}`),
@@ -1186,7 +1380,7 @@ export const api = {
   toggleVisibility: (agentId: string, kind: string, resourceId: number, visible: boolean) =>
     post<{ ok: boolean }>("/visibility/toggle", { agent_id: agentId, kind, resource_id: resourceId, visible }),
 
-  // ---- visibility (Skill，按名称) ----
+  // ---- visibility (Skill, by name) ----
   skillVisibility: (name: string) => get<{ agents: string[] }>(`/visibility/skill/${name}`).then((r) => arr(r.agents)),
   toggleSkillVisibility: (agentId: string, skillName: string, visible: boolean) =>
     post<{ ok: boolean }>("/visibility/skill/toggle", { agent_id: agentId, skill_name: skillName, visible }),
@@ -1201,7 +1395,7 @@ export const api = {
   toggleInterceptRule: (id: number, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/intercept/rules/${id}/toggle`, { enabled }),
 
-  // ---- asset intercept rules（资产拦截：全局黑名单） ----
+  // ---- asset intercept rules (asset interception: global blocklist) ----
   assetInterceptRules: () => get<{ rules: AssetInterceptRule[] }>("/asset-intercept/rules").then((r) => arr(r.rules)),
   createAssetInterceptRule: (rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
     post<AssetInterceptRule>("/asset-intercept/rules", rule),
@@ -1216,6 +1410,12 @@ export const api = {
   interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
   interceptDecide: (id: number, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
+  // 200 even on partial failure: each id carries its own ok/error.
+  interceptBatchDecide: (ids: number[], decision: "allowed" | "denied") =>
+    post<import("@/lib/types").InterceptBatchDecideResult>("/intercept/pending/batch-decide", { ids, decision }),
+  // No body: the server derives the rule from the stored request, which stays pending.
+  interceptAlwaysAllow: (id: number) =>
+    post<{ rule: InterceptRule; created: boolean }>(`/intercept/pending/${id}/always-allow`),
   interceptExecution: (id: number, conversationId?: number) =>
     get<import("@/lib/types").InterceptExecution>(
       `/intercept/history/${id}/execution${conversationId ? `?conversation=${conversationId}` : ""}`,
@@ -1239,7 +1439,7 @@ export const api = {
       total: r.total ?? r.items?.length ?? 0,
     })),
 
-  // ---- intercept tool-config (全局工具拦截范围) ----
+  // ---- intercept tool-config (global tool interception scope) ----
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
     if (MOCK) return { enabled_tools: ["bash"] };
     const token = getToken();
@@ -1263,7 +1463,7 @@ export const api = {
     if (!r.ok) throw new Error(await r.text());
   },
 
-  // ---- intercept LLM judge (模型兜底审批,全局配置) ----
+  // ---- intercept LLM judge (model fallback approval, global config) ----
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
   interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
@@ -1277,7 +1477,7 @@ export const api = {
     sp.set("size", String(params?.size ?? 50));
     return get<{ commands: CommandRecord[]; total: number }>(`/commands?${sp}`);
   },
-  // 各工具调用次数；沿用列表的 task/q 筛选，统计的是整个结果集而非当前页。
+  // Per-tool call counts; reuses the list's task/q filters and stats the whole result set, not the current page.
   commandStats: (params?: { task?: string; q?: string }) => {
     const sp = new URLSearchParams();
     if (params?.task) sp.set("task", params.task);
@@ -1298,19 +1498,8 @@ export const api = {
   llmRecordDetail: (id: number) => get<LLMRecordDetail>(`/llm/records/${id}`),
   llmTasks: () => get<{ tasks: LLMTask[] }>(`/llm/records/tasks`),
   llmRecordsDeleteTask: (task: string) => del<{ deleted: number }>(`/llm/records?task=${encodeURIComponent(task)}`),
-  // 按模型聚合本任务的 token 用量（来自常开的 llm_usage 计量账本，逐次调用精确，
-  // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
+  // Token usage of this task aggregated per model (from the always-on llm_usage metering
+  // ledger, exact per call, covering per-agent bindings / pooling / interrupted spend).
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
-
-  // ---- 一键更新 ----
-  // 检查以后端为准：下载是后端做的，浏览器能连 GitHub 而服务器连不上的情况很常见
-  // （服务器在内网、代理只配在浏览器上），那时点更新必然失败。
-  // 后端对 GitHub 的查询结果有 30 分钟缓存（未认证的 GitHub API 是 60 次/小时/IP，
-  // 顶栏每次整页加载都会查一次，不缓存会很快耗光配额）。force=true 强制回源，
-  // 留给用户显式点「检查更新」时用。
-  checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=1" : ""}`),
-  // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
-  applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
-  rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
 };

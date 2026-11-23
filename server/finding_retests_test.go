@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/intercept"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -38,7 +38,7 @@ func newRetestServer(t *testing.T) (*Server, int64) {
 	t.Helper()
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skip("test postgres not configured")
+		db.SkipPGUnavailable(t, err)
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
@@ -51,20 +51,22 @@ func newRetestServer(t *testing.T) (*Server, int64) {
 	if err := s.seedFindingRetester(); err != nil {
 		t.Fatal(err)
 	}
-	fid, err := pg.AddFinding(0, 0, "retest-server", "复测测试", "high", "summary", "original proof", "worker", nil)
+	fid, err := pg.AddFinding(0, 0, "retest-server", "retest test", "high", "summary", "original proof", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldAugment, oldResolve, oldPrompt := agent.ToolAugment, agent.ToolResolve, agent.PromptOverride
-	agent.ToolAugment = func(context.Context, string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
+	oldAugment, oldResolve, oldPrompt := agent.ToolAugment(), agent.ToolResolve(), agent.PromptOverride()
+	agent.SetToolAugment(func(context.Context, string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		return s.findingRetestTools(), agent.DeferredInfo{}, func() {}
-	}
-	agent.ToolResolve = nil
-	agent.PromptOverride = func(string) (string, bool) { return agent.RetesterDefaultPrompt, true }
+	})
+	agent.SetToolResolve(nil)
+	agent.SetPromptOverride(func(string) (string, bool) { return agent.RetesterDefaultPrompt, true })
 	t.Cleanup(func() {
 		cancel()
 		waitRetestIdle(t, s)
-		agent.ToolAugment, agent.ToolResolve, agent.PromptOverride = oldAugment, oldResolve, oldPrompt
+		agent.SetToolAugment(oldAugment)
+		agent.SetToolResolve(oldResolve)
+		agent.SetPromptOverride(oldPrompt)
 		_, _ = pg.Exec(`DELETE FROM conversations WHERE id IN (SELECT conversation_id FROM finding_retests WHERE finding_id=$1)`, fid)
 		_, _ = pg.DeleteFinding(fid)
 		pg.Close()
@@ -177,14 +179,14 @@ func TestRetestHTTPThroughConversationAndTools(t *testing.T) {
 			if !bytes.Contains(serialized, []byte("original proof")) {
 				t.Error("agent did not receive source evidence")
 			}
-			name, input = "record_finding_retest_result", `{"verdict":"inconclusive","summary":"缺少测试登录态","evidence":"已检查原证据；当前缺少有效登录态，无法确认修复状态。"}`
+			name, input = "record_finding_retest_result", `{"verdict":"inconclusive","summary":"missing test login state","evidence":"checked the original evidence; no valid login state is currently available, so the fix status cannot be confirmed."}`
 		}
 		if n > 2 {
-			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("复测结论已保存")}}, "end_turn", llm.Usage{}, nil
+			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("retest conclusion saved")}}, "end_turn", llm.Usage{}, nil
 		}
 		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: strconv.Itoa(int(n)), Name: name, Input: json.RawMessage(input)}}}, "tool_use", llm.Usage{}, nil
 	}})
-	w := retestRequest(s.startFindingRetest, "POST", fid, `{"notes":"仅验证原接口"}`)
+	w := retestRequest(s.startFindingRetest, "POST", fid, `{"notes":"only verify the original interface"}`)
 	if w.Code != 202 {
 		t.Fatalf("create: %d %s", w.Code, w.Body)
 	}
@@ -232,7 +234,7 @@ func TestRetestStopsFailuresAndNoVerdict(t *testing.T) {
 				if mode == "failure" {
 					return llm.Message{}, "", llm.Usage{}, errors.New("test model failed")
 				}
-				return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("未保存结论")}}, "end_turn", llm.Usage{}, nil
+				return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("conclusion not saved")}}, "end_turn", llm.Usage{}, nil
 			}})
 			w := retestRequest(s.startFindingRetest, "POST", fid, `{}`)
 			if w.Code != 202 {
@@ -266,9 +268,9 @@ func TestRetestFixedUpdatesFindingThroughConversation(t *testing.T) {
 	var calls atomic.Int32
 	setRetestProvider(s, retestProvider{complete: func(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 		if calls.Add(1) == 1 {
-			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "fixed-result", Name: "record_finding_retest_result", Input: json.RawMessage(`{"verdict":"fixed","summary":"修复生效","evidence":"原触发条件失效，正常对照仍可用。"}`)}}}, "tool_use", llm.Usage{}, nil
+			return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "fixed-result", Name: "record_finding_retest_result", Input: json.RawMessage(`{"verdict":"fixed","summary":"fix is effective","evidence":"the original trigger condition no longer works; the normal control remains usable."}`)}}}, "tool_use", llm.Usage{}, nil
 		}
-		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("结论已保存")}}, "end_turn", llm.Usage{}, nil
+		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("conclusion saved")}}, "end_turn", llm.Usage{}, nil
 	}})
 	w := retestRequest(s.startFindingRetest, "POST", fid, `{}`)
 	if w.Code != http.StatusAccepted {
@@ -292,7 +294,7 @@ func TestRetestValidationSeedingAndScope(t *testing.T) {
 		id   int64
 		body string
 		code int
-	}{{0, `{}`, 400}, {fid, `{`, 400}, {fid, `{"notes":"` + strings.Repeat("文", 4001) + `"}`, 400}, {999999999, `{}`, 404}, {fid, `{}`, 503}} {
+	}{{0, `{}`, 400}, {fid, `{`, 400}, {fid, `{"notes":"` + strings.Repeat("x", 4001) + `"}`, 400}, {999999999, `{}`, 404}, {fid, `{}`, 503}} {
 		w := retestRequest(s.startFindingRetest, "POST", tc.id, tc.body)
 		if w.Code != tc.code {
 			t.Fatalf("code=%d want=%d %s", w.Code, tc.code, w.Body)

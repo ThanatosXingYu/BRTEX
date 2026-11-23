@@ -6,15 +6,21 @@ package llmrec
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"iter"
 	"log"
 	"strings"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
+
+// errStreamAbandoned marks a stream whose consumer stopped reading before
+// message_stop while its context was still live. The call did not complete,
+// so it is metered as an error rather than inferred from ctx.Err().
+var errStreamAbandoned = errors.New("llmrec: consumer stopped reading before message_stop")
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
@@ -60,15 +66,45 @@ func workerFrom(ctx context.Context) string {
 	return strings.TrimSpace(worker)
 }
 
+type usageSinkContextKey struct{}
+
+// WithUsageSink attaches a callback that receives the usage of every metered
+// call made under ctx — the same value, at the same point, as the llm_usage row.
+// The task runtime uses it to meter run budgets.
+func WithUsageSink(ctx context.Context, sink func(llm.Usage)) context.Context {
+	return context.WithValue(ctx, usageSinkContextKey{}, sink)
+}
+
+type stopSinkContextKey struct{}
+
+// WithStopSink attaches a callback that receives the stop reason of every call
+// made under ctx that completes normally, once per call, after the provider's
+// last event ("" when the provider reported none). The harness keeps the stop
+// reason only long enough to decide whether a turn used tools, so a host that
+// must tell a provider refusal (Anthropic stop_reason "refusal", or
+// finish_reason "content_filter" on OpenAI-compatible endpoints) from an
+// ordinary end of turn observes it here.
+func WithStopSink(ctx context.Context, sink func(stopReason string)) context.Context {
+	return context.WithValue(ctx, stopSinkContextKey{}, sink)
+}
+
+// reportStop hands stopReason to the ctx stop sink, if one is attached.
+func reportStop(ctx context.Context, stopReason string) {
+	if sink, _ := ctx.Value(stopSinkContextKey{}).(func(string)); sink != nil {
+		sink(stopReason)
+	}
+}
+
 // Recorder wraps an llm.Provider and records every completion call.
 type Recorder struct {
 	inner llm.Provider
 	pg    *db.DB
 	model string // model name (from config, not in CompletionRequest)
 	prof  string // LLM profile name (from llm_profiles)
-	// thinkingType / reasoningEffort 是配置级思考参数(思考开关 / 思考强度)。它们在
-	// norma 的 buildBody() 里从 provider 配置注入真正的 HTTP body,不出现在
-	// CompletionRequest 上,故 Recorder 需在此单独带一份,序列化时写进录制。
+	// thinkingType / reasoningEffort are the config-level thinking params (thinking
+	// toggle / thinking effort). norma's buildBody() injects them from the provider
+	// config into the actual HTTP body; they never appear on CompletionRequest, so
+	// the Recorder carries its own copy here and writes it into the recording.
 	thinkingType    string
 	reasoningEffort string
 	enabled         func() bool // reports whether recording is currently on; nil = always record
@@ -121,6 +157,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// stats and must be complete even for interrupted/failed runs, so it is NOT
 	// gated. Only body serialization + response accumulation are skipped when off.
 	recordBodies := r.enabled == nil || r.enabled()
+	collectContext := ContextTelemetryEnabled()
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
@@ -133,6 +170,11 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 		// Backward compatibility for non-task callers. For task calls, the task
 		// runtime always supplies the registry id explicitly.
 		taskID = parsedID
+	}
+
+	var ctxMetrics ContextMetrics
+	if collectContext {
+		ctxMetrics = MeasureContext(req)
 	}
 
 	// Serialize the request only when storing bodies (this is the expensive part).
@@ -154,6 +196,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			usage       llm.Usage
 			stopReason  string
 			streamErr   error
+			complete    bool // message_stop was seen
 		)
 
 		finished := false
@@ -167,7 +210,11 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				status = "error"
 			}
 			// Lightweight metering row — always written.
-			r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+			r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+			// Opt-in context size telemetry — independent of recordBodies.
+			if collectContext {
+				r.recordContext(taskID, worker, ctxMetrics, usage, status)
+			}
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
 				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
@@ -185,11 +232,11 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				return
 			}
 			// Always track usage (cheap); accumulate text/thinking only for bodies.
-			// Anthropic (and the other providers) split token usage across events:
-			// message_start carries ONLY the input side (input + cache), message_delta
-			// ONLY the output. They must be FOLDED with Add — overwriting on delta
-			// would zero out the input already counted at start (mirrors the SDK's own
-			// llm.Accumulator; see norma/llm/accumulate.go).
+			// message_start carries the input side (input + cache) and is added.
+			// Since Norma v0.4.7 message_delta also echoes that input side next to the
+			// output, so it is folded with llm.Usage.MergeEcho (max on echoed fields,
+			// sum on output), as llm.Accumulator does; Add would count the input and
+			// cache twice. An output-only delta folds the same either way.
 			switch ev.Type {
 			case llm.SETextDelta:
 				if recordBodies {
@@ -205,14 +252,28 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				if ev.StopReason != "" {
 					stopReason = ev.StopReason
 				}
-				usage.Add(ev.Usage)
+				usage.MergeEcho(ev.Usage)
+			case llm.SEMessageStop:
+				complete = true
 			}
 			if !yield(ev, err) {
+				// The consumer stopped early. Decide the status here from what
+				// is known, not later in the deferred finish: the call only
+				// counts as "ok" if message_stop arrived and ctx is live.
+				switch {
+				case ctx.Err() != nil:
+					finish(ctx.Err())
+				case !complete:
+					finish(errStreamAbandoned)
+				default:
+					finish(nil)
+				}
 				return
 			}
 		}
 
 		// Stream completed normally.
+		reportStop(ctx, stopReason)
 		finish(streamErr)
 	}
 }
@@ -221,6 +282,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 // usage metering, normalized body recording and raw wire capture as Stream.
 func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 	recordBodies := r.enabled == nil || r.enabled()
+	collectContext := ContextTelemetryEnabled()
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
@@ -231,6 +293,11 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	taskID := TaskIDFrom(ctx)
 	if taskID == "" {
 		taskID = parsedID
+	}
+
+	var ctxMetrics ContextMetrics
+	if collectContext {
+		ctxMetrics = MeasureContext(req)
 	}
 
 	reqBody := ""
@@ -244,8 +311,13 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	status := "ok"
 	if err != nil {
 		status = "error"
+	} else {
+		reportStop(ctx, stopReason)
 	}
-	r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	if collectContext {
+		r.recordContext(taskID, worker, ctxMetrics, usage, status)
+	}
 	if recordBodies {
 		r.record(req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
 	}
@@ -263,13 +335,18 @@ func thinkingText(msg llm.Message) string {
 }
 
 // recordUsage appends one lightweight metering row to llm_usage (no bodies). Skips
-// zero-token calls with no model, which carry nothing worth metering.
-func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, status string) {
-	if r.pg == nil {
-		return
-	}
+// zero-token calls with no model, which carry nothing worth metering. The ctx
+// usage sink (if any) sees these calls even when no PostgreSQL recorder is set
+// (r.pg == nil), so a budget also counts calls that are not persisted.
+func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, status string) {
 	if r.model == "" && usage.InputTokens == 0 && usage.OutputTokens == 0 &&
 		usage.CacheReadTokens == 0 && usage.CacheWriteTokens == 0 {
+		return
+	}
+	if sink, _ := ctx.Value(usageSinkContextKey{}).(func(llm.Usage)); sink != nil {
+		sink(usage)
+	}
+	if r.pg == nil {
 		return
 	}
 	err := r.pg.InsertLLMUsage(&db.LLMUsage{
@@ -358,9 +435,11 @@ func (r *Recorder) serializeRequest(req llm.CompletionRequest) string {
 		"messages":   req.Messages,
 		"max_tokens": req.MaxTokens,
 	}
-	// 记录本次调用实际发出的思考参数。type 采用「有效值」：每请求覆盖 req.Thinking
-	// 优先于配置级 thinkingType(与 norma buildBody 的判定一致，如 compaction 摘要会
-	// 强制 disabled)；effort 无每请求覆盖，直接取配置值。两者皆空则不写 thinking 字段。
+	// Record the thinking params actually sent on this call. type takes the effective
+	// value: the per-request override req.Thinking wins over the config-level
+	// thinkingType (matching norma buildBody's decision — e.g. compaction summaries
+	// force disabled); effort has no per-request override, so the config value is
+	// used directly. When both are empty, no thinking field is written.
 	effType := r.thinkingType
 	if req.Thinking != "" {
 		effType = req.Thinking

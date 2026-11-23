@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/db"
+	"github.com/Autumn-27/artex/db"
 )
 
 func TestFindingPaginationParam(t *testing.T) {
@@ -39,7 +39,7 @@ func TestFindingPaginationParam(t *testing.T) {
 func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	marker := fmt.Sprintf("__server_finding_groups_%d__", time.Now().UnixNano())
@@ -149,7 +149,7 @@ func TestFindingGroupsReturnsTaskBucketsAndNormalizesPagination(t *testing.T) {
 func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 
@@ -178,7 +178,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx}
 	live, unsubscribe := s.engine.Broadcaster().Subscribe(task.ID)
 	defer unsubscribe()
-	body := bytes.NewBufferString(`{"description":"验证完整利用链并保留可复现证据"}`)
+	body := bytes.NewBufferString(`{"description":"verify the full exploitation chain and retain reproducible evidence"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/1/deepen", body)
 	req.SetPathValue("id", strconv.FormatInt(findingID, 10))
 	rec := httptest.NewRecorder()
@@ -216,7 +216,7 @@ func TestDeepenFindingCreatesAuditedIntentAndRevivesTask(t *testing.T) {
 	var persistedAudit db.Activity
 	auditCount := 0
 	for _, item := range activity {
-		if item.Worker == "system" && strings.Contains(item.Summary, "人工提交漏洞深入利用意图") {
+		if item.Worker == "system" && strings.Contains(item.Summary, "manually submitted vulnerability deep-exploitation intent") {
 			persistedAudit = item
 			auditCount++
 		}
@@ -278,7 +278,7 @@ func TestDeepenFindingValidatesDescription(t *testing.T) {
 func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	task, err := m.CreateTask("deepen rollback", "leave no orphan intent", nil, 0, 0)
@@ -286,15 +286,19 @@ func TestDeepenAdmissionFailureDiscardsFollowUpIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
+	var findingID int64
 	defer func() {
 		_, _ = m.pg.Exec(`UPDATE tasks SET deleted_at=NULL WHERE id=$1`, taskID)
+		if findingID > 0 {
+			_, _ = m.pg.DeleteFinding(findingID)
+		}
 		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
 	}()
 	findingNodeID, err := task.Store.AddNode(db.KindFinding, map[string]any{"summary": "source"}, 5, "confirmed", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	findingID, err := m.pg.AddFinding(taskID, findingNodeID, "test", "source", db.SeverityHigh, "source", "", "worker", nil)
+	findingID, err = m.pg.AddFinding(taskID, findingNodeID, "test", "source", db.SeverityHigh, "source", "", "worker", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

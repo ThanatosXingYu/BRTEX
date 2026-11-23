@@ -4,6 +4,7 @@ import * as React from "react"
 import { Dialog as DialogPrimitive } from "radix-ui"
 
 import { cn, radixOverlayWasOpenAtPointerDown } from "@/lib/utils"
+import { t } from "@/i18n"
 import { Button } from "@/components/ui/button"
 import { XIcon } from "lucide-react"
 
@@ -61,12 +62,12 @@ function DialogContent({
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
-        // 关闭对话框的唯一条件:点击的是遮罩(灰色背景)本身,且此刻没有任何 Radix 弹层
-        // (Select 下拉等)开着。其余"外部交互"一律挡掉(Esc、右上角 ✕ 仍可关):
-        //  · 点弹层里的选项 → target 不是遮罩 → 挡;
-        //  · 弹层开着时点对话框外/遮罩想收起它 → 有弹层开着 → 挡(只收弹层,不关对话框);
-        //  · 弹层收起时焦点移动被 Radix 误判为焦点移出 → target 不是遮罩 → 挡。
-        // (onInteractOutside 在指针/焦点两条路径都会触发。)调用方仍可追加逻辑。
+        // The only condition that closes the dialog: the click hits the overlay (the gray backdrop) itself, and no Radix popover
+        // (Select dropdown etc.) is open at that moment. Every other "outside interaction" is blocked (Esc and the ✕ at the top-right still close it):
+        //  · clicking an option in the popover → target is not the overlay → blocked;
+        //  · clicking outside the dialog or on the overlay to dismiss an open popover → a popover is open → blocked (dismiss only the popover, keep the dialog);
+        //  · when the popover closes, Radix misreads the focus move as focus leaving → target is not the overlay → blocked.
+        // (onInteractOutside fires on both the pointer and focus paths.) Callers can still append their own logic.
         onInteractOutside={(e) => {
           const target = e.detail.originalEvent.target as Element | null
           const onOverlay = !!target?.closest?.("[data-slot='dialog-overlay']")
@@ -89,7 +90,7 @@ function DialogContent({
             >
               <XIcon
               />
-              <span className="sr-only">Close</span>
+              <span className="sr-only">{t("Close")}</span>
             </Button>
           </DialogPrimitive.Close>
         )}
@@ -128,7 +129,7 @@ function DialogFooter({
       {children}
       {showCloseButton && (
         <DialogPrimitive.Close asChild>
-          <Button variant="outline">Close</Button>
+          <Button variant="outline">{t("Close")}</Button>
         </DialogPrimitive.Close>
       )}
     </div>

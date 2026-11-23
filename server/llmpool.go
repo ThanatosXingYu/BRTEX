@@ -1,42 +1,37 @@
 package server
 
 import (
+	"context"
 	"log"
+	"sync"
 	"time"
 
-	"github.com/ThanatosXingYu/BRTEX/agent"
-	"github.com/ThanatosXingYu/BRTEX/db"
-	"github.com/ThanatosXingYu/BRTEX/llmpool"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/norma/llm"
 )
 
-// LLM 轮询(故障转移)的服务端接线。设计见 docs/LLM轮询设计.md：
-//   - 全局激活配置这条路径(agent 未绑定、任务未 pin)才轮询;
-//   - 绑定/pin 的路径默认独占该配置,失败即失败(可由 llm_pool_bind_fallback 打开兜底);
-//   - 链序 = 激活配置 → 其余按 priority DESC,排除 pool_exclude 的;
-//   - 熔断状态进程级共享(s.llmHealth),重建 pool 不清空。
+// Server-side wiring for LLM pooling (failover). Design: docs/llm-polling-design.md:
+//   - Only the global active-profile path pools (agent unbound, task not pinned);
+//   - Bound/pinned paths own that profile exclusively by default: a failure is a failure (llm_pool_bind_fallback can turn on the fallback);
+//   - Chain order = active profile → the rest by priority DESC, excluding pool_exclude ones;
+//   - Circuit-breaker state is process-wide (s.llmHealth); rebuilding the pool does not clear it.
 
 // newLLMHealthRegistry builds the process-wide circuit-breaker registry, mirroring
-// state into PG so a cooling-off window survives a restart. Writes are async and
-// best-effort — the in-memory copy is authoritative.
-func newLLMHealthRegistry(pg *db.DB) *llmpool.Registry {
+// state into PG so a cooling-off window survives a restart. Writes are async.
+// The in-memory copy is authoritative. The returned syncer is nil when there is
+// no database; otherwise it flushes when ctx is cancelled.
+func newLLMHealthRegistry(ctx context.Context, pg *db.DB) (*llmpool.Registry, *healthSync) {
 	if pg == nil {
-		return llmpool.NewRegistry(nil, nil)
+		return llmpool.NewRegistry(nil, nil), nil
 	}
+	syncer := newHealthSync(ctx, pg.SaveLLMHealth, pg.ClearLLMHealth)
 	persist := func(id int64, st llmpool.State) {
-		h := db.LLMHealth{ProfileID: id, Fails: st.Fails, Trips: st.Trips, LastError: st.LastError}
-		if !st.OpenUntil.IsZero() {
-			t := st.OpenUntil
-			h.OpenUntil = &t
-		}
-		go func() {
-			if err := pg.SaveLLMHealth(h); err != nil {
-				log.Printf("[llmpool] 熔断状态落库失败: %v", err)
-			}
-		}()
+		syncer.enqueue(id, healthOp{st: st})
 	}
 	forget := func(id int64) {
-		go func() { _ = pg.ClearLLMHealth(id) }()
+		syncer.enqueue(id, healthOp{clear: true})
 	}
 	reg := llmpool.NewRegistry(persist, forget)
 	// Restore only windows that haven't expired (LoadLLMHealth filters), so a
@@ -48,10 +43,202 @@ func newLLMHealthRegistry(pg *db.DB) *llmpool.Registry {
 				st.OpenUntil = *h.OpenUntil
 			}
 			reg.Restore(h.ProfileID, st)
-			log.Printf("[llmpool] 恢复熔断状态: 配置 #%d 冷却至 %s", h.ProfileID, st.OpenUntil.Format(time.RFC3339))
+			log.Printf("[llmpool] restored circuit-breaker state: profile #%d cooling until %s", h.ProfileID, st.OpenUntil.Format(time.RFC3339))
 		}
 	}
-	return reg
+	return reg, syncer
+}
+
+// healthOp is one circuit-breaker write for a profile. clear drops the row.
+// seq orders writes for that profile: a newer op wins over one still in flight.
+type healthOp struct {
+	seq   uint64
+	clear bool
+	st    llmpool.State
+}
+
+// healthSync writes circuit-breaker state from one goroutine. A newer update for
+// the same profile replaces one that has not been written yet, so a burst of
+// state changes becomes one database call. The database call runs without mu,
+// so enqueue does not wait on a slow write. writeMu keeps those calls in order.
+// Before each call, an op that is already older than the applied or pending
+// sequence is dropped. save and clear must not call enqueue.
+type healthSync struct {
+	save       func(db.LLMHealth) error
+	clear      func(int64) error
+	retryAfter time.Duration // tests set a short delay; zero uses one second
+	mu         sync.Mutex
+	writeMu    sync.Mutex // orders database calls; enqueue does not take it
+	pending    map[int64]healthOp
+	applied    map[int64]uint64
+	seq        uint64
+	stopped    bool
+	wake       chan struct{}
+	done       chan struct{}
+}
+
+func newHealthSync(ctx context.Context, save func(db.LLMHealth) error, clear func(int64) error) *healthSync {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h := &healthSync{
+		save:    save,
+		clear:   clear,
+		pending: map[int64]healthOp{},
+		applied: map[int64]uint64{},
+		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
+	go h.loop(ctx)
+	return h
+}
+
+// FlushLLMHealth waits until the circuit-breaker writer has flushed the ops
+// queued before shutdown. Call it after the server context is cancelled and
+// before the database closes.
+func (s *Server) FlushLLMHealth() {
+	if s == nil || s.llmHealthSync == nil {
+		return
+	}
+	select {
+	case <-s.llmHealthSync.done:
+	case <-time.After(5 * time.Second):
+		log.Printf("[llmpool] timed out flushing circuit-breaker state")
+	}
+}
+
+func (h *healthSync) enqueue(id int64, op healthOp) {
+	h.mu.Lock()
+	h.seq++
+	op.seq = h.seq
+	if h.stopped {
+		h.mu.Unlock()
+		if err := h.apply(id, op); err != nil {
+			log.Printf("[llmpool] write circuit-breaker profile #%d: %v", id, err)
+		}
+		return
+	}
+	if prev, ok := h.pending[id]; ok && prev.seq > op.seq {
+		h.mu.Unlock()
+		return
+	}
+	h.pending[id] = op
+	h.mu.Unlock()
+	select {
+	case h.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (h *healthSync) take() map[int64]healthOp {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.pending) == 0 {
+		return nil
+	}
+	out := h.pending
+	h.pending = map[int64]healthOp{}
+	return out
+}
+
+func (h *healthSync) restore(id int64, op healthOp) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopped || h.applied[id] >= op.seq {
+		return
+	}
+	if cur, ok := h.pending[id]; ok && cur.seq >= op.seq {
+		return
+	}
+	h.pending[id] = op
+}
+
+// superseded reports whether a newer op for id is already applied or waiting.
+// The caller holds writeMu, so the decision and the database call stay in order.
+func (h *healthSync) superseded(id int64, seq uint64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if seq > 0 && h.applied[id] >= seq {
+		return true
+	}
+	cur, ok := h.pending[id]
+	return ok && cur.seq > seq
+}
+
+func (h *healthSync) apply(id int64, op healthOp) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if h.superseded(id, op.seq) {
+		return nil
+	}
+	var err error
+	if op.clear {
+		if h.clear != nil {
+			err = h.clear(id)
+		}
+	} else if h.save != nil {
+		row := db.LLMHealth{ProfileID: id, Fails: op.st.Fails, Trips: op.st.Trips, LastError: op.st.LastError}
+		if !op.st.OpenUntil.IsZero() {
+			openUntil := op.st.OpenUntil
+			row.OpenUntil = &openUntil
+		}
+		err = h.save(row)
+	}
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	if h.applied[id] < op.seq {
+		h.applied[id] = op.seq
+	}
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *healthSync) write(batch map[int64]healthOp) (failed bool) {
+	for id, op := range batch {
+		if err := h.apply(id, op); err != nil {
+			log.Printf("[llmpool] write circuit-breaker profile #%d: %v", id, err)
+			h.restore(id, op)
+			failed = true
+		}
+	}
+	return failed
+}
+
+func (h *healthSync) finish() {
+	h.mu.Lock()
+	h.stopped = true
+	batch := h.pending
+	h.pending = map[int64]healthOp{}
+	h.mu.Unlock()
+	for id, op := range batch {
+		if err := h.apply(id, op); err != nil {
+			log.Printf("[llmpool] write circuit-breaker profile #%d: %v", id, err)
+		}
+	}
+}
+
+func (h *healthSync) loop(ctx context.Context) {
+	defer close(h.done)
+	for {
+		failed := h.write(h.take())
+		delay := h.retryAfter
+		if delay <= 0 {
+			delay = time.Second
+		}
+		var retry <-chan time.Time
+		if failed {
+			retry = time.After(delay)
+		}
+		select {
+		case <-ctx.Done():
+			h.finish()
+			return
+		case <-h.wake:
+		case <-retry:
+		}
+	}
 }
 
 // poolMember builds one chain member from a profile, reusing the per-profile
@@ -65,7 +252,10 @@ func (s *Server) poolMember(p *db.LLMProfile, rank int) *llmpool.Member {
 	return &llmpool.Member{
 		ID: p.ID, Name: p.Name, Model: p.Model, Format: p.Format,
 		Priority: p.Priority, Active: p.IsDefault, Rank: rank,
-		WindowTokens: cfg.CompactionWindow(), Prov: prov,
+		// Actual window, not CompactionWindow(): that helper floors at 32K for
+		// compaction math, which would let an 8K profile accept a 16K request
+		// and then 400 without failover.
+		WindowTokens: cfg.ContextWindowTokens(), Prov: prov,
 	}
 }
 
@@ -83,7 +273,7 @@ func (s *Server) poolChain(headID int64, headProv llm.Provider, headCfg agent.Co
 	}
 	profs, err := s.m.pg.PoolProfiles()
 	if err != nil {
-		log.Printf("[llmpool] 读取轮询链失败: %v", err)
+		log.Printf("[llmpool] failed to read the pool chain: %v", err)
 		return nil
 	}
 	var head *db.LLMProfile
@@ -103,7 +293,7 @@ func (s *Server) poolChain(headID int64, headProv llm.Provider, headCfg agent.Co
 	members := []*llmpool.Member{{
 		ID: head.ID, Name: head.Name, Model: head.Model, Format: head.Format,
 		Priority: head.Priority, Active: head.IsDefault, Rank: llmpool.RankActive,
-		WindowTokens: headCfg.CompactionWindow(), Prov: headProv,
+		WindowTokens: headCfg.ContextWindowTokens(), Prov: headProv,
 	}}
 	for _, p := range profs {
 		if p.ID == headID {
@@ -136,7 +326,7 @@ func (s *Server) poolForActive(activeID int64, prov llm.Provider, cfg agent.Conf
 	for _, m := range pool.Members() {
 		names = append(names, m.Name+"/"+m.Model)
 	}
-	log.Printf("[llmpool] LLM 轮询已启用，链路(%d): %v", len(names), names)
+	log.Printf("[llmpool] LLM pooling enabled, chain (%d): %v", len(names), names)
 	return pool
 }
 

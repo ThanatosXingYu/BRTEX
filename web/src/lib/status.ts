@@ -1,5 +1,7 @@
 // Centralised status → color/label semantics, reused across the whole app.
-// Spec §8.3: 意图 / 覆盖 / 任务 / 严重度 each have a consistent color set.
+// Spec §8.3: intent / coverage / task / severity each have a consistent color set.
+
+import { t } from "@/i18n";
 
 export type Tone = "neutral" | "blue" | "green" | "amber" | "red" | "rose" | "violet" | "slate";
 
@@ -9,7 +11,7 @@ export const toneClasses: Record<Tone, string> = {
   green: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/20",
   amber: "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/20",
   red: "bg-red-500/15 text-red-600 dark:text-red-400 border-red-500/20",
-  // rose 用作「严重」——实心高强调,视觉上明显高于「高危」的软红描边。
+  // rose is used for "Critical" — a solid high-emphasis fill clearly above the soft red outline of "High".
   rose: "bg-rose-600 text-white border-rose-600 dark:bg-rose-600 dark:text-white",
   violet: "bg-violet-500/15 text-violet-600 dark:text-violet-400 border-violet-500/20",
   slate: "bg-slate-500/15 text-slate-600 dark:text-slate-400 border-slate-500/20",
@@ -32,81 +34,81 @@ interface StatusMeta {
 }
 
 const intent: Record<string, StatusMeta> = {
-  open: { label: "待领", tone: "slate" },
-  running: { label: "执行中", tone: "blue" },
-  paused: { label: "已暂停", tone: "amber" },
-  done: { label: "已完成", tone: "green" },
-  // blocked = 模型/API/网络故障重试用尽，这条意图基本没真正探成（非目标拦截）。
-  blocked: { label: "执行出错", tone: "red" },
-  // exhausted = 达到步数/时间预算被中途掐断、只写回部分结果（非方向已探尽）。
-  exhausted: { label: "预算耗尽", tone: "violet" },
-  // stopped = 历史软删除状态（保留,历史数据）。
-  stopped: { label: "已停止", tone: "slate" },
-  // deleted = 用户假删除了该意图（保留节点与血缘，删除原因见 delete_reason 字段）。
-  deleted: { label: "已删除", tone: "slate" },
+  open: { label: t("Open"), tone: "slate" },
+  running: { label: t("Running"), tone: "blue" },
+  paused: { label: t("Paused"), tone: "amber" },
+  done: { label: t("Completed"), tone: "green" },
+  // blocked = model/API/network failures exhausted the retries; this intent barely explored anything (not an interception).
+  blocked: { label: t("Error"), tone: "red" },
+  // exhausted = the step/time budget cut the run short midway, only partial results written back (not "direction exhausted").
+  exhausted: { label: t("Budget exhausted"), tone: "violet" },
+  // stopped = legacy soft-deleted state (kept for historical data).
+  stopped: { label: t("Stopped"), tone: "slate" },
+  // deleted = the user soft-deleted this intent (nodes and lineage kept; see delete_reason for the reason).
+  deleted: { label: t("Deleted"), tone: "slate" },
 };
 
 const task: Record<string, StatusMeta> = {
-  created: { label: "已创建", tone: "slate" },
-  queued: { label: "排队中", tone: "amber" },
-  running: { label: "运行中", tone: "blue" },
-  paused: { label: "已暂停", tone: "amber" },
-  done: { label: "已完成", tone: "green" },
-  failed: { label: "失败", tone: "red" },
-  timeout: { label: "已超时", tone: "amber" },
+  created: { label: t("Created"), tone: "slate" },
+  queued: { label: t("Queued"), tone: "amber" },
+  running: { label: t("Running"), tone: "blue" },
+  paused: { label: t("Paused"), tone: "amber" },
+  done: { label: t("Completed"), tone: "green" },
+  failed: { label: t("Failed"), tone: "red" },
+  timeout: { label: t("Timed out"), tone: "amber" },
 };
 
 const severity: Record<string, StatusMeta> = {
-  critical: { label: "严重", tone: "rose" },
-  high: { label: "高危", tone: "red" },
-  medium: { label: "中危", tone: "amber" },
-  low: { label: "低危", tone: "slate" },
+  critical: { label: t("Critical"), tone: "rose" },
+  high: { label: t("High"), tone: "red" },
+  medium: { label: t("Medium"), tone: "amber" },
+  low: { label: t("Low"), tone: "slate" },
 };
 
 const finding: Record<string, StatusMeta> = {
-  pending: { label: "待处理", tone: "amber" },
-  in_progress: { label: "处理中", tone: "blue" },
-  confirmed: { label: "已确认", tone: "red" },
-  resolved: { label: "已处理", tone: "green" },
-  fixed: { label: "已修复", tone: "green" },
-  false_positive: { label: "误报", tone: "slate" },
-  ignored: { label: "忽略", tone: "neutral" },
-  duplicate: { label: "重复", tone: "neutral" },
-  risk_accepted: { label: "风险接受", tone: "violet" },
+  pending: { label: t("Pending"), tone: "amber" },
+  in_progress: { label: t("In progress"), tone: "blue" },
+  confirmed: { label: t("Confirmed"), tone: "red" },
+  resolved: { label: t("Resolved"), tone: "green" },
+  fixed: { label: t("Fixed"), tone: "green" },
+  false_positive: { label: t("False positive"), tone: "slate" },
+  ignored: { label: t("Ignored"), tone: "neutral" },
+  duplicate: { label: t("Duplicate"), tone: "neutral" },
+  risk_accepted: { label: t("Risk accepted"), tone: "violet" },
 };
 
 const engine: Record<string, StatusMeta> = {
-  exploring: { label: "探索中", tone: "blue" },
-  paused: { label: "已暂停", tone: "amber" },
-  stalled: { label: "停滞", tone: "red" },
-  idle: { label: "空闲", tone: "neutral" },
+  exploring: { label: t("Exploring"), tone: "blue" },
+  paused: { label: t("Paused"), tone: "amber" },
+  stalled: { label: t("Stalled"), tone: "red" },
+  idle: { label: t("Idle"), tone: "neutral" },
 };
 
 const goal: Record<string, StatusMeta> = {
-  open: { label: "进行中", tone: "blue" },
-  met: { label: "已达成", tone: "green" },
-  abandoned: { label: "已放弃", tone: "slate" },
+  open: { label: t("In progress"), tone: "blue" },
+  met: { label: t("Met"), tone: "green" },
+  abandoned: { label: t("Abandoned"), tone: "slate" },
 };
 
 const audit: Record<string, StatusMeta> = {
-  allow: { label: "放行", tone: "green" },
-  block: { label: "拦截", tone: "red" },
+  allow: { label: t("Allow"), tone: "green" },
+  block: { label: t("Block"), tone: "red" },
 };
 
 const node: Record<string, StatusMeta> = {
-  observed: { label: "观测", tone: "slate" },
-  confirmed: { label: "确认", tone: "green" },
-  tombstoned: { label: "废弃", tone: "neutral" },
+  observed: { label: t("Observed"), tone: "slate" },
+  confirmed: { label: t("Confirmed"), tone: "green" },
+  tombstoned: { label: t("Tombstoned"), tone: "neutral" },
 };
 
-// 推送投递状态。sending 用 blue 而不是 amber：它不是「有问题」，
-// 而是「已被领取、正在发」，与 pending 的等待语义要能区分开。
+// Notification delivery states. sending uses blue rather than amber: it is not "a problem"
+// but "claimed and sending now", which must stay distinguishable from pending's waiting.
 const delivery: Record<string, StatusMeta> = {
-  pending: { label: "待发送", tone: "amber" },
-  sending: { label: "发送中", tone: "blue" },
-  sent: { label: "已送达", tone: "green" },
-  failed: { label: "失败", tone: "red" },
-  skipped: { label: "已跳过", tone: "neutral" },
+  pending: { label: t("Pending"), tone: "amber" },
+  sending: { label: t("Sending"), tone: "blue" },
+  sent: { label: t("Sent"), tone: "green" },
+  failed: { label: t("Failed"), tone: "red" },
+  skipped: { label: t("Skipped"), tone: "neutral" },
 };
 
 const maps = {
@@ -124,5 +126,5 @@ const maps = {
 export type StatusDomain = keyof typeof maps;
 
 export function statusMeta(domain: StatusDomain, key: string): StatusMeta {
-  return maps[domain][key] ?? { label: key, tone: "neutral" };
+  return maps[domain][key] ?? { label: t(key), tone: "neutral" };
 }
