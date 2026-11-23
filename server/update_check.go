@@ -15,7 +15,7 @@ import (
 // The update check is opt-in: only ARTEX_UPDATE_CHECK=1 (or true/on/yes) lets
 // the backend ask the public GitHub releases API for the latest ARTEX tag.
 // Unset, it makes no request at all and the UI shows no banner.
-const updateCheckURL = "https://api.github.com/repos/BaaRai/ARTEX/releases/latest"
+const updateCheckURL = "https://api.github.com/repos/ThanatosXingYu/BRTEX/releases/latest"
 const updateCheckInterval = 24 * time.Hour
 
 func updateCheckEnabled() bool {

@@ -4,6 +4,10 @@
 
 # ARTEX
 
+> **BRTEX 分支说明**：本仓库是 [BaaRai/ARTEX](https://github.com/BaaRai/ARTEX) v0.7.0 的私有维护分支，
+> 在保留上游全部功能的基础上叠加了自用改动（断流续写、国内搜索后端、归档复制回退、更宽松的重试与熔断策略、
+> 目标门禁解除、密码最短 8 位等）。上游文档保持原样以便对照，BRTEX 的改动见 CHANGELOG 顶部条目。
+
 **Autonomous penetration testing that keeps its receipts.**
 
 (upstream: [Autumn-27/ARTEX](https://github.com/Autumn-27), AGPL-3.0)
@@ -11,10 +15,10 @@
 Self-hosted multi-agent offensive security. A planner explores, workers run real tools,
 and every finding stays bound to the assets and HTTP traffic that prove it.
 
-[![Release](https://img.shields.io/github/v/release/BaaRai/ARTEX?label=release&color=6b34db)](https://github.com/BaaRai/ARTEX/releases)
-[![License](https://img.shields.io/github/license/BaaRai/ARTEX?color=6b34db)](LICENSE)
-[![CI](https://github.com/BaaRai/ARTEX/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/BaaRai/ARTEX/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/github/go-mod/go-version/BaaRai/ARTEX?color=6b34db)](go.mod)
+[![Release](https://img.shields.io/github/v/release/ThanatosXingYu/BRTEX?label=release&color=6b34db)](https://github.com/ThanatosXingYu/BRTEX/releases)
+[![License](https://img.shields.io/github/license/ThanatosXingYu/BRTEX?color=6b34db)](LICENSE)
+[![CI](https://github.com/ThanatosXingYu/BRTEX/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ThanatosXingYu/BRTEX/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/ThanatosXingYu/BRTEX?color=6b34db)](go.mod)
 
 [Quick start](#quick-start) · [Screenshots](#screenshots) · [How it works](#how-it-works) · [Install](#installation) · [Configuration](#configuration) · [Security](SECURITY.md)
 
@@ -44,7 +48,7 @@ justify it, and every autonomous action passes through scope rules, approval gat
 ## Quick start
 
 ```bash
-git clone https://github.com/BaaRai/ARTEX.git
+git clone https://github.com/ThanatosXingYu/BRTEX.git
 cd ARTEX
 cp .env.example .env            # set POSTGRES_PASSWORD (and optionally an LLM key)
 docker compose up -d --build    # builds from this checkout, starts PostgreSQL
@@ -317,7 +321,7 @@ worker remains confined to the intent it claimed.
 ### Option 1: one-click install script (recommended)
 
 ```bash
-git clone https://github.com/BaaRai/ARTEX.git
+git clone https://github.com/ThanatosXingYu/BRTEX.git
 cd ARTEX
 ./install.sh
 ```
@@ -338,7 +342,7 @@ first-run claim), or keep loopback and use a reverse proxy or SSH tunnel.
 Build from a checkout with Docker Compose:
 
 ```bash
-git clone https://github.com/BaaRai/ARTEX.git
+git clone https://github.com/ThanatosXingYu/BRTEX.git
 cd ARTEX
 cp .env.example .env            # set POSTGRES_PASSWORD, optionally ANTHROPIC_API_KEY
 docker compose up -d --build
@@ -399,8 +403,8 @@ checkout build above until the next tagged release. Once the first image is publ
 the file and `.env.example` once:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/BaaRai/ARTEX/main/docker-compose.ghcr.yml
-curl -fsSLO https://raw.githubusercontent.com/BaaRai/ARTEX/main/.env.example
+curl -fsSLO https://raw.githubusercontent.com/ThanatosXingYu/BRTEX/main/docker-compose.ghcr.yml
+curl -fsSLO https://raw.githubusercontent.com/ThanatosXingYu/BRTEX/main/.env.example
 cp .env.example .env            # set POSTGRES_PASSWORD, optionally an LLM key
 docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up -d
@@ -424,7 +428,7 @@ Legacy SSE servers usually establish the event stream with `GET /sse` and receiv
 
 ### Option 3: prebuilt binaries (Releases)
 
-Download the zip for your platform from [Releases](https://github.com/BaaRai/ARTEX/releases). It
+Download the zip for your platform from [Releases](https://github.com/ThanatosXingYu/BRTEX/releases). It
 contains `artex`, `start.sh` (`start.bat` on Windows), `skills/` and `config.example.json`:
 
 ```bash
@@ -444,7 +448,7 @@ neither.
 
 ```bash
 sha256sum -c SHA256SUMS                           # add --ignore-missing if you downloaded only some zips
-gh attestation verify <zip> --repo BaaRai/ARTEX   # built by this repository's release workflow
+gh attestation verify <zip> --repo ThanatosXingYu/BRTEX   # built by this repository's release workflow
 ```
 
 ### Option 4: build the single binary from source

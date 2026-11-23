@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [brtex-0.2.0] - 2026-11-23
+
+BRTEX 升级到 BaaRai/ARTEX v0.7.0 基线，并重新叠加自用改动。
+
+### 新增
+
+- 断流中间续写：保留已输出的半截内容、配对已执行的工具、丢弃被截断的工具调用，并注入续写提示（最多 3 次，不计入 MaxTurns）。
+- 识别中转“把思维链镜像进正文”和“思考阶段被截断”的假完成回合，按断流处理并续写。
+- `web_search` 增加 `bing`（cn.bing.com）与 `baidu` 两个无密钥、国内直连后端，服务端配置与设置页同步可选。
+- LLM 配置与“获取模型列表”清洗不可见 Unicode 字符（零宽字符、BOM 等）。
+- 远程 MCP 在无文本块时回退读取 `structuredContent`。
+
+### 变更
+
+- 同 provider 断流重试改为 10 次、固定 10s；熔断冷却梯度改为 30s→1m→1m→2m→5m→10m。
+- 任务目标歧义门禁取消“最少 80 字符”和“必须含具体目标”两条硬限制。
+- 新密码最短长度改回 8 位（后端常量、初始化页面与 i18n 同步）。
+- 归档在 `rename` 失败时回退为日志化复制，支持中断续跑与回滚；归档重试会清空残留的快照文件。
+- Bash 工具在超时/取消时终止整棵进程树，避免残留子进程占用文件导致归档失败。
+- Dockerfile：npm 走 npmmirror、apt 走阿里云镜像，`go mod download` 前先放入 `norma` 模块文件。
+- 更新检查指向 `ThanatosXingYu/BRTEX` 的发布。
+
+### 上游带来（v0.4.0 → v0.7.0）
+
+- 流量：抓包改写规则、HAR 导入导出、回放、SOCKS5/透明 TCP/raw UDP 录制、受限 Go 篡改钩子。
+- 归档：S3 加密后端（`archivestore`）、归档校验命令、spill 目录一并打包。
+- 数据库：版本化迁移框架、密钥字段静态加密（`ARTEX_SECRET_KEY` / `keys/secret.key`）、activity outbox。
+- agent：机器可验证漏洞结论（POE 等级/证据逐字校验/复测联动）、目标门禁、意图租约、覆盖台账、扫描器与 bbot 输出解析、多 LLM 轮转、分层预算、提示注入加固。
+- 其他：出口限速（`egress`）、土耳其语/简体中文 i18n、Neon 主题、`/api/ready`、登录限流、默认只听 127.0.0.1、JWT key 独立卷。
+
 ## [Unreleased]
 
 ### Added
