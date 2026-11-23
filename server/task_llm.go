@@ -622,13 +622,13 @@ func streamEventCommitsOutput(event llm.StreamEvent) bool {
 // the stream starts, mid-stream drops / overloaded / in-stream 429 and other transient
 // faults bubble straight up as model_error with zero retries. As long as not one token has been handed to the caller (!committed), replaying the exact same request duplicates no model output or tool side effects, so this adds a same-provider backoff retry layer to absorb such jitter before the whole intent re-runs.
 // Overridable by an LLM profile's retry overrides / the global retry policy.
-const sameProviderStreamRetries = 2
+const sameProviderStreamRetries = 10
 
-// sameProviderRetryBackoff is the [default] backoff before retry attempt #attempt
-// (0.5s, 1s…, capped at 4s) — same style as the SDK's exponential ladder but with a
-// smaller cap so worker wrap-up/cancellation responsiveness is not dragged out. Exposed as variables so tests can zero the backoff.
-var sameProviderRetryBackoff = func(attempt int) time.Duration {
-	return min(500*time.Millisecond*(1<<attempt), 4*time.Second)
+// sameProviderRetryBackoff is the [default] backoff before retry attempt #attempt:
+// a fixed 10s so consecutive upstream blips have time to recover, and the cadence
+// is predictable. Exposed as a variable so tests can zero the backoff.
+var sameProviderRetryBackoff = func(int) time.Duration {
+	return 10 * time.Second
 }
 
 // sameProviderRetryPolicy resolves which same-provider retry parameters this call

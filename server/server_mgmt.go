@@ -2594,7 +2594,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve API key: form input > profile stored key. The stored key is only
 	// sent to the endpoint it was saved for, since base_url comes from the form.
-	apiKey := strings.TrimSpace(req.APIKey)
+	apiKey := strings.TrimSpace(agent.StripInvisible(req.APIKey))
 	withheld := false
 	if apiKey == "" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
@@ -2613,7 +2613,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	provider := strings.TrimSpace(req.Provider)
+	provider := strings.TrimSpace(agent.StripInvisible(req.Provider))
 	// Ollama serves its model list keyless on the local server: no key gate.
 	if apiKey == "" && provider != "ollama" {
 		msg := "no API Key provided"
@@ -2624,7 +2624,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawBaseURL := strings.TrimSpace(req.BaseURL)
+	rawBaseURL := strings.TrimSpace(agent.StripInvisible(req.BaseURL))
 	baseURL := strings.TrimRight(rawBaseURL, "/")
 	defaultOllama := provider == "ollama" && rawBaseURL == ""
 
@@ -2695,7 +2695,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	// because a caller-supplied HTTP proxy fetches the target URL itself.
 	guard := newModelURLGuard(s)
 	var proxyURL *url.URL
-	if p := strings.TrimSpace(req.Proxy); p != "" {
+	if p := strings.TrimSpace(agent.StripInvisible(req.Proxy)); p != "" {
 		var err error
 		proxyURL, err = guard.validateURL(r.Context(), p, "proxy")
 		if err != nil {

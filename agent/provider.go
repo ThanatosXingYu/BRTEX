@@ -10,6 +10,7 @@
 package agent
 
 import (
+	"unicode"
 	"bytes"
 	"context"
 	"fmt"
@@ -674,4 +675,18 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 		return lat, "", fmt.Errorf("the model returned no content (the request went through, but no text was returned)")
 	}
 	return lat, reply, nil
+}
+
+// StripInvisible removes invisible Unicode format characters (zero-width
+// spaces, BOM, word joiners, ...) that sneak into pasted URLs and keys.
+// strings.TrimSpace does not treat them as whitespace, and a single stray
+// U+200B breaks url.Parse downstream with "first path segment in URL cannot
+// contain colon".
+func StripInvisible(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
 }

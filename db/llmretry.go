@@ -89,7 +89,7 @@ type LLMRetryPolicy struct {
 	// Stream: same-provider safe-window retry (replay of a broken stream before output was delivered). Default 2 attempts, exponential from 0.5s (capped at 4s).
 	Stream RetryRule `json:"stream"`
 	// Breaker: rotation breaker. Attempts=consecutive transient failures before tripping (default 3; -1=never trip on
-	// transient failures; hard failures like insufficient balance/invalid key still trip immediately); IntervalMS=fixed cooldown (0=default 1/5/30min ladder).
+	// transient failures; hard failures like insufficient balance/invalid key still trip immediately); IntervalMS=fixed cooldown (0=default 30s/1m/1m/2m/5m/10m ladder).
 	Breaker RetryRule `json:"breaker"`
 	// Intent: full-intent rerun after a worker ends with model_error. Default 2 attempts, fixed 3s.
 	Intent RetryRule `json:"intent"`

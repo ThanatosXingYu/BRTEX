@@ -19,7 +19,17 @@ import (
 // for a minute, the 2nd for five, everything after that for half an hour. A
 // profile that is merely rate-limited recovers quickly; one that keeps failing
 // stops being probed every round.
-var backoff = []time.Duration{time.Minute, 5 * time.Minute, 30 * time.Minute}
+// The first rung is short (30s) so a one-off blip costs less than a minute of
+// avoided traffic, and the last is capped at 10 minutes so a persistently broken
+// profile keeps getting retried within a working session.
+var backoff = []time.Duration{
+	30 * time.Second,
+	time.Minute,
+	time.Minute,
+	2 * time.Minute,
+	5 * time.Minute,
+	10 * time.Minute,
+}
 
 // State is one profile's circuit-breaker state.
 type State struct {

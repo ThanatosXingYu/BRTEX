@@ -195,7 +195,10 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	if err := os.MkdirAll(filepath.Dir(streamPath), archiveDirMode); err != nil {
 		return err
 	}
-	streamFile, err := os.OpenFile(streamPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, archiveFileMode)
+	// Truncate instead of O_EXCL: a failed round can leave the staging root (and
+	// this file) behind when its rollback also failed, and the retry re-snapshots
+	// llm_records from PostgreSQL, so any previous content is stale by definition.
+	streamFile, err := os.OpenFile(streamPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, archiveFileMode)
 	if err != nil {
 		return err
 	}
