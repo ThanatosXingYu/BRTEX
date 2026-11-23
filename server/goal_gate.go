@@ -1,5 +1,13 @@
 package server
 
+import "regexp"
+
+// goalDomainRE extracts the bare host names a task goal names. It is used by
+// the ask_operator target check (goalTargets), not by goal creation: BRTEX
+// dropped the gate's minimum-length and "must name a target" limits, but the
+// operator-warning path still needs to know which hosts a goal mentions.
+var goalDomainRE = regexp.MustCompile(`(?i)\b[a-z0-9][a-z0-9-]{1,61}\.[a-z]{2,}(:[0-9]+)?(/\S*)?\b`)
+
 // Ambiguity gate (ouroboros take, #99) historically refused a task goal that
 // was shorter than 80 bytes or that named no concrete target (URL, domain, IP,
 // localhost:port or absolute path), with a literal [targetless] opt-out.
