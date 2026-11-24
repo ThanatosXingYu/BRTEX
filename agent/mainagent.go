@@ -177,7 +177,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	}
 	// The main-agent run is one-shot (a text-only stop ends it). This layer adds a
 	// bounded continuation while the agent's own todo list still has open items.
-	opts.Hooks = newMainContinueHooks(hooks, todos, message)
+	opts.Hooks = newMainContinueHooks(hooks, todos)
 	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
 	// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
 	// load; each new session (seg>=1) gets its own file for a clean context. The id

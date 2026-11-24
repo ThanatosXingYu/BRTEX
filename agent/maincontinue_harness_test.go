@@ -1,8 +1,9 @@
 package agent
 
 // End-to-end check that the continuation hook is really wired into the harness
-// loop for the main agent: a turn that only writes text must be re-asked instead of
-// ending the whole run.
+// loop for the main agent: a turn that announces a next step but never calls a
+// tool must be re-asked instead of ending the whole run — while a normal final
+// answer must end the run untouched.
 
 import (
 	"context"
@@ -16,12 +17,12 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// textOnlyThenAct plays: paragraph only, then a tool call, then a final answer.
-type textOnlyThenAct struct {
+// announceThenAct plays: announcing text only, then a tool call, then a final answer.
+type announceThenAct struct {
 	calls int
 }
 
-func (m *textOnlyThenAct) call(_ context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+func (m *announceThenAct) call(_ context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 	i := m.calls
 	m.calls++
 	return func(yield func(llm.StreamEvent, error) bool) {
@@ -34,9 +35,9 @@ func (m *textOnlyThenAct) call(_ context.Context, _ llm.CompletionRequest) iter.
 			return true
 		}
 		switch i {
-		case 0: // the failure shape: text only, natural stop
+		case 0: // the failure shape: announced step, text only, natural stop
 			seq(
-				llm.StreamEvent{Type: llm.SETextDelta, Text: "已确认目标可达，下面开始扫描。"},
+				llm.StreamEvent{Type: llm.SETextDelta, Text: "已确认目标可达，先扫描端口："},
 				llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "end_turn"},
 				llm.StreamEvent{Type: llm.SEMessageStop},
 			)
@@ -57,16 +58,31 @@ func (m *textOnlyThenAct) call(_ context.Context, _ llm.CompletionRequest) iter.
 	}
 }
 
+// answerOnly answers in one turn and never announces more work.
+type answerOnly struct {
+	calls int
+	text  string
+}
+
+func (m *answerOnly) call(_ context.Context, _ llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	m.calls++
+	return func(yield func(llm.StreamEvent, error) bool) {
+		yield(llm.StreamEvent{Type: llm.SETextDelta, Text: m.text}, nil)
+		yield(llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "end_turn"}, nil)
+		yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+	}
+}
+
 func TestMainContinueHookWiredIntoHarness(t *testing.T) {
-	model := &textOnlyThenAct{}
-	hooks := newMainContinueHooks(nil, actool.NewTodoStore(), "对 10.0.0.5 做端口扫描")
+	model := &announceThenAct{}
+	hooks := newMainContinueHooks(nil, actool.NewTodoStore())
 	term := runQuery(t, model.call, hooks, "对 10.0.0.5 做端口扫描")
 
 	if term.Reason != harness.ReasonCompleted {
 		t.Fatalf("reason=%v", term.Reason)
 	}
 	if model.calls < 3 {
-		t.Fatalf("model called %d time(s): the text-only turn was not re-asked", model.calls)
+		t.Fatalf("model called %d time(s): the announcing text-only turn was not re-asked", model.calls)
 	}
 	if term.Text != "扫描完成。" {
 		t.Fatalf("terminal text=%q", term.Text)
@@ -75,7 +91,7 @@ func TestMainContinueHookWiredIntoHarness(t *testing.T) {
 	// have produced a result.
 	var nudged, toolResult bool
 	for _, m := range term.Messages {
-		if strings.Contains(m.Text(), "还没有通过任何工具落地") {
+		if strings.Contains(m.Text(), "[自动续跑]") {
 			nudged = true
 		}
 		for _, b := range m.Content {
@@ -92,16 +108,26 @@ func TestMainContinueHookWiredIntoHarness(t *testing.T) {
 	}
 }
 
-// A question must not be re-asked.
-func TestMainContinueHookIgnoresQuestionsInHarness(t *testing.T) {
-	model := &textOnlyThenAct{}
-	hooks := newMainContinueHooks(nil, actool.NewTodoStore(), "现在进度怎么样？")
-	term := runQuery(t, model.call, hooks, "现在进度怎么样？")
-	if model.calls != 1 {
-		t.Fatalf("model called %d times, a question must end after one answer", model.calls)
-	}
-	if term.Reason != harness.ReasonCompleted {
-		t.Fatalf("reason=%v", term.Reason)
+// A normal final answer must end the run on the first turn, untouched.
+func TestMainContinueHookLeavesNormalAnswerAlone(t *testing.T) {
+	for _, text := range []string{
+		"扫描完成，端口 22 与 80 开放。",
+		"目前共拿到 629 条订单，其中 577 条带真实卡密。",
+		"还需要我继续扫描其余端口吗？",
+		"建议先做权限梳理，再动上传点；由你决定。",
+	} {
+		model := &answerOnly{text: text}
+		hooks := newMainContinueHooks(nil, actool.NewTodoStore())
+		term := runQuery(t, model.call, hooks, "汇报一下当前进展")
+		if model.calls != 1 {
+			t.Fatalf("closing %q: model called %d times, a normal answer must not be re-asked", text, model.calls)
+		}
+		if term.Reason != harness.ReasonCompleted {
+			t.Fatalf("closing %q: reason=%v", text, term.Reason)
+		}
+		if term.Text != text {
+			t.Fatalf("closing %q: terminal text=%q", text, term.Text)
+		}
 	}
 }
 

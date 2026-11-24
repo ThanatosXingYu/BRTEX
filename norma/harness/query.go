@@ -182,6 +182,21 @@ type HookRunner interface {
 	Stop(ctx context.Context, messages []llm.Message) (prevent bool, blockingErrors []string, message string)
 }
 
+// StopBlockRepeater is implemented by hooks that bound their own repeated
+// stop-blocking. The harness fires the Stop hook at most once between two tool
+// rounds, so an always-blocking hook cannot spin; a hook that opts in says it
+// carries its own budget and may be asked again after every text-only stop.
+type StopBlockRepeater interface {
+	AllowRepeatedStopBlocking() bool
+}
+
+// allowsRepeatedStopBlocking reports whether the hook wants to be consulted
+// again after it already injected a blocking message.
+func allowsRepeatedStopBlocking(h HookRunner) bool {
+	r, ok := h.(StopBlockRepeater)
+	return ok && r.AllowRepeatedStopBlocking()
+}
+
 // QueryDeps are injectable side-effect boundaries for testing (FR-01.6).
 type QueryDeps struct {
 	CallModel func(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error]
@@ -539,7 +554,7 @@ func (l *loop) run() {
 						l.messages = append(l.messages, bm)
 						l.record(bm, llm.Usage{})
 					}
-					l.stopHookActive = true
+					l.stopHookActive = !allowsRepeatedStopBlocking(l.in.Hooks)
 					l.lastContinue = ContinueStopHookBlocking
 					continue
 				}
