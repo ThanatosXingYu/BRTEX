@@ -7,7 +7,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	pgdb "github.com/Autumn-27/artex/db"
@@ -145,6 +148,61 @@ func TestTaskArchivePackageSkipsSymlink(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(extracted, "link.txt")); !os.IsNotExist(err) {
 		t.Fatalf("symlink should have been skipped, but link.txt exists: %v", err)
+	}
+}
+
+func TestTaskArchiveSkipsFIFO(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes cannot be created with mkfifo semantics on windows")
+	}
+	dataDir := t.TempDir()
+	taskDir := filepath.Join(dataDir, "tasks", "42")
+	if err := os.MkdirAll(filepath.Join(taskDir, "i7", "fakeproc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	regular := filepath.Join(taskDir, "i7", "keep.txt")
+	if err := os.WriteFile(regular, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A fake /proc tree leaves a FIFO behind. Opening it with no writer blocks
+	// forever and would wedge the archive worker.
+	fifo := filepath.Join(taskDir, "i7", "fakeproc", "cmdline")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		stage, err := stageTaskArchiveFiles(dataDir, 7, "42", 1)
+		if err != nil {
+			done <- err
+			return
+		}
+		archivePath := filepath.Join(dataDir, "archive.tar.zst")
+		snapshot := &pgdb.TaskArchiveSnapshot{FormatVersion: pgdb.TaskArchiveFormatVersion, TaskID: 42}
+		_, _, checksum, err := writeTaskArchivePackage(archivePath, stage.payload, snapshot)
+		if err != nil {
+			done <- err
+			return
+		}
+		extracted := filepath.Join(dataDir, "restore")
+		if err := extractTaskArchivePackage(archivePath, checksum, extracted); err != nil {
+			done <- err
+			return
+		}
+		if got, err := os.ReadFile(filepath.Join(extracted, "files", "tasks", "42", "i7", "keep.txt")); err != nil || string(got) != "keep me" {
+			done <- errors.New("regular file not archived")
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("archiving a task with a FIFO hung instead of skipping it")
 	}
 }
 

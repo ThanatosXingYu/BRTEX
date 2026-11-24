@@ -242,11 +242,14 @@ func copyArchiveTree(source, destination string) error {
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
 		if entry.IsDir() {
 			return os.MkdirAll(target, archiveDirMode)
+		}
+		// Only regular files are copied. Opening a FIFO with no writer blocks
+		// forever, which would wedge the single archive worker; sockets and
+		// device nodes cannot be archived either.
+		if !info.Mode().IsRegular() {
+			return nil
 		}
 		if err := os.MkdirAll(filepath.Dir(target), archiveDirMode); err != nil {
 			return err
@@ -736,11 +739,14 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if !entry.IsDir() && !info.Mode().IsRegular() {
 			// The archive format supports only regular files and directories end to end (the
-			// unpacker errors out on other types), so symlinks cannot be restored. Skip rather
-			// than fail the whole package: the link target is not read (lstat, never leaves the tree) and no symlink entry is written; when a link points inside the tree, the target file itself is still walked and archived separately.
-			log.Printf("[task-archive] skipping symlink (unsupported by the archive, other files unaffected): %s", current)
+			// unpacker errors out on other types), so symlinks, FIFOs, sockets and device
+			// nodes cannot be restored. Skip rather than fail the whole package: the target
+			// is never read (lstat only, never leaves the tree) and a FIFO in particular would
+			// block forever on open. When a symlink points inside the tree, the target file
+			// itself is still walked and archived separately.
+			log.Printf("[task-archive] skipping non-regular file (unsupported by the archive, other files unaffected): %s", current)
 			return nil
 		}
 		header, err := tar.FileInfoHeader(info, "")
